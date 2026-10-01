@@ -22,3 +22,10 @@ engine/.venv/
 
 __pycache__/
 *.py[cod]
+
+# Local workspace tooling (ZCode session plans, MCP config)
+.zcode/
+
+# Regenerable fixtures and specs
+engine/tests/test_speech.wav
+zernio-mcp/openapi.yaml
