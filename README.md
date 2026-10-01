@@ -43,7 +43,7 @@ This README describes the current source. Check the [release notes](https://gith
 
 ## Quick start
 
-You need an **[OpenRouter API key](https://openrouter.ai/keys) with available credit**. No BridgeMind account is required.
+You need an **[OpenRouter API key](https://openrouter.ai/keys) with available credit** — or clip for free with a **[NVIDIA key](https://build.nvidia.com)** (Settings → AI provider → NVIDIA). No BridgeMind account is required.
 
 1. **Connect your key.** Paste it into the first-launch setup card.
 2. **Add a video.** Choose a local file, a public YouTube link, or a public, completed Twitch VOD.
@@ -62,7 +62,7 @@ Use footage you have permission to use. See the [user guide](docs/usage.md) for 
 ### Find complete moments
 
 - Discover clips with their setup and ending intact, using the source transcript and metadata.
-- Choose **Quality**, **Economy**, or **Advanced** with your own compatible OpenRouter models.
+- Choose **Quality**, **Economy**, or **Advanced** with your own compatible OpenRouter models — or run planning for free on **NVIDIA's hosted models** with local Whisper transcription.
 - Enable optional source research and Jev editorial checks for context, title support and completeness.
 
 ### Refine the edit
@@ -95,7 +95,7 @@ Use footage you have permission to use. See the [user guide](docs/usage.md) for 
 
 ## AI, costs and privacy
 
-**Rendering is local; AI processing uses cloud providers.** Audio and transcripts go to OpenRouter. Visual-only planning and enabled AI framing checks can send sampled frames. Your videos and keys do not pass through a BridgeMind server.
+**Rendering is local; AI processing uses cloud providers — or your own GPU.** By default audio and transcripts go to OpenRouter. Visual-only planning and enabled AI framing checks can send sampled frames. Your videos and keys do not pass through a BridgeMind server. Prefer fully offline? Settings → Local AI deploys faster-whisper transcription and an Ollama planner on this machine with one click — no key, no cloud cost (see [docs/local-ai.md](docs/local-ai.md)). On a budget? Settings → AI provider → NVIDIA plans clips on [build.nvidia.com](https://build.nvidia.com)'s free tier (~1000 credits, 40 requests per minute) and transcribes locally with faster-whisper (see [docs/nvidia-cloud.md](docs/nvidia-cloud.md)); transcripts never leave the machine, and only the planning prompt goes to NVIDIA.
 
 - **Bring your own accounts.** AI calls bill your OpenRouter account. Optional social publishing uses your Zernio account and uploads selected clips to its service.
 - **Choose additional analysis.** Jev review for Automatic, source web research and additional visual context are opt-in betas. Review & edit always uses Jev; these features can add provider cost.

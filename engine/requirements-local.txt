@@ -1,0 +1,10 @@
+# Local (offline) AI backend for BridgeClip.
+#
+# Installed on demand by Settings → Local AI → offline setup; the cloud-only
+# install stays slim without these. CTranslate2 (pulled in by faster-whisper)
+# needs cuBLAS/cuDNN 9 DLLs on Windows; the nvidia wheels provide them and
+# engine/clip_engine/services/local_whisper.py adds their bin dirs to the DLL
+# search path before importing faster_whisper.
+faster-whisper>=1.1
+nvidia-cublas-cu12; sys_platform == "win32"
+nvidia-cudnn-cu12; sys_platform == "win32"

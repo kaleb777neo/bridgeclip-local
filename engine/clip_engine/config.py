@@ -9,7 +9,7 @@ import os
 from functools import lru_cache
 from typing import List, Literal, Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
@@ -683,6 +683,80 @@ class Settings(BaseSettings):
     planner_output_price: Optional[float] = None
     transcription_diarize: bool = True
 
+    # ============================================================
+    # AI BACKEND
+    # "cloud" routes every AI call through OpenRouter (default). "local" runs
+    # transcription with faster-whisper on this machine and chat with Ollama
+    # at local_llm_base_url; no API key or internet connection is needed.
+    # "nvidia" plans and repairs clips through NVIDIA's hosted NIM API
+    # (OpenAI-compatible, free build.nvidia.com tier) and transcribes with
+    # the same local faster-whisper stack, so the pipeline stays free.
+    # ============================================================
+    ai_backend: Literal["cloud", "local", "nvidia"] = "cloud"
+    local_llm_base_url: str = "http://127.0.0.1:11434"
+    local_planner_model: str = "qwen3:8b"
+    local_repair_model: str = "qwen3:8b"
+    # Local models have smaller context and slower token rates than cloud;
+    # keep generation and context budgets within what a laptop GPU serves.
+    local_planner_max_output_tokens: int = 16000
+    local_planner_context_tokens: int = 16384
+    local_whisper_model: Literal["large-v3-turbo", "large-v3", "medium"] = "large-v3-turbo"
+    local_whisper_device: Literal["auto", "cuda", "cpu"] = "auto"
+    local_whisper_compute_type: Literal["auto", "float16", "int8"] = "auto"
+    # Empty = auto-detect the spoken language per chunk; "ro"/"en"/... pins it
+    # and stops drift into the wrong language on music or noise.
+    transcription_language: str = ""
+
+    # NVIDIA NIM (https://build.nvidia.com). The free tier serves ~40 requests
+    # per minute; the chat path honours Retry-After when it throttles.
+    nvidia_api_key: Optional[str] = None
+    nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
+    nvidia_planner_model: str = "deepseek-ai/deepseek-v3.1"
+    nvidia_repair_model: str = "meta/llama-3.3-70b-instruct"
+    # Free-tier models cap generation below the paid cloud planner budget.
+    nvidia_planner_max_output_tokens: int = 16000
+
+    @model_validator(mode="after")
+    def _apply_local_backend_models(self) -> "Settings":
+        """Swap cloud model slugs for local ones when the local backend is on.
+
+        Ollama tags look like "qwen3:8b"; cloud slugs look like "vendor/model".
+        An explicit local tag set via env is kept as-is.
+        """
+        if self.ai_backend != "local":
+            return self
+        replacements = {
+            "planner_model": self.local_planner_model,
+            "editorial_repair_model": self.local_repair_model,
+            "layout_vision_model": self.local_planner_model,
+            "source_context_model": self.local_planner_model,
+        }
+        for field_name, local_model in replacements.items():
+            if "/" in getattr(self, field_name):
+                object.__setattr__(self, field_name, local_model)
+        return self
+
+    @model_validator(mode="after")
+    def _apply_nvidia_backend_models(self) -> "Settings":
+        """Swap untouched cloud defaults for NVIDIA NIM slugs on the nvidia backend.
+
+        Only values still equal to the built-in cloud defaults are swapped, so
+        an explicit PLANNER_MODEL / EDITORIAL_REPAIR_MODEL env override
+        survives. The desktop bridge pairs AI_BACKEND=nvidia with
+        NVIDIA_PLANNER_MODEL, which feeds this swap.
+        """
+        if self.ai_backend != "nvidia":
+            return self
+        fields = type(self).model_fields
+        replacements = {
+            "planner_model": self.nvidia_planner_model,
+            "editorial_repair_model": self.nvidia_repair_model,
+        }
+        for field_name, nvidia_model in replacements.items():
+            if getattr(self, field_name) == fields[field_name].default:
+                object.__setattr__(self, field_name, nvidia_model)
+        return self
+
     @field_validator("planner_reasoning_effort", "layout_vision_reasoning_effort")
     @classmethod
     def _validate_reasoning_effort(cls, value: str, info) -> str:
@@ -700,6 +774,14 @@ class Settings(BaseSettings):
     def get_planner_fallback_models(self) -> List[str]:
         """Fallback planner models, excluding blanks and the primary."""
         if self.clipping_mode == "advanced":
+            return []
+        if self.ai_backend == "local":
+            # Ollama serves one model at a time; there is no cross-vendor
+            # fallback chain to walk.
+            return []
+        if self.ai_backend == "nvidia":
+            # The `models` chain is OpenRouter server-side routing; NVIDIA NIM
+            # serves one model per request.
             return []
         return self._split_models(self.planner_fallback_models, self.planner_model)
 
@@ -812,13 +894,19 @@ class Settings(BaseSettings):
     def max_download_duration_seconds(self) -> int:
         return 21600  # 6 hours max (credit-guarded in API)
 
-    # Transcription uses the same OpenRouter key as planning.
+    # Transcription uses the same OpenRouter key as planning, unless a backend
+    # with a local faster-whisper stack runs it on this machine ("local" and
+    # "nvidia": NVIDIA NIM hosts no OpenAI-compatible transcription endpoint).
     @property
     def transcription_provider(self) -> str:
+        if self.ai_backend in ("local", "nvidia"):
+            return "local"
         return "openrouter"
 
     @property
     def transcription_model(self) -> str:
+        if self.ai_backend in ("local", "nvidia"):
+            return f"local/whisper-{self.local_whisper_model}"
         if self.clipping_mode == "advanced":
             if not self.advanced_transcription_model:
                 raise ValueError("Choose a transcription model in Advanced mode")
@@ -829,6 +917,34 @@ class Settings(BaseSettings):
     @property
     def openrouter_base_url(self) -> str:
         return "https://openrouter.ai/api/v1"
+
+    @property
+    def llm_provider(self) -> str:
+        """Chat provider serving this run: "nvidia" or "openrouter"."""
+        return "nvidia" if self.ai_backend == "nvidia" else "openrouter"
+
+    @property
+    def llm_base_url(self) -> str:
+        """Base URL of the cloud chat API for the active backend."""
+        if self.ai_backend == "nvidia":
+            return self.nvidia_base_url.rstrip("/")
+        return self.openrouter_base_url
+
+    @property
+    def llm_api_key(self) -> Optional[str]:
+        """API key of the cloud chat provider for the active backend."""
+        if self.ai_backend == "nvidia":
+            return self.nvidia_api_key
+        return self.openrouter_api_key
+
+    @property
+    def effective_planner_max_output_tokens(self) -> int:
+        """Cloud budget as configured; capped to what local/free models serve."""
+        if self.ai_backend == "local":
+            return min(self.planner_max_output_tokens, self.local_planner_max_output_tokens)
+        if self.ai_backend == "nvidia":
+            return min(self.planner_max_output_tokens, self.nvidia_planner_max_output_tokens)
+        return self.planner_max_output_tokens
 
     # Clip Planning Configuration
     @property

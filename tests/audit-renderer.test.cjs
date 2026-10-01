@@ -139,8 +139,8 @@ test('clip paths from run files only drop the file:// prefix and are never decod
 })
 
 test('the renderer settings state never retains raw API keys, even if the main process returned them', async () => {
-  const leak = { openrouterApiKey: 'sk-or-SECRET', zernioApiKey: 'sk_SECRET' }
-  const settings = { openrouterConfigured: true, zernioConfigured: true, outputDirectory: '/clips', pythonPath: 'python3', customVocabulary: '', ...leak }
+  const leak = { openrouterApiKey: 'sk-or-SECRET', nvidiaApiKey: 'nvapi-SECRET', zernioApiKey: 'sk_SECRET' }
+  const settings = { openrouterConfigured: true, nvidiaConfigured: true, zernioConfigured: true, outputDirectory: '/clips', pythonPath: 'python3', customVocabulary: '', ...leak }
   window.bridgeclip.settings.load = async () => settings
   window.bridgeclip.settings.save = async () => settings
   window.bridgeclip.settings.replaceApiKey = async () => settings
@@ -148,17 +148,18 @@ test('the renderer settings state never retains raw API keys, even if the main p
   await useSettingsStore.getState().save({ customVocabulary: 'x' })
   await useSettingsStore.getState().replaceApiKey('openrouterApiKey', 'sk-or-typed')
   const state = JSON.stringify(useSettingsStore.getState())
-  assert.doesNotMatch(state, /SECRET|sk-or-typed/, 'state holds configured flags only')
+  assert.doesNotMatch(state, /SECRET|sk-or-typed|nvapi-/, 'state holds configured flags only')
   assert.equal(useSettingsStore.getState().openrouterConfigured, true)
+  assert.equal(useSettingsStore.getState().nvidiaConfigured, true)
 })
 
 test('the settings page shows a configured key as a masked, empty field rather than the stored value', () => {
-  useSettingsStore.setState({ openrouterConfigured: true, zernioConfigured: true, loaded: true, outputDirectory: '/clips' })
+  useSettingsStore.setState({ openrouterConfigured: true, nvidiaConfigured: true, zernioConfigured: true, loaded: true, outputDirectory: '/clips' })
   const html = render(React.createElement(SettingsPage))
   assert.match(html, /Saved securely\. Paste a new key to replace\./)
-  assert.doesNotMatch(html, /sk-or-|sk_SECRET|SECRET/)
+  assert.doesNotMatch(html, /sk-or-|sk_SECRET|SECRET|nvapi-/)
   const inputs = [...html.matchAll(/<input[^>]*>/g)].map((match) => match[0]).filter((input) => /type="password"/.test(input))
-  assert.equal(inputs.length, 2, 'both key inputs are password fields until the user reveals their own draft')
+  assert.equal(inputs.length, 3, 'every key input (OpenRouter, NVIDIA, Zernio) is a password field until the user reveals their own draft')
   for (const input of inputs) assert.match(input, /value=""/)
   assertEscaped(html)
 })

@@ -12,7 +12,7 @@ interface SettingsState extends ClipSettings {
   toolError: string | null
   load: () => Promise<void>
   save: (settings: Partial<ClipSettings>) => Promise<void>
-  replaceApiKey: (key: 'openrouterApiKey' | 'zernioApiKey', value: string) => Promise<void>
+  replaceApiKey: (key: 'openrouterApiKey' | 'nvidiaApiKey' | 'zernioApiKey', value: string) => Promise<void>
   checkTools: () => Promise<void>
 }
 
@@ -23,9 +23,16 @@ let latestToolCheck = 0
 
 export const useSettingsStore = create<SettingsState>((set, get) => ({
   openrouterConfigured: false,
+  nvidiaConfigured: false,
   zernioConfigured: false,
   ...JEV_DEFAULTS,
   ...JEV_FEATURE_DEFAULTS,
+  aiProvider: 'cloud',
+  nvidiaPlannerModel: 'deepseek-ai/deepseek-v3.1',
+  localLlmBaseUrl: 'http://127.0.0.1:11434',
+  localPlannerModel: 'qwen3:8b',
+  localWhisperModel: 'large-v3-turbo',
+  transcriptionLanguage: '',
   outputDirectory: '',
   pythonPath: 'python3',
   customVocabulary: '',
@@ -99,6 +106,13 @@ function pickSettings(s: ClipSettings): ClipSettings {
     jevEnabled: s.jevEnabled ?? JEV_FEATURE_DEFAULTS.jevEnabled,
     jevVisualContext: s.jevVisualContext ?? JEV_FEATURE_DEFAULTS.jevVisualContext,
     sourceContextWebResearch: s.sourceContextWebResearch ?? JEV_FEATURE_DEFAULTS.sourceContextWebResearch,
+    aiProvider: s.aiProvider ?? 'cloud',
+    nvidiaConfigured: s.nvidiaConfigured,
+    nvidiaPlannerModel: s.nvidiaPlannerModel ?? 'deepseek-ai/deepseek-v3.1',
+    localLlmBaseUrl: s.localLlmBaseUrl ?? 'http://127.0.0.1:11434',
+    localPlannerModel: s.localPlannerModel ?? 'qwen3:8b',
+    localWhisperModel: s.localWhisperModel ?? 'large-v3-turbo',
+    transcriptionLanguage: s.transcriptionLanguage ?? '',
     zernioConfigured: s.zernioConfigured,
     outputDirectory: s.outputDirectory,
     pythonPath: s.pythonPath,
@@ -108,14 +122,21 @@ function pickSettings(s: ClipSettings): ClipSettings {
 
 export type SetupState = { ready: boolean; missingKeys: string[]; toolsOk: boolean | null }
 
-/** Whether a clip job can start: the OpenRouter key is present and, once the
- *  system check has run, every required tool found. */
+/** Whether a clip job can start: a usable AI provider (a cloud key for the
+ *  selected provider, or the offline stack) and, once the system check has
+ *  run, every required tool. */
 export function useSetupState(): SetupState {
   const openrouter = useSettingsStore((s) => s.openrouterConfigured)
+  const nvidia = useSettingsStore((s) => s.aiProvider === 'nvidia')
+  const nvidiaConfigured = useSettingsStore((s) => s.nvidiaConfigured)
+  const localProvider = useSettingsStore((s) => s.aiProvider === 'local')
   const tools = useSettingsStore((s) => s.toolStatus)
   const toolError = useSettingsStore((s) => s.toolError)
   const checkingTools = useSettingsStore((s) => s.checkingTools)
-  const missingKeys = [!openrouter && 'OpenRouter'].filter(Boolean) as string[]
+  const missingKeys = [
+    ...(!openrouter && !nvidia && !localProvider ? ['OpenRouter'] : []),
+    ...(nvidia && !nvidiaConfigured ? ['NVIDIA'] : [])
+  ]
   const toolsOk = toolError ? false : tools
     ? tools.python && tools.pythonDeps && tools.ffmpeg && tools.ffprobe && tools.ytdlp && tools.engine && tools.bridgeRunner
     : null

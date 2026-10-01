@@ -613,6 +613,23 @@ export class ZernioClient {
     return unwrap((await this.postingRequest('GET', `/posts/${encodeURIComponent(postId)}`)).body, 'post')
   }
 
+  /**
+   * GET /v1/posts — the calendar source. Covers the whole workspace, not just
+   * BridgeClip's own posts; `source: 'external'` returns posts made outside
+   * Zernio, synced from the platforms (~12 months per account).
+   */
+  async listPosts(filter: { fromDate: string; toDate: string; source: 'zernio' | 'external'; page?: number; limit?: number }): Promise<JsonRecord> {
+    const params = new URLSearchParams({
+      source: filter.source,
+      sortBy: 'scheduled-desc',
+      fromDate: filter.fromDate,
+      toDate: filter.toDate,
+      page: String(filter.page ?? 1),
+      limit: String(filter.limit ?? 500)
+    })
+    return asRecord((await this.postingRequest('GET', `/posts?${params}`)).body)
+  }
+
   /** PUT /v1/posts/{id}; used to reschedule. Returns the post as Zernio reports it. */
   async updatePost(postId: string, payload: JsonRecord): Promise<JsonRecord> {
     return unwrap((await this.postingRequest('PUT', `/posts/${encodeURIComponent(postId)}`, { body: payload })).body, 'post')

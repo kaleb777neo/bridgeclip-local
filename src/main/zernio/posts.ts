@@ -16,6 +16,7 @@ import {
   applyZernioPost,
   buildCreatePostBody,
   isPostUrl,
+  parseCalendarPost,
   parsePostClipRequest,
   parseTikTokCreatorInfo,
   tiktokOptionsError
@@ -31,6 +32,8 @@ import {
   checkClip,
   isValidTimeZone,
   scheduleError,
+  type CalendarPost,
+  type CalendarResult,
   type ClipMediaInfo,
   type PostClipRequest,
   type PostClipResult,
@@ -776,6 +779,83 @@ export async function openPostLink(id: unknown, targetIndex: unknown): Promise<v
   const target = Number.isInteger(targetIndex) ? post.targets[targetIndex as number] : undefined
   if (!target || !isPostUrl(target.url, target.platform)) throw new Error('This post doesn’t have a link yet.')
   await shell.openExternal(target.url)
+}
+
+/** Calendar posts per source page; both list calls together answer one view. */
+const CALENDAR_PAGE_LIMIT = 500
+/** Two pages per source: a month with more than a thousand posts per source is a scraping accident. */
+const CALENDAR_MAX_PAGES = 2
+
+function calendarDay(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  // The list endpoint takes YYYY-MM-DD or ISO; normalise to local calendar days.
+  const date = new Date(value)
+  return Number.isFinite(date.getTime()) ? value : null
+}
+
+/**
+ * The Posts calendar: every post of the Zernio workspace inside a date window,
+ * BridgeClip's own and everyone else's (`external`), straight from GET /v1/posts.
+ */
+export async function calendarPosts(from: unknown, to: unknown): Promise<CalendarResult> {
+  const fromDate = calendarDay(from)
+  const toDate = calendarDay(to)
+  if (!fromDate || !toDate) throw new Error('Choose a valid date range for the calendar.')
+  if (Date.parse(toDate) < Date.parse(fromDate)) throw new Error('The calendar range ends before it starts.')
+  if (Date.parse(toDate) - Date.parse(fromDate) > 100 * 86_400_000) throw new Error('The calendar range is too wide.')
+
+  let client: ZernioClient
+  try {
+    client = getClient()
+  } catch (error) {
+    return { posts: [], from: fromDate, to: toDate, truncated: false, error: error instanceof Error ? error.message : 'Add your Zernio API key to see the calendar.' }
+  }
+
+  const collected = new Map<string, CalendarPost>()
+  let truncated = false
+  let failure: string | null = null
+  for (const source of ['zernio', 'external'] as const) {
+    for (let page = 1; page <= CALENDAR_MAX_PAGES; page += 1) {
+      try {
+        const body = await client.listPosts({ fromDate, toDate, source, page, limit: CALENDAR_PAGE_LIMIT })
+        for (const item of extractCalendarCollection(body)) {
+          const parsed = parseCalendarPost(item, source)
+          if (parsed && !collected.has(parsed.id)) collected.set(parsed.id, parsed)
+        }
+        const pages = Number(asRecord(asRecord(body).pagination).pages)
+        if (!Number.isFinite(pages) || page >= pages) break
+        if (page === CALENDAR_MAX_PAGES) truncated = true
+      } catch (error) {
+        failure = error instanceof Error ? error.message : 'Could not load the calendar.'
+        break
+      }
+    }
+    if (failure && /API key|rate limit/i.test(failure)) break
+  }
+  const posts = [...collected.values()].sort((a, b) => a.when.localeCompare(b.when))
+  return { posts, from: fromDate, to: toDate, truncated, error: failure }
+}
+
+/** The list endpoint wraps rows as `{ posts: [...] }`; tolerate a bare array too. */
+function extractCalendarCollection(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value
+  const record = value !== null && typeof value === 'object' ? value as Record<string, unknown> : {}
+  for (const key of ['posts', 'data', 'items']) {
+    if (Array.isArray(record[key])) return record[key] as unknown[]
+  }
+  return []
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
+/** Opens a calendar post link; the URL must be https on that platform's own site. */
+export async function openCalendarPostLink(platform: unknown, url: unknown): Promise<void> {
+  if (typeof platform !== 'string' || !isZernioPlatform(platform) || !isPostUrl(url, platform)) {
+    throw new Error('This post doesn’t have a link yet.')
+  }
+  await shell.openExternal(url as string)
 }
 
 export async function openTikTokLegal(key: unknown): Promise<void> {

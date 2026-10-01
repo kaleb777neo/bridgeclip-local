@@ -14,7 +14,9 @@ import httpx
 from clip_engine.services.clip_editor import TimeMap, preserve_intervals
 from clip_engine.services.jev_service import choice, noul
 from clip_engine.services.editorial_evidence import transcript_row
-from clip_engine.services.openrouter import OpenRouterError, chat_completion, json_schema_format, message_text
+from clip_engine.services.openrouter import OpenRouterError, chat_completion, json_schema_format, message_text, sanitize_payload
+from clip_engine.services import local_llm
+from clip_engine.services.local_llm import is_local_backend
 from clip_engine.services.sponsor_policy import SPONSOR_ALLOWED, SPONSOR_EXCLUDED, SPONSOR_DISCOVERY_RULE
 
 # Clip eligibility and destructive omissions have different risk thresholds.
@@ -353,15 +355,26 @@ class CoherenceReviewer:
                 + SPONSOR_DISCOVERY_RULE},
                 {'role': 'user', 'content': user_content}],
             'response_format': json_schema_format('coherent_clip_repair', REPAIR_SCHEMA)}
+        provider = getattr(self.settings, "llm_provider", "openrouter")
+        payload = sanitize_payload(payload, provider)
         record['request_messages'] = copy.deepcopy(payload['messages'])
         record['request_parameters'] = json.dumps({k: v for k, v in payload.items() if k != 'messages'})
         self.repair_requests += 1
         began = time.monotonic()
+        # Local LLMs generate far fewer tokens per second than cloud APIs;
+        # give a local repair room to finish instead of timing out at 30 s.
+        local_budget = 180 if is_local_backend(self.settings) else 30
         try:
-            async with asyncio.timeout(30):
-                async with httpx.AsyncClient(base_url='https://openrouter.ai/api/v1', timeout=30,
-                    headers={'Authorization': f'Bearer {self.settings.openrouter_api_key}'}) as client:
-                    body, usage = await chat_completion(client, payload)
+            async with asyncio.timeout(local_budget):
+                async with httpx.AsyncClient(
+                    base_url=getattr(self.settings, "llm_base_url", "https://openrouter.ai/api/v1"),
+                    timeout=local_budget,
+                    headers={"Authorization": f"Bearer {getattr(self.settings, 'llm_api_key', None) or self.settings.openrouter_api_key}"},
+                ) as client:
+                    if is_local_backend(self.settings):
+                        body, usage = await local_llm.ollama_chat(self.settings, payload)
+                    else:
+                        body, usage = await chat_completion(client, payload, provider=provider)
             record['usage'] = {k: usage.get(k) for k in ('prompt_tokens', 'completion_tokens', 'total_tokens', 'cost')}
             cost = usage.get('cost')
             if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0:

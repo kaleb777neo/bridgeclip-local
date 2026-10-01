@@ -16,21 +16,29 @@ import type {
   ZernioSyncResult,
   ZernioStatusCheck
 } from '../shared/zernio'
-import type { ClipMediaInfo, PostClipRequest, PostClipResult, PostProgress, PostRecord, PostsRefreshResult, TikTokCreatorInfo, TikTokLegalLink } from '../shared/zernio-posts'
+import type { CalendarResult, ClipMediaInfo, PostClipRequest, PostClipResult, PostProgress, PostRecord, PostsRefreshResult, TikTokCreatorInfo, TikTokLegalLink } from '../shared/zernio-posts'
 import type { ClipJobRequest, JobSnapshot } from '../shared/jobs'
 import type { MetadataEnhancement, AutomationSourceGroup, AutomationBatchResult, AutomationSourceContext, Automation, AutomationUpdate, AutomationTikTokReview, AutomationTikTokReviewUpdate } from '../shared/automations'
 import type { LibraryClipPostingStatus, LibraryEnhancementOptions, LibraryRunPostingCounts } from '../shared/library-posting'
 import type { OpenRouterCatalog } from '../shared/openrouter-models'
+import type { LocalAiProgress, LocalAiStatus } from '../shared/local-ai'
 import type { UpdateState } from '../shared/updates'
 import type { OutputStorageUsage } from '../shared/output-storage'
 import type { YouTubePreview } from '../shared/youtube-preview'
 
 export interface ClipSettings extends JevThresholdSettings {
   openrouterConfigured: boolean
+  nvidiaConfigured: boolean
   zernioConfigured: boolean
   jevEnabled: string
   jevVisualContext: string
   sourceContextWebResearch: string
+  aiProvider: 'cloud' | 'nvidia' | 'local'
+  nvidiaPlannerModel: string
+  localLlmBaseUrl: string
+  localPlannerModel: string
+  localWhisperModel: string
+  transcriptionLanguage: string
   outputDirectory: string
   pythonPath: string
   customVocabulary: string
@@ -88,6 +96,14 @@ export interface BridgeClipAPI {
   }
   edits: { inspect: (outputDir: string) => Promise<EditAudit> }
   models: { list: (refresh?: boolean) => Promise<OpenRouterCatalog> }
+  localai: {
+    /** Offline stack readiness: GPU, faster-whisper, weights, Ollama, model. */
+    status: () => Promise<LocalAiStatus>
+    /** Deploys everything the offline mode needs; progress via onProgress. */
+    setup: () => Promise<LocalAiStatus>
+    cancel: () => Promise<boolean>
+    onProgress: (callback: (progress: LocalAiProgress) => void) => () => void
+  }
   automations: {
     reviewContent: (id: string, contentId: string, returnToQueue: boolean) => Promise<AutomationReviewResult>
     acknowledgeWarnings: (id: string | null, contentId?: string) => Promise<Automation[]>
@@ -118,7 +134,7 @@ export interface BridgeClipAPI {
     /** Pass true to count again instead of reusing a result from the last few seconds. */
     storageUsage: (fresh?: boolean) => Promise<OutputStorageUsage>
     save: (settings: ClipSettings) => Promise<ClipSettings>
-    replaceApiKey: (key: 'openrouterApiKey' | 'zernioApiKey', value: string) => Promise<ClipSettings>
+    replaceApiKey: (key: 'openrouterApiKey' | 'nvidiaApiKey' | 'zernioApiKey', value: string) => Promise<ClipSettings>
     selectOutputDir: () => Promise<string | null>
   }
   zernio: {
@@ -152,11 +168,15 @@ export interface BridgeClipAPI {
       list: () => Promise<PostRecord[]>
       /** Re-reads posts whose status can still change, a few per call. `force` includes ones refreshed recently. */
       refresh: (force: boolean) => Promise<PostsRefreshResult>
+      /** Every post in the Zernio workspace inside a date window (calendar view). */
+      calendar: (from: string, to: string) => Promise<CalendarResult>
       cancel: (postId: string) => Promise<PostRecord[]>
       reschedule: (postId: string, scheduledFor: string, timezone: string) => Promise<PostRecord[]>
       retry: (postId: string) => Promise<PostRecord[]>
       dismiss: (postId: string) => Promise<PostRecord[]>
       open: (postId: string, targetIndex: number) => Promise<void>
+      /** Opens a calendar post's public link, validated against the platform's site. */
+      openCalendarLink: (platform: string, url: string) => Promise<void>
       openTikTokLegal: (key: TikTokLegalLink) => Promise<void>
     }
   }
@@ -248,6 +268,12 @@ const api: BridgeClipAPI = {
   },
   edits: { inspect: (outputDir) => ipcRenderer.invoke('edits:inspect', outputDir) },
   models: { list: (refresh = false) => ipcRenderer.invoke('models:list', refresh) },
+  localai: {
+    status: () => ipcRenderer.invoke('localai:status'),
+    setup: () => ipcRenderer.invoke('localai:setup'),
+    cancel: () => ipcRenderer.invoke('localai:cancel'),
+    onProgress: (callback) => subscribe('localai:progress', callback)
+  },
   automations: {
     reviewContent: (id, contentId, returnToQueue) => ipcRenderer.invoke('automations:reviewContent', id, contentId, returnToQueue),
     acknowledgeWarnings: (id, contentId) => ipcRenderer.invoke('automations:acknowledgeWarnings', id, contentId),
@@ -300,11 +326,13 @@ const api: BridgeClipAPI = {
       onProgress: (callback) => subscribe('zernio:postProgress', callback),
       list: () => ipcRenderer.invoke('zernio:posts:list'),
       refresh: (force) => ipcRenderer.invoke('zernio:posts:refresh', force),
+      calendar: (from, to) => ipcRenderer.invoke('zernio:posts:calendar', from, to),
       cancel: (postId) => ipcRenderer.invoke('zernio:posts:cancel', postId),
       reschedule: (postId, scheduledFor, timezone) => ipcRenderer.invoke('zernio:posts:reschedule', postId, scheduledFor, timezone),
       retry: (postId) => ipcRenderer.invoke('zernio:posts:retry', postId),
       dismiss: (postId) => ipcRenderer.invoke('zernio:posts:dismiss', postId),
       open: (postId, targetIndex) => ipcRenderer.invoke('zernio:posts:open', postId, targetIndex),
+      openCalendarLink: (platform, url) => ipcRenderer.invoke('zernio:posts:openCalendarLink', platform, url),
       openTikTokLegal: (key) => ipcRenderer.invoke('zernio:posts:openTikTokLegal', key)
     }
   },

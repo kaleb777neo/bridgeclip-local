@@ -148,6 +148,26 @@ CAMERA_DEADZONE = 0.12
 CAMERA_MAX_SPEED = 0.9
 MAX_PATH_KEYFRAMES = 40
 
+# Talking-versus-listening tiebreak: when two people share the frame and
+# neither dominates, the largest face can be the listener leaning toward the
+# camera. Mouth-region motion sampled at 12 fps decides the subject; an
+# inconclusive signal keeps the existing largest-face choice.
+LIP_FPS = 12.0
+LIP_MIN_SHOT_MS = 1200
+LIP_MAX_SHOTS_PER_CLIP = 12
+# A challenger needs this share of the subject's face area to be worth a decode.
+LIP_MIN_COMPETING_AREA = 0.45
+# Mean 0-255 gray delta under this is nobody moving; a switch also requires
+# the winner to clear the runner-up by this ratio (camera pans raise both).
+LIP_NOISE_FLOOR = 1.5
+LIP_ACTIVITY_RATIO = 1.6
+LIP_MIN_SAMPLES = 4
+# Mouth band within a YuNet face box (boxes span forehead to chin).
+LIP_MOUTH_X = (0.28, 0.72)
+LIP_MOUTH_Y = (0.60, 0.95)
+LIP_CROP_W = 48
+LIP_CROP_H = 32
+
 
 class LayoutType:
     TALKING_HEAD = "talking_head"
@@ -1037,6 +1057,92 @@ def classify_shot(
     return ShotLayout(0, 0, LayoutType.SCREEN), None
 
 
+def competing_faces(tracks: list[FaceTrack], shot_frames: int) -> Optional[list[FaceTrack]]:
+    """The two largest on-camera tracks, when a listener could hold the lock.
+
+    Mirrors classify_shot's subject selection, so the first track is whoever
+    the camera currently follows. None when the subject is uncontested or the
+    frame is already a balanced two shot (both people get framed anyway).
+    """
+    present = [
+        t for t in tracks
+        if len(t.samples) >= max(1, MIN_TRACK_PRESENCE * shot_frames)
+        and t.median_box().h >= MIN_FACE_HEIGHT
+    ]
+    present.sort(key=lambda t: -t.median_box().area)
+    on_camera = [t for t in present if not is_corner_overlay(t.median_box())]
+    if len(on_camera) < 2:
+        return None
+    a, b = on_camera[0].median_box(), on_camera[1].median_box()
+    if b.area < LIP_MIN_COMPETING_AREA * a.area:
+        return None
+    similar = min(a.h, b.h) / max(a.h, b.h) >= 0.5
+    separated = abs(a.cx - b.cx) >= 0.22
+    if len(on_camera) == 2 and similar and separated:
+        return None
+    return on_camera[:2]
+
+
+def _box_at(samples: list[tuple[int, Box]], t: int) -> Optional[Box]:
+    """Face box at time t, interpolated between its detections.
+
+    None across a gap longer than the association window: the identity was
+    unobserved there, so motion in between cannot be attributed to it.
+    """
+    if not samples or t < samples[0][0] - 250 or t > samples[-1][0] + 250:
+        return None
+    if t <= samples[0][0]:
+        return samples[0][1]
+    if t >= samples[-1][0]:
+        return samples[-1][1]
+    for (t0, b0), (t1, b1) in zip(samples, samples[1:]):
+        if t <= t1:
+            if t1 - t0 > MAX_TRACK_GAP_MS:
+                return None
+            f = (t - t0) / max(t1 - t0, 1)
+            return Box(b0.x + (b1.x - b0.x) * f, b0.y + (b1.y - b0.y) * f,
+                      b0.w + (b1.w - b0.w) * f, b0.h + (b1.h - b0.h) * f)
+    return None
+
+
+def _mouth_crop(gray, box: Box, img_w: int, img_h: int):
+    """Mouth band of a face, resized to a fixed grid so frames stay comparable."""
+    x0 = int(round((box.x + box.w * LIP_MOUTH_X[0]) * img_w))
+    x1 = int(round((box.x + box.w * LIP_MOUTH_X[1]) * img_w))
+    y0 = int(round((box.y + box.h * LIP_MOUTH_Y[0]) * img_h))
+    y1 = int(round((box.y + box.h * LIP_MOUTH_Y[1]) * img_h))
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(img_w, x1), min(img_h, y1)
+    if x1 - x0 < 6 or y1 - y0 < 4:
+        return None
+    return cv2.resize(gray[y0:y1, x0:x1], (LIP_CROP_W, LIP_CROP_H), interpolation=cv2.INTER_AREA)
+
+
+def pick_talking_track(deltas: list[list[float]]) -> Optional[int]:
+    """Which candidate is talking, or None when the evidence must not move the camera.
+
+    Deltas come largest-face-first, so only an index above 0 switches the
+    subject. Silence (both under the noise floor) and camera pans (both rise
+    together) keep the existing choice.
+    """
+    if len(deltas) < 2:
+        return None
+    medians = [median(d) if len(d) >= LIP_MIN_SAMPLES else 0.0 for d in deltas]
+    best = max(range(len(medians)), key=lambda i: medians[i])
+    runner_up = max(m for i, m in enumerate(medians) if i != best)
+    if medians[best] < LIP_NOISE_FLOOR or medians[best] < LIP_ACTIVITY_RATIO * runner_up:
+        return None
+    return best
+
+
+def retarget_subject(shot: ShotLayout, track: FaceTrack, shot_start: int, shot_end: int,
+                     src_w: int, src_h: int) -> None:
+    """Repoint a talking-head shot's virtual camera at another face track."""
+    shot.people = [track.median_box()]
+    samples = [(t - shot_start, box) for t, box in track.samples]
+    shot.focus_path = smooth_focus_path(samples, shot_end - shot_start,
+                                        inset_crop_width(shot.crop_bounds, src_w, src_h))
+
+
 def smooth_focus_path(
     samples: list[tuple[int, Box]],
     duration_ms: int,
@@ -1486,6 +1592,7 @@ class LayoutAnalyzer:
             segments = list(zip(boundaries, boundaries[1:]))
         if progress:
             progress('Checking shot layouts', 0)
+        lip_budget = LIP_MAX_SHOTS_PER_CLIP
         for shot_index, (shot_start, shot_end) in enumerate(segments):
             if progress:
                 progress('Checking shot layouts', round(100 * shot_index / max(1, len(segments))))
@@ -1501,6 +1608,28 @@ class LayoutAnalyzer:
             reference_ms = (shot_start + shot_end) // 2
 
             inset = shot.content_box is not None or shot.crop_bounds is not None
+            if (lip_budget > 0 and not inset and vision
+                    and shot.layout == LayoutType.TALKING_HEAD
+                    and shot_end - shot_start >= LIP_MIN_SHOT_MS):
+                # The largest face may be a listener leaning toward the camera;
+                # mouth motion picks the speaker when the two are close enough
+                # to be confused, and never moves the camera on weak evidence.
+                rivals = competing_faces(track_faces(shot_frames), len(shot_frames))
+                if rivals is not None:
+                    lip_budget -= 1
+                    deltas = await loop.run_in_executor(
+                        None, self._mouth_activity, video_path, start_ms,
+                        shot_start, shot_end, src_w, src_h, rivals)
+                    winner = pick_talking_track(deltas)
+                    if decision is not None:
+                        decision["lips"] = {
+                            "scores": [round(median(d), 2) if d else None for d in deltas],
+                            "switched": winner is not None and winner > 0}
+                    if winner is not None and winner > 0:
+                        logger.info(
+                            f"Retargeting subject at {shot_start / 1000:.1f}s to the talking face "
+                            f"(mouth motion {median(deltas[winner]):.1f} vs {median(deltas[0]):.1f})")
+                        retarget_subject(shot, rivals[winner], shot_start, shot_end, src_w, src_h)
             if inset and decision is not None:
                 decision["vision"] = {"status": "content_region"}
             if vision and self._vision_enabled() and not inset:
@@ -1735,6 +1864,52 @@ class LayoutAnalyzer:
         cv2.normalize(hist, hist)
         return FrameInfo(t_ms=t_ms, faces=boxes, hist=hist, scores=scores,
                         content_box=detect_content_box(image))
+
+    def _mouth_activity(
+        self, video_path: str, render_start_ms: int, shot_start: int, shot_end: int,
+        src_w: int, src_h: int, tracks: list[FaceTrack],
+    ) -> list[list[float]]:
+        """Frame-to-frame mouth-region gray deltas per track across the shot.
+
+        A second, short decode at LIP_FPS: the main pass keeps no pixels and
+        4 fps misses mouth movement. Best effort — a failed decode yields
+        fewer samples and the tiebreak simply keeps the current subject.
+        """
+        width, height = analysis_dimensions(src_w, src_h)
+        cmd = [
+            "ffmpeg", "-nostdin", "-v", "error",
+            "-ss", f"{(render_start_ms + shot_start) / 1000:.3f}",
+            "-protocol_whitelist", "file,pipe,fd", "-format_whitelist", "mov,matroska,webm,avi,flv,mpegts",
+            "-i", video_path,
+            "-t", f"{(shot_end - shot_start) / 1000:.3f}",
+            "-map", "0:v:0", "-an", "-sn", "-dn",
+            "-vf", f"fps={LIP_FPS},scale={width}:{height}",
+            "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
+        ]
+        frame_bytes = width * height * 3
+        local_samples = [[(t - shot_start, b) for t, b in track.samples] for track in tracks]
+        deltas: list[list[float]] = [[] for _ in tracks]
+        previous: list[Any] = [None] * len(tracks)
+        try:
+            with media_process(cmd, timeout=2 * 60) as (proc, _stderr):
+                index = 0
+                while True:
+                    raw = proc.stdout.read(frame_bytes)
+                    if not raw or len(raw) != frame_bytes:
+                        break
+                    gray = cv2.cvtColor(np.frombuffer(raw, np.uint8).reshape(height, width, 3),
+                                        cv2.COLOR_BGR2GRAY)
+                    t_ms = int(index * 1000 / LIP_FPS)
+                    for i, samples in enumerate(local_samples):
+                        box = _box_at(samples, t_ms)
+                        crop = _mouth_crop(gray, box, width, height) if box is not None else None
+                        if crop is not None and previous[i] is not None:
+                            deltas[i].append(float(np.abs(crop.astype(np.float32) - previous[i]).mean()))
+                        previous[i] = crop
+                    index += 1
+        except (OSError, ValueError, MediaProcessError):
+            logger.warning("Mouth activity decode failed; keeping the largest-face subject")
+        return deltas
 
     def _precise_frames(self, video_path, start_ms, duration_ms, src_w, src_h, progress=None):
         """Sample faces, scan every frame for camera changes, and examine the

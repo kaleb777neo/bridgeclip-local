@@ -9,6 +9,7 @@ const execFileAsync = promisify(execFile)
 import { createInterface } from 'readline'
 import { Transform } from 'stream'
 import { loadSettings, getSettingsForBridge, vocabularyTerms } from './settings-store'
+import { modelsDir } from './local-ai'
 import { logger } from './logger'
 import { parseJobOutput, type JobOutput } from '../shared/job-output'
 import { BRIDGE_CONTRACT_VERSION } from '../shared/job-contract'
@@ -490,6 +491,9 @@ export function startClipJob(
     ...envVars,
     PYTHONPATH: enginePath,
     BRIDGECLIP_WORK_ROOT: jobWorkRoot,
+    // Shared with the offline setup in Settings → Local AI, so Whisper
+    // weights are downloaded once and reused by every job.
+    BRIDGECLIP_MODELS_DIR: modelsDir(),
     PYTHONUNBUFFERED: '1',
     PYTHONDONTWRITEBYTECODE: '1'
   }

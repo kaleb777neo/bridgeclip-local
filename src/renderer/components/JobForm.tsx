@@ -410,6 +410,11 @@ export function FormatStep({ draft, update }: { draft: ClipDraft; update: Update
 
 export function ClipsStep({ draft, update }: { draft: ClipDraft; update: Update }): React.JSX.Element {
   const jevEnabled = useSettingsStore((s) => s.jevEnabled === 'on')
+  const localProvider = useSettingsStore((s) => s.aiProvider === 'local')
+  const nvidiaProvider = useSettingsStore((s) => s.aiProvider === 'nvidia')
+  const localPlannerModel = useSettingsStore((s) => s.localPlannerModel)
+  const nvidiaPlannerModel = useSettingsStore((s) => s.nvidiaPlannerModel)
+  const localWhisperModel = useSettingsStore((s) => s.localWhisperModel)
   const toggleDuration = (id: string): void => {
     update({ durations: draft.durations.includes(id) ? draft.durations.filter((d) => d !== id) : [...draft.durations, id] })
   }
@@ -428,23 +433,36 @@ export function ClipsStep({ draft, update }: { draft: ClipDraft; update: Update 
         <p id="clip-request-help" className="mt-2 text-2xs text-ink-subtle">Only matching moments are clipped, so you may get fewer clips, or none. Leave blank for the best moments.</p>
       </Group>
       <Group label="Clipping mode">
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3" role="radiogroup" aria-label="Clipping mode">
-          {([
-            { id: 'quality', label: 'Quality', hint: `GPT-6 Sol planning · ${draft.workflow === 'review' ? 'Jev review required' : `Jev review & repairs ${jevEnabled ? 'enabled' : 'off'}`} · MAI Transcribe 2` },
-            { id: 'economy', label: 'Economy', hint: 'GLM 5.3 Flash planning · Whisper Turbo' },
-            { id: 'advanced', label: 'Advanced', hint: 'Choose your OpenRouter models' }
-          ] as const).map((mode) => {
-            const selected = draft.clippingMode === mode.id
-            return <button key={mode.id} type="button" role="radio" aria-checked={selected} tabIndex={selected ? 0 : -1}
-              onKeyDown={onRadioKeyDown} onClick={() => update({ clippingMode: mode.id })}
-              className={cn('glass-tile glass-tile-hover rounded-xl px-3 py-2.5 text-left', selected && 'glass-selected')}>
-              <span className="block text-sm font-medium text-ink">{mode.label}</span>
-              <span className="block text-2xs text-ink-subtle">{mode.hint}</span>
-            </button>
-          })}
-        </div>
-        {draft.clippingMode === 'advanced' ? <AdvancedModels draft={draft} update={update} /> :
-          <p className="mt-2 text-2xs text-ink-subtle">Economy uses lower-cost models and skips paid vision checks. Transcription retries temporary errors and can fall back to Whisper Large V3, then MAI Transcribe 2. Clip choices and captions may be less accurate.</p>}
+        {localProvider ? (
+          <div className="glass-tile rounded-xl px-3 py-2.5" aria-label="Offline clipping mode">
+            <span className="block text-sm font-medium text-ink">Offline · {localPlannerModel} planning · Whisper {localWhisperModel} transcription</span>
+            <span className="block text-2xs text-ink-subtle">Runs entirely on this computer. Change models in Settings → Local AI; Jev review and web research are skipped offline.</span>
+          </div>
+        ) : nvidiaProvider ? (
+          <div className="glass-tile rounded-xl px-3 py-2.5" aria-label="Free NVIDIA clipping mode">
+            <span className="block text-sm font-medium text-ink">Free · {nvidiaPlannerModel} planning · Whisper {localWhisperModel} transcription</span>
+            <span className="block text-2xs text-ink-subtle">Planning runs on NVIDIA’s free cloud tier (about 40 requests per minute); transcription runs on this computer. Change models in Settings → AI provider; Jev review and web research are skipped.</span>
+          </div>
+        ) : (
+          <>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3" role="radiogroup" aria-label="Clipping mode">
+              {([
+                { id: 'quality', label: 'Quality', hint: `GPT-6 Sol planning · ${draft.workflow === 'review' ? 'Jev review required' : `Jev review & repairs ${jevEnabled ? 'enabled' : 'off'}`} · MAI Transcribe 2` },
+                { id: 'economy', label: 'Economy', hint: 'GLM 5.3 Flash planning · Whisper Turbo' },
+                { id: 'advanced', label: 'Advanced', hint: 'Choose your OpenRouter models' }
+              ] as const).map((mode) => {
+                const selected = draft.clippingMode === mode.id
+                return <button key={mode.id} type="button" role="radio" aria-checked={selected} tabIndex={selected ? 0 : -1}
+                  onKeyDown={onRadioKeyDown} onClick={() => update({ clippingMode: mode.id })}
+                  className={cn('glass-tile glass-tile-hover rounded-xl px-3 py-2.5 text-left', selected && 'glass-selected')}>
+                  <span className="block text-sm font-medium text-ink">{mode.label}</span>
+                  <span className="block text-2xs text-ink-subtle">{mode.hint}</span>
+                </button>
+              })}
+            </div>
+            {draft.clippingMode === 'advanced' && <AdvancedModels draft={draft} update={update} />}
+          </>
+        )}
       </Group>
       <Group label="Clip length" aside={draft.durations.length === 0 ? 'Any length' : `${draft.durations.length} selected`}>
         <div className="grid grid-cols-4 gap-1.5 sm:grid-cols-7" role="group" aria-label="Clip length options">
@@ -546,6 +564,7 @@ function ReviewStep({ draft, trim, onEdit }: {
   onEdit: (step: WizardStep) => void
 }): React.JSX.Element {
   const active = useActiveJobs()
+  const aiProvider = useSettingsStore((s) => s.aiProvider)
   const runningCount = active.filter((job) => job.status !== 'queued').length
   const lengths = draft.durations.length === 0
     ? 'Any length'
@@ -592,7 +611,11 @@ function ReviewStep({ draft, trim, onEdit }: {
           ? `${runningCount} jobs are running. This one waits in the queue and starts automatically.`
           : active.length > 0
             ? `Runs alongside ${active.length} other job${active.length === 1 ? '' : 's'}. Up to ${MAX_PARALLEL_JOBS} run at once.`
-            : 'Runs on this computer. Transcription and clip planning bill your OpenRouter account.'}
+            : aiProvider === 'local'
+              ? 'Runs on this computer; nothing leaves the machine.'
+              : aiProvider === 'nvidia'
+                ? 'Runs on this computer. Planning uses NVIDIA’s free tier; transcription stays local.'
+                : 'Runs on this computer. Transcription and clip planning bill your OpenRouter account.'}
       </p>
     </div>
   )

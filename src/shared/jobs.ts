@@ -61,6 +61,8 @@ export interface JobSnapshot {
   stages?: PipelineStage[]
   diagnostics?: RunDiagnostics
   progressAt?: number
+  /** When the current status first appeared; lets the UI time the active step even without engine stage measurements. */
+  statusAt?: number
   step: string
   clipsDone: number
   clipsTotal: number

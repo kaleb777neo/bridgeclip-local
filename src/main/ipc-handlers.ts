@@ -21,6 +21,7 @@ import { assertAbsolutePath, assertMediaPath, assertTrustedSender, authorizeMedi
 import { assertPublicWebUrl } from './network-policy'
 import { validateJobConfig } from './validation'
 import { getModelCatalog, resolveAdvancedModels } from './openrouter-models'
+import { cancelLocalAiSetup, ensureOllamaRunning, getLocalAiStatus, setupLocalAi } from './local-ai'
 import { getYouTubePreview } from './youtube-preview'
 import { randomUUID } from 'crypto'
 import { resolveBinary, supportsCaptionFilter } from './tools'
@@ -42,11 +43,13 @@ import {
   checkZernioStatus
 } from './zernio/service'
 import {
+  calendarPosts,
   cancelPost,
   cancelUpload,
   dismissPost,
   getTikTokCreatorInfo,
   listPosts,
+  openCalendarPostLink,
   openPostLink,
   openTikTokLegal,
   probeClipForPosting,
@@ -73,6 +76,20 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
   handle('settings:storageUsage', (_event, fresh: unknown = false) => measureOutputStorage(loadSettings().outputDirectory, { fresh: fresh === true }))
   handle('models:list', (_event, refresh: unknown = false) => getModelCatalog(refresh))
   handle('source:youtubePreview', (_event, source: unknown, details: unknown = false) => getYouTubePreview(source, details))
+
+  // Offline AI backend: readiness checks and one-click deployment.
+  handle('localai:status', async () => {
+    const settings = loadSettings()
+    const pythonPath = resolvePythonPath(getEnginePath(), settings.pythonPath)
+    return getLocalAiStatus(settings, pythonPath)
+  })
+  handle('localai:setup', (event) => setupLocalAi(loadSettings(), (progress) => {
+    if (!event.sender.isDestroyed()) event.sender.send('localai:progress', progress)
+  }))
+  handle('localai:cancel', () => {
+    cancelLocalAiSetup()
+    return true
+  })
 
   handle('settings:save', (_event, settings: PublicSettings) => {
     const current = loadSettings()
@@ -110,6 +127,8 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
   }))
   handle('zernio:posts:cancelUpload', (_event, attemptId: unknown) => cancelUpload(attemptId))
   handle('zernio:posts:list', () => listPosts())
+  handle('zernio:posts:calendar', (_event, from: unknown, to: unknown) => calendarPosts(from, to))
+  handle('zernio:posts:openCalendarLink', (_event, platform: unknown, url: unknown) => openCalendarPostLink(platform, url))
   handle('zernio:posts:refresh', (_event, force: unknown) => refreshPosts(force))
   handle('zernio:posts:cancel', (_event, postId: unknown) => cancelPost(postId))
   handle('zernio:posts:reschedule', (_event, postId: unknown, scheduledFor: unknown, timezone: unknown) => reschedulePost(postId, scheduledFor, timezone))
@@ -176,7 +195,9 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
 
     try {
       config = validateJobConfig(config)
-      if (config.clippingMode === 'advanced') {
+      // The Advanced-mode catalog is OpenRouter's; the other backends serve
+      // their own models and would also fail the catalog fetch.
+      if (config.clippingMode === 'advanced' && loadSettings().aiProvider === 'cloud') {
         config.plannerCapabilities = await resolveAdvancedModels(config.plannerModel!, config.transcriptionModel!)
       }
       if (isWebUrl(config.videoUrl)) await assertPublicWebUrl(config.videoUrl)
@@ -185,9 +206,40 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
     } catch (error) { return { error: error instanceof Error ? error.message : 'Invalid job options' } }
     const settings = loadSettings()
 
-    if (!settings.openrouterApiKey) {
+    if (settings.aiProvider === 'local') {
+      // Offline mode: no cloud key needed, but the local stack must be ready.
+      // The managed runtime is auto-started here, so a reboot needs no click.
+      await ensureOllamaRunning(settings.localLlmBaseUrl)
+      const status = await getLocalAiStatus(settings, resolvePythonPath(getEnginePath(), settings.pythonPath))
+      if (!status.whisperRuntime) {
+        return { error: 'Offline transcription is not installed yet. Open Settings → Local AI and run the offline setup first.' }
+      }
+      if (!status.whisperModelReady) {
+        return { error: `Whisper ${settings.localWhisperModel} weights are missing. Open Settings → Local AI and run the offline setup first.` }
+      }
+      if (!status.ollamaRunning) {
+        return { error: 'The local AI runtime (Ollama) is not running. Start Ollama or open Settings → Local AI and run the offline setup.' }
+      }
+      if (!status.plannerReady) {
+        return { error: `The local model ${settings.localPlannerModel} is not installed. Open Settings → Local AI and run the offline setup.` }
+      }
+    } else if (settings.aiProvider === 'nvidia') {
+      // Free NVIDIA planning: the key pays for chat, while transcription runs
+      // on the local Whisper stack, so only that part must be installed.
+      if (!settings.nvidiaApiKey) {
+        logger.warn('job.start.missingKey', { key: 'NVIDIA_API_KEY' })
+        return { error: 'A NVIDIA API key is required for free cloud planning. Create one at build.nvidia.com and add it in Settings, or choose another provider in Settings → Local AI.' }
+      }
+      const status = await getLocalAiStatus(settings, resolvePythonPath(getEnginePath(), settings.pythonPath))
+      if (!status.whisperRuntime) {
+        return { error: 'Free transcription is not installed yet. Open Settings → Local AI and run the offline setup first.' }
+      }
+      if (!status.whisperModelReady) {
+        return { error: `Whisper ${settings.localWhisperModel} weights are missing. Open Settings → Local AI and run the offline setup first.` }
+      }
+    } else if (!settings.openrouterApiKey) {
       logger.warn('job.start.missingKey', { key: 'OPENROUTER_API_KEY' })
-      return { error: 'OpenRouter API key is required for AI clip planning. Go to Settings to add it.' }
+      return { error: 'OpenRouter API key is required for AI clip planning. Go to Settings to add it, or switch to the local offline mode in Settings → Local AI.' }
     }
 
     const enginePath = getEnginePath()

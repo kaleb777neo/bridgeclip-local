@@ -87,6 +87,12 @@ FAILURES = (
     (("transcription failed",),
      "Audio transcription failed.",
      "Check that the video has a playable audio track, then retry."),
+    (("local transcription is not installed", "could not load local whisper", "unknown local whisper model", "local backend unavailable",),
+     "The offline transcription stack is not ready.",
+     "Open Settings → Local AI and run the offline setup, then retry."),
+    (("local ai runtime (ollama) is not running", "local model '", "local ai request failed",),
+     "The offline AI runtime is not answering.",
+     "Open Settings → Local AI, confirm Ollama is running and the model is installed, then retry."),
     (("video render failed",),
      "Clip rendering failed.",
      "Run Settings → System check. If all tools are ready, report this run so the render can be diagnosed."),
@@ -126,6 +132,12 @@ FAILURES = (
     (("no clip-worthy moments",),
      "BridgeClip couldn't find any clips in this video.",
      "No clear spoken or visual moment met the selected clip length. If you set a start and end time, widen it or pick a shorter clip length."),
+    (("nvidia api error (401)", "nvidia api error (403)"),
+     "NVIDIA rejected the API key.",
+     "Check the NVIDIA key in Settings. It starts with nvapi- and is generated at build.nvidia.com."),
+    (("nvidia api error (429)",),
+     "NVIDIA's free tier rate limit was reached.",
+     "Wait a minute and retry. For sustained runs, request a higher rate limit from build.nvidia.com."),
     (("out of credits", "quota exceeded"),
      "Your OpenRouter key is out of credits.",
      "Add credits at openrouter.ai/credits or raise the key's limit at openrouter.ai/keys."),
@@ -183,6 +195,65 @@ def progress_callback(progress) -> None:
     })
 
 
+def _local_ai_ports() -> tuple[int, ...]:
+    """Loopback ports the local AI backend may use (Ollama chat endpoint)."""
+    from urllib.parse import urlparse
+
+    base_url = os.environ.get("LOCAL_LLM_BASE_URL", "http://127.0.0.1:11434")
+    try:
+        parsed = urlparse(base_url if "://" in base_url else f"http://{base_url}")
+        host = (parsed.hostname or "").lower()
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        # Only the machine itself; a LAN-hosted runtime stays blocked.
+        if host in ("localhost", "127.0.0.1", "::1", "[::1]"):
+            return (port,)
+    except ValueError:
+        pass
+    return ()
+
+
+def check_whisper_ready() -> "str | None":
+    """Fail fast when the offline transcription runtime is missing."""
+    try:
+        import faster_whisper  # noqa: F401
+    except ImportError:
+        return ("Local transcription is not installed. Open Settings → Local AI and run "
+                "the offline setup before clipping without a cloud provider.")
+    return None
+
+
+def check_ollama_ready(settings) -> "str | None":
+    """Fail fast when the offline chat runtime is missing or has no model."""
+    base_url = getattr(settings, "local_llm_base_url", "http://127.0.0.1:11434").rstrip("/")
+    planner = getattr(settings, "planner_model", "qwen3:8b")
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"{base_url}/api/tags", timeout=3) as response:
+            tags = json.loads(response.read().decode("utf-8", "replace"))
+    except Exception:
+        return ("The local AI runtime (Ollama) is not running. Open Settings → Local AI "
+                "and run the offline setup, or start Ollama, then retry.")
+    installed = {model.get("name") or model.get("model") for model in tags.get("models", [])}
+    if planner not in installed:
+        return (f"The local model '{planner}' is not installed in Ollama. Open Settings → "
+                "Local AI and run the offline setup to download it.")
+    return None
+
+
+def check_local_backend(settings) -> "str | None":
+    """Fail fast with an actionable message when the offline stack is not ready."""
+    return check_whisper_ready() or check_ollama_ready(settings)
+
+
+def check_nvidia_backend() -> "str | None":
+    """Fail fast when the NVIDIA backend's local whisper stack is not ready.
+
+    NVIDIA NIM has no transcription endpoint, so the free backend transcribes
+    with faster-whisper locally; the chat side only needs the API key.
+    """
+    return check_whisper_ready()
+
+
 async def run(config: dict) -> bool:
     """Run the clipping pipeline with the given config."""
     config = validate_config(config)
@@ -199,25 +270,41 @@ async def run(config: dict) -> bool:
     os.environ["YTDLP_NO_PLUGINS"] = "1"
     os.environ["LAYOUT_VISION_ENABLED"] = "true" if config["layout_vision_enabled"] else "false"
     os.environ["CLIPPING_MODE"] = config.get("clipping_mode", "quality")
+    backend = os.environ.get("AI_BACKEND", "cloud")
+    local_backend = backend == "local"
+    nvidia_backend = backend == "nvidia"
     if config.get("clipping_mode", "quality") == "economy":
         # Each job has its own bridge process, so model choices cannot leak to
         # another queued or concurrent run. Do not fall back to higher-cost planners.
-        os.environ["PLANNER_MODEL"] = "z-ai/glm-5.3-flash"
-        os.environ["EDITORIAL_REPAIR_MODEL"] = "google/gemini-3.8-flash"
         os.environ["PLANNER_FALLBACK_MODELS"] = ""
         os.environ["LAYOUT_VISION_ENABLED"] = "false"
+        if not nvidia_backend:
+            os.environ["PLANNER_MODEL"] = "z-ai/glm-5.3-flash"
+            os.environ["EDITORIAL_REPAIR_MODEL"] = "google/gemini-3.8-flash"
     elif config.get("clipping_mode") == "advanced":
-        os.environ["PLANNER_MODEL"] = config["planner_model"]
+        # Advanced models come from the OpenRouter catalog; the NVIDIA backend
+        # serves its own models and the UI does not offer the combination.
+        if not nvidia_backend:
+            os.environ["PLANNER_MODEL"] = config["planner_model"]
+            os.environ["ADVANCED_TRANSCRIPTION_MODEL"] = config["transcription_model"]
         os.environ["PLANNER_FALLBACK_MODELS"] = ""
-        os.environ["ADVANCED_TRANSCRIPTION_MODEL"] = config["transcription_model"]
         os.environ["PLANNER_MAX_OUTPUT_TOKENS"] = str(config.get("planner_max_output_tokens", 32000))
         os.environ["PLANNER_SUPPORTS_IMAGES"] = str(config.get("planner_supports_images", False)).lower()
         for name in ("planner_input_price", "planner_output_price"):
             if config.get(name) is not None:
                 os.environ[name.upper()] = str(config[name])
 
+    if local_backend or nvidia_backend:
+        # Cloud-only stages have no free equivalent: Jev decisions and web
+        # research are OpenRouter services, and without a vision model smart
+        # framing falls back to the bundled local YuNet face detector.
+        os.environ["JEV_ENABLED"] = "false"
+        os.environ["JEV_VISUAL_CONTEXT"] = "false"
+        os.environ["SOURCE_CONTEXT_WEB_RESEARCH"] = "false"
+        os.environ["LAYOUT_VISION_ENABLED"] = "false"
+
     from network_guard import install as install_network_guard
-    install_network_guard()
+    install_network_guard(allowed_loopback_ports=_local_ai_ports() if local_backend else ())
 
     from clip_engine.logging_safety import install_safe_logging
     install_safe_logging()
@@ -237,8 +324,20 @@ async def run(config: dict) -> bool:
     settings = get_settings()
 
     missing = []
-    if not settings.openrouter_api_key:
+    if backend == "cloud" and not settings.openrouter_api_key:
         missing.append("OPENROUTER_API_KEY")
+    if nvidia_backend and not settings.nvidia_api_key:
+        missing.append("NVIDIA_API_KEY")
+    if local_backend:
+        local_error = check_local_backend(settings)
+        if local_error:
+            emit({"type": "error", "message": local_error})
+            return False
+    if nvidia_backend:
+        nvidia_error = check_nvidia_backend()
+        if nvidia_error:
+            emit({"type": "error", "message": nvidia_error})
+            return False
     if missing:
         emit({"type": "error", "message": f"Missing required API keys: {', '.join(missing)}"})
         return False

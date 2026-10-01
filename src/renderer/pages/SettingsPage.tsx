@@ -1,6 +1,7 @@
 import { JevSettings } from '../components/JevSettings'
+import { LocalAiSection } from '../components/LocalAiSection'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { ArrowUpRight, BookA, Check, ChevronDown, Cpu, FolderOpen, Github, History, Info, KeyRound, Loader2, RefreshCw, ScrollText, SlidersHorizontal } from 'lucide-react'
+import { ArrowUpRight, BookA, Check, ChevronDown, CloudOff, Cpu, FolderOpen, Github, History, Info, KeyRound, Loader2, RefreshCw, ScrollText, SlidersHorizontal } from 'lucide-react'
 import { useSettingsStore } from '../store/use-settings-store'
 import { useChangelogStore } from '../store/use-changelog-store'
 import { useApiKeyDrafts } from '../hooks/use-api-key-drafts'
@@ -21,12 +22,12 @@ import { Callout } from '../components/ui/Callout'
 import { UpdatesRow } from '../components/Updates'
 import { OutputStorage } from '../components/OutputStorage'
 
-type SectionId = 'keys' | 'jev' | 'vocabulary' | 'output' | 'system' | 'about'
+type SectionId = 'localai' | 'keys' | 'jev' | 'vocabulary' | 'output' | 'system' | 'about'
 type SectionTone = 'success' | 'warning' | 'danger' | 'idle'
 
-/** `showUpdates` changes each time Help → Check for Updates… asks for the Updates row. */
+/** `showUpdates` changes each time Help → Check for Updates… asks the Updates row. */
 export function SettingsPage({ showUpdates = 0 }: { showUpdates?: number }): React.JSX.Element {
-  const { outputDirectory, pythonPath, customVocabulary, openrouterConfigured, zernioConfigured, sourceContextWebResearch, saving, save, toolStatus, toolError, checkTools, checkingTools } =
+  const { outputDirectory, pythonPath, customVocabulary, openrouterConfigured, nvidiaConfigured, zernioConfigured, sourceContextWebResearch, aiProvider, saving, save, toolStatus, toolError, checkTools, checkingTools } =
     useSettingsStore()
   const keys = useApiKeyDrafts()
   const [isPackaged, setIsPackaged] = useState(true)
@@ -53,10 +54,13 @@ export function SettingsPage({ showUpdates = 0 }: { showUpdates?: number }): Rea
   const tools = toolRows(toolStatus)
   const toolsChecked = tools.every((row) => row.ok != null)
   const toolsMissing = tools.filter((row) => !row.optional && row.ok === false).length
-  const keysMissing = Number(!openrouterConfigured)
+  const localProvider = aiProvider === 'local'
+  const nvidiaProvider = aiProvider === 'nvidia'
+  const keysMissing = Number(aiProvider === 'cloud' && !openrouterConfigured) + Number(nvidiaProvider && !nvidiaConfigured)
   const vocabularyTerms = customVocabulary.split('\n').filter((line) => line.trim()).length
 
   const sections: { id: SectionId; label: string; icon: ReactNode; tone: SectionTone }[] = [
+    { id: 'localai', label: 'Local AI', icon: <CloudOff />, tone: 'idle' },
     { id: 'keys', label: 'API keys', icon: <KeyRound />, tone: keysMissing ? 'warning' : 'success' },
     { id: 'jev', label: 'TypeSafe Jev', icon: <SlidersHorizontal />, tone: 'idle' },
     { id: 'vocabulary', label: 'Vocabulary', icon: <BookA />, tone: 'idle' },
@@ -74,7 +78,8 @@ export function SettingsPage({ showUpdates = 0 }: { showUpdates?: number }): Rea
   }, [showUpdates])
 
   const checks: { label: string; ok: boolean | null; detail: string; section: SectionId; optional?: boolean; tone?: 'danger' }[] = [
-    { label: 'OpenRouter', ok: openrouterConfigured, detail: openrouterConfigured ? 'Key saved' : 'Needed to transcribe and pick clips', section: 'keys' },
+    { label: 'OpenRouter', ok: openrouterConfigured, detail: openrouterConfigured ? 'Key saved' : localProvider || nvidiaProvider ? 'Not needed in this mode' : 'Needed to transcribe and pick clips', section: 'keys', optional: localProvider || nvidiaProvider },
+    { label: 'NVIDIA', ok: nvidiaConfigured, detail: nvidiaConfigured ? 'Key saved' : nvidiaProvider ? 'Needed for free clip planning' : 'Optional, free planning provider', section: 'keys', optional: !nvidiaProvider },
     { label: 'Tools', ok: toolsChecked ? toolsMissing === 0 : null, detail: !toolsChecked ? (checkingTools ? 'Checking…' : 'Not checked') : toolsMissing ? `${toolsMissing} missing` : 'All installed', section: 'system', tone: 'danger' },
     { label: 'Zernio', ok: zernioConfigured, detail: zernioConfigured ? 'Posting on' : 'Optional, for posting', section: 'keys', optional: true }
   ]
@@ -116,7 +121,7 @@ export function SettingsPage({ showUpdates = 0 }: { showUpdates?: number }): Rea
                 <IconTile tone={blocking ? 'warning' : 'success'} size="lg">{blocking ? <KeyRound /> : <Check strokeWidth={3} />}</IconTile>
                 <div>
                   <h2 className="text-sm font-semibold text-ink">{blocking ? `${blocking} thing${blocking === 1 ? '' : 's'} to set up before clipping` : 'Ready to clip'}</h2>
-                  <p className="mt-0.5 text-xs text-ink-muted">{APP_NAME} runs on this computer. One OpenRouter key covers transcription and clip selection.</p>
+                  <p className="mt-0.5 text-xs text-ink-muted">{APP_NAME} runs on this computer. {localProvider ? 'Offline mode clips with local models; no cloud key needed.' : nvidiaProvider ? 'NVIDIA’s free tier picks the clips; transcription runs on this machine.' : 'One OpenRouter key covers transcription and clip selection.'}</p>
                 </div>
               </div>
             </div>
@@ -137,6 +142,8 @@ export function SettingsPage({ showUpdates = 0 }: { showUpdates?: number }): Rea
               ))}
             </div>
           </Panel>
+
+          <LocalAiSection />
 
           <Section id="keys">
             <PanelHeader
@@ -165,6 +172,19 @@ export function SettingsPage({ showUpdates = 0 }: { showUpdates?: number }): Rea
                   <span className="mt-1 block text-xs text-ink-subtle">Off by default. When on, the video’s title, description and channel go to OpenRouter web search (up to two searches) and Gemini builds a channel and video overview before transcription. Uses extra OpenRouter credit and adds time. Only YouTube and Twitch sources are researched; local files never are. View the brief and sources in the transcript inspector.</span>
                 </span>
               </label>
+              <KeyRow>
+                <ApiKeyInput
+                  label="NVIDIA (free tier)"
+                  value={keys.drafts.nvidiaApiKey}
+                  configured={nvidiaConfigured}
+                  onChange={(v) => keys.setDraft('nvidiaApiKey', v)}
+                  onRemove={() => void keys.remove('nvidiaApiKey')}
+                  onBlur={() => void keys.persist()}
+                  placeholder="nvapi-…"
+                  description="Free clip planning on build.nvidia.com (~1000 credits, 40 requests per minute). Pick the NVIDIA provider in the AI provider section above to use it."
+                  getKeyUrl={PROVIDER_LINKS.nvidia}
+                />
+              </KeyRow>
               <p className="eyebrow px-1 pt-2">Optional</p>
               <KeyRow>
                 <ApiKeyInput

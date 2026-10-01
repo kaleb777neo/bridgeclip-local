@@ -47,6 +47,7 @@ function ipcWithLibrary(library) {
     './network-policy': {},
     './validation': {},
     './openrouter-models': {},
+    './local-ai': {},
     './tools': {},
     './zernio/service': {},
     './zernio/posts': {},

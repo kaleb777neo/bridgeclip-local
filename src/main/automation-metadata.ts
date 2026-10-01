@@ -1,20 +1,23 @@
 import { app } from 'electron'
-import { execFile } from 'child_process'
-import { mkdtemp, readFile, readdir, rm, stat } from 'fs/promises'
+import { execFile, spawn } from 'child_process'
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { promisify } from 'util'
 import { AUTOMATION_PLATFORMS, MAX_RESEARCH_URL, type GeneratedPlatformMetadata, type AutomationSourceContext, type MetadataResearch } from '../shared/automations'
 import { PLATFORM_RULES, captionLength, youtubeTitleFor, type FacebookFormat } from '../shared/zernio-posts'
-import { loadSettings, vocabularyTerms } from './settings-store'
+import { loadSettings, vocabularyTerms, type AppSettings } from './settings-store'
 import { resolveBinary } from './tools'
 import { logger } from './logger'
 import { readResponseText } from './http-response'
+import { getEnginePath, resolvePythonPath } from './pipeline-runner'
+import { modelsDir } from './local-ai'
 
 const execFileAsync = promisify(execFile)
 type Platform = (typeof AUTOMATION_PLATFORMS)[number]
 const CATEGORY_IDS = new Set(['1', '10', '20', '22', '24', '27', '28'])
 const MODEL = 'openai/gpt-4.1-mini'
+const NVIDIA_CHAT_URL = 'https://integrate.api.nvidia.com/v1/chat/completions'
 const MAX_TRANSCRIPT = 20_000
 export interface MetadataContext { guidance?: string; facebookFormat?: FacebookFormat; source?: AutomationSourceContext | null; research?: MetadataResearch }
 
@@ -37,28 +40,154 @@ function endpoint(name: 'BRIDGECLIP_E2E_TRANSCRIPTION_URL' | 'BRIDGECLIP_E2E_OPE
   return app.isPackaged ? production : process.env[name] || production
 }
 
-async function providerResponse(response: Response, operation: 'transcription' | 'metadata', maxBytes = 100_000): Promise<Record<string, unknown>> {
+// ---------------------------------------------------------------------------
+// Local backend: Ollama chat + faster-whisper through the engine venv
+// ---------------------------------------------------------------------------
+
+/** One structured-output chat call against the local Ollama server. */
+async function ollamaContent(
+  settings: AppSettings,
+  body: { model: string; messages: { role: string; content: string }[]; format?: unknown; maxTokens: number; temperature?: number }
+): Promise<string> {
+  const response = await fetch(`${settings.localLlmBaseUrl.replace(/\/+$/, '')}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    redirect: 'error',
+    signal: AbortSignal.timeout(300_000),
+    body: JSON.stringify({
+      model: body.model,
+      messages: body.messages,
+      stream: false,
+      think: false,
+      ...(body.format ? { format: body.format } : {}),
+      options: { temperature: body.temperature ?? 0.2, num_predict: body.maxTokens }
+    })
+  })
+  if (!response.ok) {
+    throw new Error(`The local AI runtime answered with ${response.status}. Check Settings → Local AI and try again.`)
+  }
+  const data = JSON.parse(await readResponseText(response, 2_000_000, 'The local model returned too much metadata.')) as { message?: { content?: unknown } }
+  if (typeof data.message?.content !== 'string' || !data.message.content.trim()) {
+    throw new Error('The local model returned no metadata. The clip was not posted.')
+  }
+  return data.message.content
+}
+
+/** Transcribe the segmented WAVs with the engine's local Whisper backend. */
+async function localWhisperTexts(settings: AppSettings, wavPaths: string[]): Promise<string[]> {
+  const pythonPath = resolvePythonPath(getEnginePath(), settings.pythonPath)
+  const directory = await mkdtemp(join(tmpdir(), 'bridgeclip-local-stt-'))
+  const script = join(directory, 'transcribe.py')
+  await writeFile(script, [
+    'import json, os, sys',
+    'from types import SimpleNamespace',
+    'from clip_engine.services.local_whisper import LocalWhisperBackend',
+    'settings = SimpleNamespace(',
+    '    local_whisper_model=os.environ.get("LOCAL_WHISPER_MODEL", "large-v3-turbo"),',
+    '    local_whisper_device=os.environ.get("LOCAL_WHISPER_DEVICE", "auto"),',
+    '    local_whisper_compute_type=os.environ.get("LOCAL_WHISPER_COMPUTE_TYPE", "auto"))',
+    'backend = LocalWhisperBackend(settings)',
+    'language = os.environ.get("TRANSCRIPTION_LANGUAGE") or None',
+    'keyterms = json.loads(os.environ.get("BRIDGECLIP_KEYTERMS", "[]"))',
+    'texts = []',
+    'try:',
+    '    for path in sys.argv[1:]:',
+    '        response = backend.transcribe_chunk(path, language, keyterms, 0)',
+    '        texts.append(response["text"].strip())',
+    'finally:',
+    '    backend.close()',
+    'print(json.dumps({"texts": texts}))'
+  ].join('\n'), { encoding: 'utf-8' })
+  try {
+    const result = await new Promise<string>((resolve, reject) => {
+      const child = spawn(pythonPath, [script, ...wavPaths], {
+        windowsHide: true,
+        env: {
+          ...process.env,
+          PYTHONPATH: getEnginePath(),
+          BRIDGECLIP_MODELS_DIR: modelsDir(),
+          LOCAL_WHISPER_MODEL: settings.localWhisperModel,
+          TRANSCRIPTION_LANGUAGE: settings.transcriptionLanguage,
+          BRIDGECLIP_KEYTERMS: JSON.stringify(vocabularyTerms(settings.customVocabulary).slice(0, 20)),
+          PYTHONUNBUFFERED: '1'
+        }
+      })
+      let stdout = ''
+      let stderr = ''
+      child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString() })
+      child.stderr.on('data', (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-2000) })
+      child.on('error', reject)
+      child.on('close', code => {
+        if (code === 0) resolve(stdout)
+        else reject(new Error(`Local transcription failed (exit ${code})${stderr ? `: ${stderr.split('\n').slice(-2).join(' ')}` : ''}`))
+      })
+    })
+    const parsed = JSON.parse(result.trim().split('\n').pop() ?? '') as { texts?: unknown }
+    if (!Array.isArray(parsed.texts) || parsed.texts.length !== wavPaths.length || !parsed.texts.every((text): text is string => typeof text === 'string')) {
+      throw new Error('invalid')
+    }
+    return parsed.texts
+  } catch {
+    throw new Error('The clip audio could not be transcribed locally. Check Settings → Local AI, then try again.')
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+}
+
+/** One structured-output chat call against NVIDIA's hosted NIM API. */
+async function nvidiaContent(
+  settings: AppSettings,
+  body: { name: string; messages: { role: string; content: string }[]; schema: unknown; maxTokens: number }
+): Promise<string> {
+  const key = settings.nvidiaApiKey
+  if (!key) throw new Error('Add a NVIDIA API key in Settings to generate automation metadata.')
+  const base = { model: settings.nvidiaPlannerModel, temperature: 0.2, max_tokens: body.maxTokens, messages: body.messages }
+  // Some free NIM models reject json_schema constrained decoding; one retry
+  // without it keeps metadata working (the writer prompt demands JSON anyway).
+  for (const withSchema of [true, false]) {
+    const response = await fetch(NVIDIA_CHAT_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      redirect: 'error',
+      signal: AbortSignal.timeout(120_000),
+      body: JSON.stringify(withSchema
+        ? { ...base, response_format: { type: 'json_schema', json_schema: { name: body.name, strict: true, schema: body.schema } } }
+        : base)
+    })
+    if (response.status === 400 && withSchema) continue
+    const data = await providerResponse(response, 'metadata', 100_000, 'NVIDIA')
+    const choices = data.choices
+    const content = Array.isArray(choices) ? (choices[0] as { message?: { content?: unknown } })?.message?.content : null
+    if (typeof content !== 'string' || !content.trim()) throw new Error('NVIDIA returned no metadata. The clip was not posted.')
+    return content
+  }
+  throw new Error('NVIDIA rejected the metadata request. Try again or use manual metadata.')
+}
+
+async function providerResponse(response: Response, operation: 'transcription' | 'metadata', maxBytes = 100_000, label = 'OpenRouter'): Promise<Record<string, unknown>> {
   if (!response.ok) {
     const status = response.status
-    if (status === 401 || status === 403) throw new Error('OpenRouter rejected the API key. Check it in Settings.')
-    if (status === 402) throw new Error('OpenRouter reports insufficient credits. Check your OpenRouter account.')
-    if (status === 429) throw new Error('OpenRouter is rate limiting requests. Try again shortly.')
-    if (status === 400) throw new Error(`OpenRouter rejected the ${operation} request (400). ${operation === 'transcription' ? 'The clip audio or request format may be unsupported.' : 'Try again or use manual metadata.'}`)
-    throw new Error(`OpenRouter ${operation} failed (${status}). Try again later.`)
+    if (status === 401 || status === 403) throw new Error(`${label} rejected the API key. Check it in Settings.`)
+    if (status === 402) throw new Error(`${label} reports insufficient credits. Check your ${label} account.`)
+    if (status === 429) throw new Error(`${label} is rate limiting requests. Try again shortly.`)
+    if (status === 400) throw new Error(`${label} rejected the ${operation} request (400). ${operation === 'transcription' ? 'The clip audio or request format may be unsupported.' : 'Try again or use manual metadata.'}`)
+    throw new Error(`${label} ${operation} failed (${status}). Try again later.`)
   }
-  const raw = await readResponseText(response, maxBytes, 'OpenRouter returned too much metadata.')
+  const raw = await readResponseText(response, maxBytes, `${label} returned too much metadata.`)
   try {
     const parsed: unknown = JSON.parse(raw)
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>
   } catch { /* Safe fixed error below. */ }
-  throw new Error('OpenRouter returned an invalid response. Try again.')
+  throw new Error(`${label} returned an invalid response. Try again.`)
 }
 
-/** Use the same OpenRouter account for speech recognition and metadata writing. */
+/** Use the same provider for speech recognition and metadata writing; offline and NVIDIA modes use the local Whisper backend. */
 export async function transcribeAutomationClip(path: string): Promise<string> {
   const settings = loadSettings()
+  // NVIDIA NIM has no transcription endpoint; its backend transcribes locally.
+  const local = settings.aiProvider !== 'cloud'
   const key = settings.openrouterApiKey
-  if (!key) throw new Error('Add an OpenRouter API key in Settings to transcribe automation clips.')
+  if (!local && !key) throw new Error('Add an OpenRouter API key in Settings to transcribe automation clips.')
   const directory = await mkdtemp(join(tmpdir(), 'bridgeclip-transcript-'))
   try {
     // Bound each request rather than sending an entire long recording to STT.
@@ -75,30 +204,36 @@ export async function transcribeAutomationClip(path: string): Promise<string> {
     if (totalBytes > 50 * 1024 * 1024) throw new Error('The clip audio is too long for automatic metadata. Use manual metadata.')
     const phrases = vocabularyTerms(settings.customVocabulary)
     let transcript = ''
-    for (const file of files) {
-      const bytes = await readFile(join(directory, file))
-      const result = await providerResponse(await fetch(endpoint('BRIDGECLIP_E2E_TRANSCRIPTION_URL', 'https://openrouter.ai/api/v1/audio/transcriptions'), {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'microsoft/mai-transcribe-2', input_audio: { data: bytes.toString('base64'), format: 'wav' },
-          response_format: 'verbose_json',
-          ...(phrases.length ? { provider: { options: { azure: { phraseList: { phrases } } } } } : {})
-        }),
-        redirect: 'error', signal: AbortSignal.timeout(90_000)
-      }), 'transcription', 2_000_000)
-      if (typeof result.text !== 'string') throw new Error('OpenRouter returned an invalid transcript. Try again.')
-      const text = [...result.text].map((character) => {
-        const code = character.charCodeAt(0)
-        return code <= 31 || code === 127 ? ' ' : character
-      }).join('').replace(/\s+/g, ' ').trim()
-      transcript = [transcript, text].filter(Boolean).join(' ')
+    if (local) {
+      const texts = await localWhisperTexts(settings, files.map((file) => join(directory, file)))
+      transcript = texts.join(' ').replace(/\s+/g, ' ').trim()
       if (transcript.length > MAX_TRANSCRIPT) throw new Error('This clip’s transcript is too long for automatic metadata. Use manual metadata.')
+    } else {
+      for (const file of files) {
+        const bytes = await readFile(join(directory, file))
+        const result = await providerResponse(await fetch(endpoint('BRIDGECLIP_E2E_TRANSCRIPTION_URL', 'https://openrouter.ai/api/v1/audio/transcriptions'), {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'microsoft/mai-transcribe-2', input_audio: { data: bytes.toString('base64'), format: 'wav' },
+            response_format: 'verbose_json',
+            ...(phrases.length ? { provider: { options: { azure: { phraseList: { phrases } } } } } : {})
+          }),
+          redirect: 'error', signal: AbortSignal.timeout(90_000)
+        }), 'transcription', 2_000_000)
+        if (typeof result.text !== 'string') throw new Error('OpenRouter returned an invalid transcript. Try again.')
+        const text = [...result.text].map((character) => {
+          const code = character.charCodeAt(0)
+          return code <= 31 || code === 127 ? ' ' : character
+        }).join('').replace(/\s+/g, ' ').trim()
+        transcript = [transcript, text].filter(Boolean).join(' ')
+        if (transcript.length > MAX_TRANSCRIPT) throw new Error('This clip’s transcript is too long for automatic metadata. Use manual metadata.')
+      }
     }
     if (!transcript) throw new Error('No speech was detected in this clip. Use manual metadata for silent clips.')
     return transcript
   } catch (error) {
-    if (error instanceof Error && /OpenRouter|No speech|transcript is too long|audio is too long/.test(error.message)) throw error
+    if (error instanceof Error && /OpenRouter|No speech|transcript is too long|audio is too long|could not be transcribed/.test(error.message)) throw error
     throw new Error('The clip audio could not be transcribed. Check that it has a playable audio track and try again.')
   } finally { await rm(directory, { recursive: true, force: true }) }
 }
@@ -121,7 +256,7 @@ function evidenceOptions(transcript: string): string[] {
 /** Fixed diagnostic codes, never model output or transcript text. */
 export function metadataFailureCode(message: string): string {
   if (message.includes('not grounded')) return 'evidence_mismatch'
-  if (message.startsWith('OpenRouter')) return 'provider_failure'
+  if (message.startsWith('OpenRouter') || message.startsWith('NVIDIA')) return 'provider_failure'
   if (message.startsWith('AI batch')) return 'batch_incomplete'
   if (message.startsWith('AI')) return 'fields_invalid'
   return 'generation_failure'
@@ -286,34 +421,48 @@ function metadataPrompt(platforms: readonly Platform[], context: MetadataContext
 
 export async function generateAutomationMetadata(transcript: string, title: string, notes: string, platforms: readonly Platform[], context: MetadataContext = {}): Promise<GeneratedPlatformMetadata[]> {
   const settings = loadSettings()
+  const local = settings.aiProvider === 'local'
+  const nvidia = settings.aiProvider === 'nvidia'
   const key = settings.openrouterApiKey
-  if (!key) throw new Error('Add an OpenRouter API key in Settings to generate automation metadata.')
+  if (!local && !nvidia && !key) throw new Error('Add an OpenRouter API key in Settings to generate automation metadata.')
   const { vocabulary, names, schema, rules, systemPrompt } = metadataPrompt(platforms, context)
   const input = { title: title.slice(0, 500), notes: notes.slice(0, 2000), transcript, evidenceOptions: evidenceOptions(transcript),
     enhancementGuidance: context.guidance || null, sourceContext: context.source ?? null, research: context.research?.status === 'complete' ? context.research : null, ...(vocabulary.length ? { vocabulary } : {}),
     platforms: names.map((platform) => ({ platform, guidance: rules[platform] })) }
   let validationFeedback: string | null = null
   for (let attempt = 0; attempt < 2; attempt++) {
-    let response: Record<string, unknown>
-    try { response = await providerResponse(await fetch(endpoint('BRIDGECLIP_E2E_OPENROUTER_URL', 'https://openrouter.ai/api/v1/chat/completions'), {
-      method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'https://github.com/bridge-mind/bridgeclip', 'X-Title': 'BridgeClip' },
-      redirect: 'error',
-      signal: AbortSignal.timeout(120_000),
-      body: JSON.stringify({ model: MODEL, temperature: 0.2, messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: JSON.stringify(input) },
-        ...(validationFeedback ? [{ role: 'user', content: `Regenerate all posts. The previous result failed validation: ${validationFeedback} Check every platform's required fields and caption rules. Copy each evidence phrase as a contiguous excerpt of the transcript. Remove any claim that cannot be supported by that excerpt. Use a Threads topic only when it appears verbatim in the transcript.` }] : [])
-      ], response_format: { type: 'json_schema', json_schema: { name: 'automation_metadata', strict: true, schema } }, provider: { require_parameters: true }, max_tokens: 4000 })
-    }), 'metadata') } catch (error) {
-      if (error instanceof Error && error.message.startsWith('OpenRouter')) throw error
-      throw new Error('OpenRouter could not be reached. The clip was not posted; try again later.')
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: JSON.stringify(input) },
+      ...(validationFeedback ? [{ role: 'user', content: `Regenerate all posts. The previous result failed validation: ${validationFeedback} Check every platform's required fields and caption rules. Copy each evidence phrase as a contiguous excerpt of the transcript. Remove any claim that cannot be supported by that excerpt. Use a Threads topic only when it appears verbatim in the transcript.` }] : [])
+    ]
+    let content: string
+    if (local) {
+      content = await ollamaContent(settings, {
+        model: settings.localPlannerModel, messages, format: schema, maxTokens: 4000
+      })
+    } else if (nvidia) {
+      content = await nvidiaContent(settings, { name: 'automation_metadata', messages, schema, maxTokens: 4000 })
+    } else {
+      let response: Record<string, unknown>
+      try { response = await providerResponse(await fetch(endpoint('BRIDGECLIP_E2E_OPENROUTER_URL', 'https://openrouter.ai/api/v1/chat/completions'), {
+        method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'https://github.com/bridge-mind/bridgeclip', 'X-Title': 'BridgeClip' },
+        redirect: 'error',
+        signal: AbortSignal.timeout(120_000),
+        body: JSON.stringify({ model: MODEL, temperature: 0.2, messages,
+          response_format: { type: 'json_schema', json_schema: { name: 'automation_metadata', strict: true, schema } }, provider: { require_parameters: true }, max_tokens: 4000 })
+      }), 'metadata') } catch (error) {
+        if (error instanceof Error && error.message.startsWith('OpenRouter')) throw error
+        throw new Error('OpenRouter could not be reached. The clip was not posted; try again later.')
+      }
+      const choices = response.choices
+      const choiceContent = Array.isArray(choices) ? (choices[0] as { message?: { content?: unknown } })?.message?.content : null
+      if (typeof choiceContent !== 'string') throw new Error('OpenRouter returned no metadata. The clip was not posted.')
+      content = choiceContent
     }
-    const choices = response.choices
-    const content = Array.isArray(choices) ? (choices[0] as { message?: { content?: unknown } })?.message?.content : null
-    if (typeof content !== 'string') throw new Error('OpenRouter returned no metadata. The clip was not posted.')
     try { return parseGeneratedMetadata(JSON.parse(content), names, transcript, context) }
     catch (error) {
-      if (error instanceof SyntaxError) throw new Error('OpenRouter returned invalid metadata JSON. The clip was not posted.')
+      if (error instanceof SyntaxError) throw new Error(`${local ? 'The local model' : nvidia ? 'NVIDIA' : 'OpenRouter'} returned invalid metadata JSON. The clip was not posted.`)
       if (attempt === 0 && error instanceof Error && /^AI(?: metadata|-generated)/.test(error.message)) {
         validationFeedback = error.message
         continue
@@ -326,7 +475,13 @@ export async function generateAutomationMetadata(transcript: string, title: stri
 
 /** A separate, bounded research pass keeps web output away from structured copy validation. */
 export async function researchAutomationTopic(transcript: string, source: AutomationSourceContext | null, scope: 'clip' | 'source' = 'clip', guidance = ''): Promise<MetadataResearch> {
-  const key = loadSettings().openrouterApiKey
+  const settings = loadSettings()
+  // Web search is an OpenRouter tool without a free-provider equivalent;
+  // degrade to transcript-only context in offline and NVIDIA modes.
+  if (settings.aiProvider !== 'cloud') {
+    return { status: 'unavailable', summary: 'Web research needs the OpenRouter provider and is skipped in this mode. This draft uses the clip transcript and available source context only.', sources: [] }
+  }
+  const key = settings.openrouterApiKey
   if (!key) throw new Error('Add an OpenRouter API key in Settings to enhance metadata.')
   try {
     const response = await providerResponse(await fetch(endpoint('BRIDGECLIP_E2E_OPENROUTER_URL', 'https://openrouter.ai/api/v1/chat/completions'), {
@@ -367,8 +522,11 @@ export async function generateAutomationMetadataBatch(clips: MetadataBatchClip[]
   posts: Map<string, GeneratedPlatformMetadata[]>; errors: Map<string, string>
 }> {
   if (!clips.length || clips.length > 5) throw new Error('Choose one to five clips per writing batch.')
-  const key = loadSettings().openrouterApiKey
-  if (!key) throw new Error('Add an OpenRouter API key in Settings to generate automation metadata.')
+  const settings = loadSettings()
+  const local = settings.aiProvider === 'local'
+  const nvidia = settings.aiProvider === 'nvidia'
+  const key = settings.openrouterApiKey
+  if (!local && !nvidia && !key) throw new Error('Add an OpenRouter API key in Settings to generate automation metadata.')
   const { schema, systemPrompt, rules, vocabulary } = metadataPrompt(platforms, context)
   const posts = new Map<string, GeneratedPlatformMetadata[]>()
   const errors = new Map<string, string>()
@@ -377,33 +535,56 @@ export async function generateAutomationMetadataBatch(clips: MetadataBatchClip[]
     const batchSchema = { type: 'object', additionalProperties: false, properties: { clips: { type: 'array', items: {
       ...schema, properties: { id: { type: 'string', enum: pending.map((clip) => clip.id) }, ...schema.properties }, required: ['id', 'posts']
     } } }, required: ['clips'] }
+    const messages = [
+      { role: 'system', content: systemPrompt + ' Return one clips entry per requested id, each containing its own posts. Each clip transcript is independent: NEVER transfer a claim or evidence phrase from another clip. Reuse source research only for relevant context. For Facebook use each clip’s facebookFormat: a reel requires a title of at most 80 characters; a feed video has no separate title.' },
+      { role: 'user', content: JSON.stringify({ enhancementGuidance: context.guidance || null, sourceContext: context.source, research: context.research?.status === 'complete' ? context.research : null,
+        vocabulary, platforms: platforms.map((platform) => ({ platform, guidance: rules[platform] })),
+        clips: pending.map((clip) => ({ ...clip, title: clip.title.slice(0, 500), notes: clip.notes.slice(0, 2000), evidenceOptions: evidenceOptions(clip.transcript), validationFeedback: errors.get(clip.id) ?? null })) }) }
+    ]
+    let result: { clips?: unknown } | null
     try {
-      const response = await providerResponse(await fetch(endpoint('BRIDGECLIP_E2E_OPENROUTER_URL', 'https://openrouter.ai/api/v1/chat/completions'), {
-        method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, redirect: 'error', signal: AbortSignal.timeout(120000),
-        body: JSON.stringify({ model: MODEL, temperature: 0.2, max_tokens: Math.min(20000, pending.length * 4000),
-          response_format: { type: 'json_schema', json_schema: { name: 'automation_metadata_batch', strict: true, schema: batchSchema } }, provider: { require_parameters: true },
-          messages: [
-            { role: 'system', content: systemPrompt + ' Return one clips entry per requested id, each containing its own posts. Each clip transcript is independent: NEVER transfer a claim or evidence phrase from another clip. Reuse source research only for relevant context. For Facebook use each clip’s facebookFormat: a reel requires a title of at most 80 characters; a feed video has no separate title.' },
-            { role: 'user', content: JSON.stringify({ enhancementGuidance: context.guidance || null, sourceContext: context.source, research: context.research?.status === 'complete' ? context.research : null,
-              vocabulary, platforms: platforms.map((platform) => ({ platform, guidance: rules[platform] })),
-              clips: pending.map((clip) => ({ ...clip, title: clip.title.slice(0, 500), notes: clip.notes.slice(0, 2000), evidenceOptions: evidenceOptions(clip.transcript), validationFeedback: errors.get(clip.id) ?? null })) }) }
-          ] })
-      }), 'metadata', 500000)
-      const choices = response.choices
-      const content = Array.isArray(choices) ? choices[0]?.message?.content : null
-      const result = typeof content === 'string' ? JSON.parse(content) : null
-      if (!Array.isArray(result?.clips) || result.clips.length > pending.length || result.clips.some((entry: { id?: unknown } | null) => !pending.some((clip) => clip.id === entry?.id))) throw new Error('AI batch metadata named invalid clips.')
-      for (const clip of pending) {
-        try {
-          const matches = result.clips.filter((entry: { id?: unknown } | null) => entry?.id === clip.id)
-          if (matches.length !== 1) throw new Error('AI batch metadata omitted or duplicated this clip.')
-          posts.set(clip.id, parseGeneratedMetadata(matches[0], platforms, clip.transcript, { ...context, facebookFormat: clip.facebookFormat }))
-          errors.delete(clip.id)
-        } catch (error) { errors.set(clip.id, error instanceof Error ? error.message : 'AI metadata was invalid.') }
+      let content: string
+      if (local) {
+        content = await ollamaContent(settings, {
+          model: settings.localPlannerModel, messages, format: batchSchema,
+          maxTokens: Math.min(20000, pending.length * 4000)
+        })
+      } else if (nvidia) {
+        content = await nvidiaContent(settings, {
+          name: 'automation_metadata_batch', messages, schema: batchSchema,
+          maxTokens: Math.min(20000, pending.length * 4000)
+        })
+      } else {
+        const response = await providerResponse(await fetch(endpoint('BRIDGECLIP_E2E_OPENROUTER_URL', 'https://openrouter.ai/api/v1/chat/completions'), {
+          method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, redirect: 'error', signal: AbortSignal.timeout(120000),
+          body: JSON.stringify({ model: MODEL, temperature: 0.2, max_tokens: Math.min(20000, pending.length * 4000),
+            response_format: { type: 'json_schema', json_schema: { name: 'automation_metadata_batch', strict: true, schema: batchSchema } }, provider: { require_parameters: true },
+            messages })
+        }), 'metadata', 500000)
+        const choices = response.choices
+        const choiceContent = Array.isArray(choices) ? (choices[0] as { message?: { content?: unknown } })?.message?.content : null
+        if (typeof choiceContent !== 'string') throw new Error('AI batch metadata was incomplete.')
+        content = choiceContent
       }
+      result = JSON.parse(content) as { clips?: unknown }
     } catch (error) {
-      const message = error instanceof Error && /^(OpenRouter|AI batch)/.test(error.message) ? error.message : 'The metadata batch could not be generated. Try again.'
+      const message = error instanceof Error && /^(OpenRouter|NVIDIA|AI batch)/.test(error.message) ? error.message : 'The metadata batch could not be generated. Try again.'
       for (const clip of pending) errors.set(clip.id, message)
+      result = null
+    }
+    if (result) {
+      if (!Array.isArray(result.clips) || result.clips.length > pending.length || result.clips.some((entry: { id?: unknown } | null) => !pending.some((clip) => clip.id === entry?.id))) {
+        for (const clip of pending) errors.set(clip.id, 'AI batch metadata named invalid clips.')
+      } else {
+        for (const clip of pending) {
+          try {
+            const matches = result.clips.filter((entry: { id?: unknown } | null) => entry?.id === clip.id)
+            if (matches.length !== 1) throw new Error('AI batch metadata omitted or duplicated this clip.')
+            posts.set(clip.id, parseGeneratedMetadata(matches[0], platforms, clip.transcript, { ...context, facebookFormat: clip.facebookFormat }))
+            errors.delete(clip.id)
+          } catch (error) { errors.set(clip.id, error instanceof Error ? error.message : 'AI metadata was invalid.') }
+        }
+      }
     }
     pending = pending.filter((clip) => !posts.has(clip.id))
   }

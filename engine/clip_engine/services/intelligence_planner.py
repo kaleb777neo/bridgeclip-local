@@ -27,9 +27,13 @@ from clip_engine.services.openrouter import (
     OpenRouterError,
     apply_reasoning,
     chat_completion,
+    is_nvidia_backend,
     json_schema_format,
     message_text,
+    sanitize_payload,
 )
+from clip_engine.services import local_llm
+from clip_engine.services.local_llm import is_local_backend
 from clip_engine.services.transcription_service import (
     TranscriptSegment,
     TranscriptionResult,
@@ -40,6 +44,25 @@ from clip_engine.services.transcription_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Local planning context budget: ~24k transcript chars ≈ 8k tokens, leaving
+# most of a 16k-token context for the JSON plan. Larger transcripts are
+# planned in windows and merged.
+LOCAL_TRANSCRIPT_WINDOW_CHARS = 24000
+
+# One rubric-JSON clip costs a local planner ~700 output tokens, so a 16k
+# num_predict budget holds roughly eight of them. Asking for more produces a
+# truncated plan that fails to parse and is then retried identically.
+LOCAL_MAX_CLIPS_PER_REQUEST = 8
+
+
+def _window_overlap_ratio(a: "ClipPlanSegment", b: "ClipPlanSegment") -> float:
+    """Intersection over the shorter clip; > 0.5 marks a duplicate moment."""
+    intersection = min(a.end_time_ms, b.end_time_ms) - max(a.start_time_ms, b.start_time_ms)
+    if intersection <= 0:
+        return 0.0
+    shorter = min(a.end_time_ms - a.start_time_ms, b.end_time_ms - b.start_time_ms)
+    return intersection / max(1, shorter)
 
 
 @dataclass
@@ -275,8 +298,8 @@ class IntelligencePlannerService:
         self.settings = get_settings()
         self._http_client: Optional[httpx.AsyncClient] = None
         
-        if not self.settings.openrouter_api_key:
-            logger.warning("OPENROUTER_API_KEY not set, intelligence planning will fail")
+        if not getattr(self.settings, "llm_api_key", None) and not is_local_backend(self.settings):
+            logger.warning("No cloud LLM API key set, intelligence planning will fail")
 
     def calculate_optimal_clip_count(
         self,
@@ -396,18 +419,128 @@ class IntelligencePlannerService:
 
         return 0.0, "fallback"
 
+    async def _plan_local_windowed(
+        self,
+        *,
+        transcript_result: TranscriptionResult,
+        transcript: list[TranscriptSegment],
+        video_metadata: Any,
+        max_clips: Optional[int],
+        auto_clip_count: bool,
+        min_duration_seconds: Optional[int],
+        max_duration_seconds: Optional[int],
+        duration_ranges: Optional[list[str]],
+        target_platform: str,
+        aspect_ratio: str,
+        source_context: Optional[dict],
+        clip_request: Optional[str],
+    ) -> Optional[ClipPlanResponse]:
+        """Plan long transcripts in char-bounded windows for the local model.
+
+        Returns None when the transcript fits a single context, so the caller
+        falls through to the normal single-shot planner.
+        """
+        total_chars = sum(len(segment.text) for segment in transcript)
+        if total_chars <= LOCAL_TRANSCRIPT_WINDOW_CHARS:
+            return None
+
+        windows: list[list[TranscriptSegment]] = []
+        current: list[TranscriptSegment] = []
+        chars = 0
+        for segment in transcript:
+            current.append(segment)
+            chars += len(segment.text)
+            if chars >= LOCAL_TRANSCRIPT_WINDOW_CHARS:
+                windows.append(current)
+                # A little look-back gives a boundary moment its setup lines.
+                current = current[-2:]
+                chars = sum(len(s.text) for s in current)
+        if len(current) > 2 or (current and not windows):
+            windows.append(current)
+        logger.info(
+            "Local planning: %d transcript windows (%d chars total, budget %d)",
+            len(windows), total_chars, LOCAL_TRANSCRIPT_WINDOW_CHARS,
+        )
+
+        total_ms = max(1, transcript[-1].end_time_ms - transcript[0].start_time_ms)
+        merged: list[ClipPlanSegment] = []
+        insights: list[str] = []
+        self._in_windowed_call = True
+        try:
+            for window in windows:
+                window_ms = max(1, window[-1].end_time_ms - window[0].start_time_ms)
+                window_max_clips = max_clips
+                if max_clips and not auto_clip_count:
+                    window_max_clips = max(1, math.ceil(max_clips * window_ms / total_ms))
+                result = await self.plan_clips(
+                    transcript_result=TranscriptionResult(
+                        segments=window,
+                        full_text=" ".join(s.text for s in window),
+                        language=transcript_result.language if transcript_result else None,
+                        duration_seconds=window_ms / 1000,
+                        provider="local",
+                    ),
+                    video_metadata=video_metadata,
+                    max_clips=window_max_clips,
+                    auto_clip_count=auto_clip_count,
+                    min_duration_seconds=min_duration_seconds,
+                    max_duration_seconds=max_duration_seconds,
+                    duration_ranges=duration_ranges,
+                    target_platform=target_platform,
+                    frames=None,
+                    start_time_seconds=window[0].start_time_ms / 1000,
+                    end_time_seconds=window[-1].end_time_ms / 1000,
+                    aspect_ratio=aspect_ratio,
+                    source_context=source_context,
+                    jev_enabled=False,
+                    clip_request=clip_request,
+                )
+                merged.extend(result.segments)
+                if result.insights:
+                    insights.append(result.insights)
+        finally:
+            self._in_windowed_call = False
+
+        deduped = self._merge_windowed_clips(merged, max_clips)
+        logger.info("Local windowed planning merged %d -> %d clips", len(merged), len(deduped))
+        combined_insights = " | ".join(dict.fromkeys(i for i in insights if i)) or None
+        return ClipPlanResponse(
+            segments=deduped,
+            total_clips=len(deduped),
+            target_platform=target_platform,
+            insights=combined_insights,
+        )
+
+    @staticmethod
+    def _merge_windowed_clips(
+        clips: list[ClipPlanSegment], max_clips: Optional[int],
+    ) -> list[ClipPlanSegment]:
+        """Keep the highest-scoring version of moments found in two windows."""
+        ranked = sorted(clips, key=lambda c: c.virality_score, reverse=True)
+        kept: list[ClipPlanSegment] = []
+        for clip in ranked:
+            if any(_window_overlap_ratio(clip, other) > 0.5 for other in kept):
+                continue
+            kept.append(clip)
+            if max_clips and len(kept) >= max_clips:
+                break
+        kept.sort(key=lambda c: c.start_time_ms)
+        return kept
+
     async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create HTTP client."""
+        """Get or create the HTTP client for the active chat provider."""
         if self._http_client is None or self._http_client.is_closed:
-            self._http_client = httpx.AsyncClient(
-                base_url=self.settings.openrouter_base_url,
-                # Reasoning over a multi-hour transcript can take minutes.
-                timeout=httpx.Timeout(600.0, connect=30.0),
-                headers={
-                    "Authorization": f"Bearer {self.settings.openrouter_api_key}",
+            headers = {"Authorization": f"Bearer {self.settings.llm_api_key}"}
+            if self.settings.llm_provider == "openrouter":
+                headers.update({
                     "HTTP-Referer": "https://github.com/bridge-mind/bridgeclip",
                     "X-Title": "BridgeClip AI Clipping Agent",
-                },
+                })
+            self._http_client = httpx.AsyncClient(
+                base_url=self.settings.llm_base_url,
+                # Reasoning over a multi-hour transcript can take minutes.
+                timeout=httpx.Timeout(600.0, connect=30.0),
+                headers=headers,
             )
         return self._http_client
 
@@ -510,6 +643,28 @@ class IntelligencePlannerService:
                 insights="Visual-only planning needs at least three sampled frames",
             )
 
+        # Local models cannot hold a multi-hour transcript plus JSON output in
+        # one context window. Split into overlapping windows, plan each, merge.
+        if (transcript and not jev_enabled and discovery_feedback is None
+                and is_local_backend(self.settings)
+                and not getattr(self, "_in_windowed_call", False)):
+            windowed = await self._plan_local_windowed(
+                transcript_result=transcript_result,
+                transcript=transcript,
+                video_metadata=video_metadata,
+                max_clips=max_clips,
+                auto_clip_count=auto_clip_count,
+                min_duration_seconds=min_duration_seconds,
+                max_duration_seconds=max_duration_seconds,
+                duration_ranges=duration_ranges,
+                target_platform=target_platform,
+                aspect_ratio=aspect_ratio,
+                source_context=source_context,
+                clip_request=clip_request,
+            )
+            if windowed is not None:
+                return windowed
+
         # Calculate effective duration for clip count scaling
         effective_duration_seconds, duration_source = self._resolve_effective_duration_seconds(
             start_time_seconds,
@@ -559,6 +714,14 @@ class IntelligencePlannerService:
                 clip_count = max_fit
         if discovery_feedback is not None:
             clip_count = min(clip_count, 8)
+        if ((is_local_backend(self.settings) or is_nvidia_backend(self.settings))
+                and clip_count > LOCAL_MAX_CLIPS_PER_REQUEST):
+            logger.info(
+                f"Planner clip count capped {clip_count} -> {LOCAL_MAX_CLIPS_PER_REQUEST}: "
+                f"the {self.settings.effective_planner_max_output_tokens}-token output budget "
+                "cannot hold a longer plan without truncating"
+            )
+            clip_count = LOCAL_MAX_CLIPS_PER_REQUEST
         self.discovery_limit = clip_count
         longform = bool(transcript) and is_longform(aspect_ratio, min_duration_seconds)
         self._current_longform = longform
@@ -584,31 +747,35 @@ class IntelligencePlannerService:
         metadata_duration = getattr(video_metadata, "duration_seconds", None)
         self._current_video_duration = float(metadata_duration) if metadata_duration is not None else None
         
-        # Build prompts
-        system_prompt = (
-            self._build_longform_system_prompt(clip_count, min_duration_seconds, max_duration_seconds)
-            if longform else
-            self._build_system_prompt(clip_count, min_duration_seconds, max_duration_seconds, duration_ranges)
-            if transcript else
-            self._build_visual_only_system_prompt(clip_count, min_duration_seconds, max_duration_seconds, duration_ranges)
-        )
-        if jev_enabled:
-            system_prompt += (
-                f'\nPreferred discovery range: {start_time_seconds if start_time_seconds is not None else "source start"}'
-                f' to {end_time_seconds if end_time_seconds is not None else "source end"} seconds. '
-                'Prioritize ideas around this range but extend either boundary to preserve meaning. '
-                'Length and clip count are preferences, never quotas. Return no clips rather than force one.'
+        # Build prompts. The helpers take the clip count so a retry after a
+        # truncated local plan can rebuild the request with a smaller one.
+        def _planner_system_prompt(count: int) -> str:
+            prompt = (
+                self._build_longform_system_prompt(count, min_duration_seconds, max_duration_seconds)
+                if longform else
+                self._build_system_prompt(count, min_duration_seconds, max_duration_seconds, duration_ranges)
+                if transcript else
+                self._build_visual_only_system_prompt(count, min_duration_seconds, max_duration_seconds, duration_ranges)
             )
-        system_prompt += SPONSOR_DISCOVERY_RULE
-        if clip_request:
-            system_prompt += CLIP_REQUEST_RULE
-        if transcript:
-            system_prompt += MOMENT_DISCOVERY_RULE if jev_enabled else MOMENT_HINT_RULE
-        if discovery_feedback is not None:
-            system_prompt += ('\nSECOND AND FINAL DISCOVERY PASS: Search the listed underexplored intervals for different moments. '
-                'The previous candidates have already been reviewed. Do not repeat or overlap them by more than 5 seconds. '
-                'Use surrounding transcript only for needed setup/payoff. Never fill a quota. '
-                + json.dumps(discovery_feedback))
+            if jev_enabled:
+                prompt += (
+                    f'\nPreferred discovery range: {start_time_seconds if start_time_seconds is not None else "source start"}'
+                    f' to {end_time_seconds if end_time_seconds is not None else "source end"} seconds. '
+                    'Prioritize ideas around this range but extend either boundary to preserve meaning. '
+                    'Length and clip count are preferences, never quotas. Return no clips rather than force one.'
+                )
+            prompt += SPONSOR_DISCOVERY_RULE
+            if clip_request:
+                prompt += CLIP_REQUEST_RULE
+            if transcript:
+                prompt += MOMENT_DISCOVERY_RULE if jev_enabled else MOMENT_HINT_RULE
+            if discovery_feedback is not None:
+                prompt += ('\nSECOND AND FINAL DISCOVERY PASS: Search the listed underexplored intervals for different moments. '
+                    'The previous candidates have already been reviewed. Do not repeat or overlap them by more than 5 seconds. '
+                    'Use surrounding transcript only for needed setup/payoff. Never fill a quota. '
+                    + json.dumps(discovery_feedback))
+            return prompt
+
         transcript_text = self._build_transcript_text(transcript)
         
         logger.info("Transcript text length: %s chars", len(transcript_text))
@@ -642,16 +809,19 @@ class IntelligencePlannerService:
         )
         
         # Build multimodal message
-        messages = self._build_vision_messages(
-            system_prompt,
-            transcript_text,
-            frame_images,
-            clip_count,
-            transcript,
-            self._current_video_duration or effective_duration_seconds,
-            longform,
-            source_context,
-        )
+        def _planner_messages(count: int) -> list[dict]:
+            return self._build_vision_messages(
+                _planner_system_prompt(count),
+                transcript_text,
+                frame_images,
+                count,
+                transcript,
+                self._current_video_duration or effective_duration_seconds,
+                longform,
+                source_context,
+            )
+
+        messages = _planner_messages(clip_count)
         
         model_name = self.settings.planner_model
         fallback_models = self.settings.get_planner_fallback_models()
@@ -662,6 +832,7 @@ class IntelligencePlannerService:
         )
 
         max_attempts = 1 if discovery_feedback is not None else 3
+        self._planner_response_truncated = False
         cumulative_prompt_tokens = 0
         cumulative_completion_tokens = 0
         cumulative_total_tokens = 0
@@ -682,6 +853,7 @@ class IntelligencePlannerService:
                 'response': None, 'usage': None}
             self.audit['requests'].append(record)
             try:
+                self._planner_response_truncated = False
                 response, usage_data = await self._call_openrouter(
                     model=model_name,
                     fallback_models=fallback_models,
@@ -697,6 +869,10 @@ class IntelligencePlannerService:
                 else:
                     cost_reported = False
                     pricing = MODEL_PRICING.get(served_by, DEFAULT_PRICING)
+                    if getattr(self.settings, "llm_provider", "openrouter") == "nvidia":
+                        # NVIDIA's free NIM tier does not bill per token, so
+                        # estimates are zero by definition.
+                        pricing = {"input": 0.0, "output": 0.0}
                     if self.settings.clipping_mode == "advanced":
                         if self.settings.planner_input_price is not None and self.settings.planner_output_price is not None:
                             pricing = {"input": self.settings.planner_input_price, "output": self.settings.planner_output_price}
@@ -718,6 +894,17 @@ class IntelligencePlannerService:
                 if not e.retryable or attempt == max_attempts - 1:
                     logger.error(f"Clip planning failed after {attempts_made} attempt(s): {e}")
                     raise
+                if (self._planner_response_truncated and clip_count > 1
+                        and (is_local_backend(self.settings) or is_nvidia_backend(self.settings))):
+                    # A truncated plan won't parse no matter how often the
+                    # identical request is repeated; ask for fewer clips.
+                    clip_count = max(1, clip_count // 2)
+                    self.discovery_limit = clip_count
+                    messages = _planner_messages(clip_count)
+                    logger.warning(
+                        f"Retrying local planning with {clip_count} clips "
+                        "(previous output was cut off by the token limit)"
+                    )
                 delay = 2 ** attempt
                 logger.warning(
                     f"Clip planning attempt {attempts_made} failed ({e}); retrying in {delay}s..."
@@ -734,8 +921,9 @@ class IntelligencePlannerService:
                 result.segments, clip_count, allow_alternatives=jev_enabled and bool(transcript),
             )
             result.total_clips = len(result.segments)
+            cost_provider = getattr(self.settings, "llm_provider", "openrouter")
             result.api_costs = PlanningApiCosts(
-                provider="openrouter",
+                provider=cost_provider,
                 model=served_by,
                 prompt_tokens=cumulative_prompt_tokens,
                 completion_tokens=cumulative_completion_tokens,
@@ -747,7 +935,8 @@ class IntelligencePlannerService:
             logger.info(
                 f"Planning API cost: ${cumulative_cost:.6f} "
                 f"({cumulative_total_tokens} tokens, {attempts_made} attempt(s), "
-                f"model={served_by}, source={'openrouter' if cost_reported else 'estimate'})"
+                f"model={served_by}, source={'reported' if cost_reported else 'estimate'} "
+                f"via {cost_provider})"
             )
             return result
 
@@ -1167,11 +1356,15 @@ Do not overlap clips by more than 5 seconds."""
         fallback_models: list[str],
         messages: list[dict],
     ) -> dict:
-        """Build the OpenRouter chat payload for a clip-planning request."""
+        """Build the chat payload for a clip-planning request.
+
+        The payload is sanitized per provider here so the audit record shows
+        what actually went on the wire.
+        """
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "max_tokens": self.settings.planner_max_output_tokens,
+            "max_tokens": self.settings.effective_planner_max_output_tokens,
             "response_format": json_schema_format(
                 "clip_plan", clip_plan_schema(getattr(self, "_current_longform", False)),
             ),
@@ -1188,7 +1381,7 @@ Do not overlap clips by more than 5 seconds."""
         # selected model use its defaults instead of requiring a preset effort.
         if self.settings.clipping_mode != "advanced":
             apply_reasoning(payload, self.settings.planner_reasoning_effort)
-        return payload
+        return sanitize_payload(payload, getattr(self.settings, "llm_provider", "openrouter"))
 
     async def _call_openrouter(
         self,
@@ -1205,7 +1398,11 @@ Do not overlap clips by more than 5 seconds."""
         client = await self._get_client()
         payload = self._build_request_payload(model, fallback_models or [], messages)
         try:
-            return await chat_completion(client, payload)
+            if is_local_backend(self.settings):
+                return await local_llm.ollama_chat(self.settings, payload)
+            return await chat_completion(
+                client, payload, provider=getattr(self.settings, "llm_provider", "openrouter"),
+            )
         except OpenRouterError as e:
             raise IntelligencePlanningError(str(e), retryable=e.retryable) from e
 
@@ -1217,10 +1414,11 @@ Do not overlap clips by more than 5 seconds."""
                 raise IntelligencePlanningError(
                     f"Planner returned no content (finish_reason={finish_reason})"
                 )
-            if finish_reason == "length":
+            self._planner_response_truncated = finish_reason == "length"
+            if self._planner_response_truncated:
                 logger.warning(
                     "Planner output hit max_tokens "
-                    f"({self.settings.planner_max_output_tokens}); response may be truncated"
+                    f"({self.settings.effective_planner_max_output_tokens}); response may be truncated"
                 )
 
             logger.info("Planner response length: %s chars", len(content))

@@ -428,11 +428,28 @@ def find_sentence_start_boundary(
 
 
 class TranscriptionService:
-    """OpenRouter speech recognition with word timing for captions."""
+    """Speech recognition with word timing for captions.
+
+    Cloud mode uses OpenRouter's audio transcription endpoint. Local mode
+    (``ai_backend`` in ``("local", "nvidia")``) runs faster-whisper on this
+    machine through the same chunk loop and response parsing; the NVIDIA NIM
+    API hosts no OpenAI-compatible transcription endpoint, so its backend
+    transcribes locally too.
+    """
 
     def __init__(self):
         self.settings = get_settings()
         self.progress_callback: Optional[Callable[[str], None]] = None
+        self._local_backend = None
+
+    def _is_local(self) -> bool:
+        return getattr(self.settings, "ai_backend", "cloud") in ("local", "nvidia")
+
+    def _get_local_backend(self):
+        if getattr(self, "_local_backend", None) is None:
+            from .local_whisper import LocalWhisperBackend
+            self._local_backend = LocalWhisperBackend(self.settings)
+        return self._local_backend
 
     def _progress(self, message: str) -> None:
         callback = getattr(self, "progress_callback", None)
@@ -570,7 +587,7 @@ class TranscriptionService:
         """
         if not os.path.isfile(audio_path):
             raise TranscriptionError("Audio file not found", reason="audio_missing")
-        if not self.settings.openrouter_api_key:
+        if not self._is_local() and not self.settings.openrouter_api_key:
             raise TranscriptionProviderError("auth")
         if translate_to_english:
             raise TranscriptionError("Audio translation is not supported", reason="translation_unsupported")
@@ -579,11 +596,15 @@ class TranscriptionService:
         costs = TranscriptionApiCosts(model="")
         detected_language = None
         primary = self.settings.transcription_model
-        # Keep the recovered model for the rest of this run. Retrying an
-        # unavailable model for each chunk causes repeated failures and costs.
-        models = list(dict.fromkeys((primary, BUDGET_FALLBACK_MODEL, TRANSCRIPTION_MODEL, BUDGET_TRANSCRIPTION_MODEL)))
-        if getattr(self.settings, "clipping_mode", "quality") == "advanced":
+        if self._is_local():
+            # One local model, no cross-vendor recovery chain.
             models = [primary]
+        else:
+            # Keep the recovered model for the rest of this run. Retrying an
+            # unavailable model for each chunk causes repeated failures and costs.
+            models = list(dict.fromkeys((primary, BUDGET_FALLBACK_MODEL, TRANSCRIPTION_MODEL, BUDGET_TRANSCRIPTION_MODEL)))
+            if getattr(self.settings, "clipping_mode", "quality") == "advanced":
+                models = [primary]
         chunk_count = max(1, math.ceil(duration / TRANSCRIPTION_CHUNK_SECONDS))
         with tempfile.TemporaryDirectory(prefix="clip-transcribe-", dir=os.path.dirname(audio_path)) as work:
             for index in range(chunk_count):
@@ -617,6 +638,11 @@ class TranscriptionService:
                             label = f"C{index + 1}{label}"
                         segments.append(TranscriptSegment(words[0].start_time_ms, words[-1].end_time_ms,
                                                           " ".join(w.word for w in words), label, words))
+        # Free local Whisper GPU memory before the planning stage wants the
+        # GPU for the local LLM; the worker process is per-job anyway on error.
+        if getattr(self, "_local_backend", None) is not None:
+            self._local_backend.close()
+            self._local_backend = None
         costs.estimated_cost_usd = round(costs.estimated_cost_usd, 8)
         return TranscriptionResult(
             segments=segments, full_text=" ".join(segment.text for segment in segments),
@@ -724,8 +750,28 @@ class TranscriptionService:
                         output_tokens=usage.get('completion_tokens'), cost_usd=usage.get('cost'))
             return result
 
+    async def _request_transcript_local(self, audio_path: str, language: Optional[str], keyterms: Optional[list[str]]) -> dict:
+        """Transcribe one chunk on this machine with faster-whisper."""
+        from .local_whisper import LocalWhisperError
+
+        duration = await asyncio.to_thread(self._audio_duration, audio_path)
+        effective_language = language or getattr(self.settings, "transcription_language", "") or None
+        if effective_language == "auto":
+            effective_language = None
+        phrases = normalize_keyterms(keyterms)
+        try:
+            response = await asyncio.to_thread(
+                self._get_local_backend().transcribe_chunk,
+                audio_path, effective_language, phrases, duration,
+            )
+        except LocalWhisperError as error:
+            raise TranscriptionError(str(error), reason="local_backend_unavailable") from None
+        return response
+
     async def _request_transcript_body(self, audio_path: str, language: Optional[str], keyterms: Optional[list[str]], model: Optional[str] = None) -> dict:
         import httpx
+        if self._is_local():
+            return await self._request_transcript_local(audio_path, language, keyterms)
         if os.path.getsize(audio_path) > MAX_TRANSCRIPTION_AUDIO_BYTES:
             raise TranscriptionError("Transcription audio chunk is too large", reason="audio_chunk_too_large")
         audio = await asyncio.to_thread(Path(audio_path).read_bytes)
@@ -745,8 +791,9 @@ class TranscriptionService:
             # Groq accepts a prompt hint for Whisper. Other providers may
             # ignore this option; word timings remain required either way.
             payload["provider"] = {"options": {"groq": {"prompt": "Expected vocabulary: " + ", ".join(phrases)}}}
-        if language and language != "auto":
-            payload["language"] = language
+        effective_language = language or getattr(self.settings, "transcription_language", "")
+        if effective_language and effective_language != "auto":
+            payload["language"] = effective_language
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0), follow_redirects=False) as client:
                 async with client.stream(

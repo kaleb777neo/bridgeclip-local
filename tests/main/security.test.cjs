@@ -136,7 +136,7 @@ test('thumbnail generation uses a private cache and does not follow an adjacent 
       electron: { app: { getPath: () => userData } },
       '../shared/job-output': jobOutput,
       './run-history': runHistory,
-      './tools': { resolveBinary: () => 'ffmpeg' },
+      './tools': { resolveBinary: () => 'ffmpeg' }, './local-ai': { modelsDir: () => '/tmp/bridgeclip-models' },
       child_process: { execFile: (_command, args, _options, callback) => {
         fs.writeFileSync(args.at(-1), 'thumbnail')
         callback(null, '', '')
@@ -193,7 +193,7 @@ test('the native picker authorizes media and shell opening rejects aliased appli
       './validation': {},
       './openrouter-models': {},
       './youtube-preview': { getYouTubePreview: async () => ({ title: 'A video' }) },
-      './tools': {},
+      './tools': {}, './local-ai': { modelsDir: () => '/tmp/bridgeclip-models' },
       './zernio/service': {},
       './zernio/posts': {},
       './automations': {},
@@ -338,6 +338,51 @@ test('saved provider keys remain in main and migrate away from legacy encoding',
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })
 
+test('nvidia provider key stays in main and routes the engine to the free backend', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-settings-nvidia-'))
+  const userData = path.join(root, 'userdata')
+  const file = path.join(userData, 'settings.json')
+  fs.mkdirSync(userData)
+  fs.writeFileSync(file, JSON.stringify({ outputDirectory: root }))
+  const settingsStore = loadSource('settings-store.ts', {
+    electron: {
+      app: { getPath: (name) => ({ home: root, appData: root, userData }[name]), isReady: () => true },
+      safeStorage: { isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'gnome_libsecret', encryptString: (value) => Buffer.from(value), decryptString: (value) => value.toString() }
+    }
+  })
+  try {
+    settingsStore.replaceApiKey('openrouterApiKey', 'or-dummy')
+    settingsStore.replaceApiKey('nvidiaApiKey', 'nvapi-dummy')
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).nvidiaApiKey.scheme, 'safeStorage')
+    const publicView = settingsStore.publicSettings(settingsStore.loadSettings())
+    assert.equal(publicView.nvidiaConfigured, true)
+    assert.equal(JSON.stringify(publicView).includes('nvapi-dummy'), false)
+    // The renderer cannot smuggle a key value through the public settings shape.
+    settingsStore.savePublicSettings({ ...publicView, nvidiaApiKey: 'untrusted-replacement' })
+    assert.equal(settingsStore.loadSettings().nvidiaApiKey, 'nvapi-dummy')
+    settingsStore.savePublicSettings({ ...publicView, aiProvider: 'nvidia', nvidiaPlannerModel: 'meta/llama-3.3-70b-instruct' })
+    const nvidiaWorker = settingsStore.getSettingsForBridge(settingsStore.loadSettings())
+    assert.equal(nvidiaWorker.AI_BACKEND, 'nvidia')
+    assert.equal(nvidiaWorker.NVIDIA_API_KEY, 'nvapi-dummy')
+    assert.equal(nvidiaWorker.NVIDIA_PLANNER_MODEL, 'meta/llama-3.3-70b-instruct')
+    // The OpenRouter key never rides along on the NVIDIA backend.
+    assert.equal(nvidiaWorker.OPENROUTER_API_KEY, '')
+    settingsStore.savePublicSettings({ ...publicView, aiProvider: 'cloud' })
+    const cloudWorker = settingsStore.getSettingsForBridge(settingsStore.loadSettings())
+    assert.equal(cloudWorker.AI_BACKEND, 'cloud')
+    assert.equal(cloudWorker.OPENROUTER_API_KEY, 'or-dummy')
+    assert.equal(cloudWorker.NVIDIA_API_KEY, '')
+    // Unknown providers and non-slug model ids fall back to safe values.
+    settingsStore.savePublicSettings({ ...publicView, aiProvider: 'surprise', nvidiaPlannerModel: 'not a slug' })
+    const sanitized = settingsStore.loadSettings()
+    assert.equal(sanitized.aiProvider, 'cloud')
+    assert.equal(sanitized.nvidiaPlannerModel, 'deepseek-ai/deepseek-v3.1')
+    assert.throws(() => settingsStore.replaceApiKey('nvidiaKey', 'unused'), /Invalid API key/)
+    settingsStore.replaceApiKey('nvidiaApiKey', '')
+    assert.equal(settingsStore.publicSettings(settingsStore.loadSettings()).nvidiaConfigured, false)
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
 test('settings migration retires ElevenLabs without decrypting it and preserves the OpenRouter key', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-single-key-'))
   const userData = path.join(root, 'userdata')
@@ -395,7 +440,7 @@ test('engine checks distinguish missing modules, models, contracts and timeouts 
   const runner = loadSource('pipeline-runner.ts', {
     electron: { app }, child_process: { execFile },
     './settings-store': {}, './logger': {}, '../shared/job-output': {},
-    '../shared/job-contract': jobContract, './run-history': {}, './tools': {}
+    '../shared/job-contract': jobContract, './run-history': {}, './tools': {}, './local-ai': { modelsDir: () => '/tmp/bridgeclip-models' }
   })
   const check = () => runner.validatePython('/project with spaces/.venv/bin/python', '/project with spaces/engine')
   assert.equal((await check()).ok, true)
@@ -459,7 +504,7 @@ test('Windows resolves the saved legacy Python default without replacing an inst
       if (!python3Runnable) throw new Error('Python is unavailable')
     } },
     './settings-store': {}, './logger': {}, '../shared/job-output': {},
-    '../shared/job-contract': {}, './run-history': {}, './tools': {}
+    '../shared/job-contract': {}, './run-history': {}, './tools': {}, './local-ai': { modelsDir: () => '/tmp/bridgeclip-models' }
   }, { process: winProcess })
 
   assert.equal(store.loadSettings().pythonPath, 'python')
@@ -505,7 +550,7 @@ test('library rejects parseable but incomplete job output', async (t) => {
       assert.equal((await manager.getJobHistory(root))[0].status, 'failed')
       const withoutNoFollow = loadSource('file-manager.ts', {
         fs: { ...fs, constants: { ...fs.constants, O_NOFOLLOW: undefined } },
-        '../shared/job-output': jobOutput, './run-history': runHistory, './tools': { resolveBinary: () => 'ffprobe' }
+        '../shared/job-output': jobOutput, './run-history': runHistory, './tools': { resolveBinary: () => 'ffprobe' }, './local-ai': { modelsDir: () => '/tmp/bridgeclip-models' }
       })
       assert.equal(await withoutNoFollow.getJobOutput(run, root), null)
       assert.equal((await withoutNoFollow.getJobHistory(root))[0].status, 'failed', 'a link inside the library is still rejected')
@@ -535,7 +580,7 @@ test('job output rejects a link substituted during open when O_NOFOLLOW is unava
           close: async () => { closed = true; await handle.close() }
         }
       } },
-      '../shared/job-output': jobOutput, './run-history': runHistory, './tools': { resolveBinary: () => 'ffprobe' }
+      '../shared/job-output': jobOutput, './run-history': runHistory, './tools': { resolveBinary: () => 'ffprobe' }, './local-ai': { modelsDir: () => '/tmp/bridgeclip-models' }
     })
     assert.equal(await manager.getJobOutput(run, root), null)
     assert.equal(closed, true, 'the opened file is closed after rejection')
@@ -640,7 +685,7 @@ test('pipeline preserves split JSON messages and protects the job identity', asy
     '../shared/job-output': jobOutput,
     './run-history': runHistory,
     '../shared/job-contract': jobContract,
-    './tools': { resolveBinary: () => '/staged/engine-bin/ffmpeg' }
+    './tools': { resolveBinary: () => '/staged/engine-bin/ffmpeg' }, './local-ai': { modelsDir: () => '/tmp/bridgeclip-models' }
   })
   const window = { isDestroyed: () => false, webContents: { isDestroyed: () => false, send: (channel, data) => sent.push({ channel, data }) } }
   runner.startClipJob('trusted-job', {
@@ -691,7 +736,7 @@ test('pipeline rejects a mismatched result identity and a failed process exit', 
       '../shared/job-output': jobOutput,
       './run-history': runHistory,
       '../shared/job-contract': jobContract,
-      './tools': { resolveBinary: () => 'ffmpeg' }
+      './tools': { resolveBinary: () => 'ffmpeg' }, './local-ai': { modelsDir: () => '/tmp/bridgeclip-models' }
     })
     const window = { isDestroyed: () => false, webContents: { isDestroyed: () => false, send: (channel, data) => sent.push({ channel, data }) } }
     runner.startClipJob('trusted-job', { videoUrl: '/tmp/video.mp4' }, window)
@@ -726,7 +771,7 @@ test('a bridge failure is saved in run history before the UI receives it', async
     './run-history': runHistory,
     '../shared/job-output': jobOutput,
     '../shared/job-contract': jobContract,
-    './tools': { resolveBinary: () => 'ffmpeg' }
+    './tools': { resolveBinary: () => 'ffmpeg' }, './local-ai': { modelsDir: () => '/tmp/bridgeclip-models' }
   })
   const sent = []
   const window = { isDestroyed: () => false, webContents: { isDestroyed: () => false, send: (channel, data) => sent.push({ channel, data }) } }
@@ -787,7 +832,7 @@ test('cancellation retains a live process group after the leader closes and forc
     '../shared/job-output': jobOutput,
     './run-history': runHistory,
     '../shared/job-contract': jobContract,
-    './tools': { resolveBinary: () => 'ffmpeg' }
+    './tools': { resolveBinary: () => 'ffmpeg' }, './local-ai': { modelsDir: () => '/tmp/bridgeclip-models' }
   }, {
     process: { ...process, platform: 'darwin', kill: (pid, signal) => { if (signal !== 0) signals.push({ pid, signal }) } },
     setTimeout: (fn) => { callback = fn; timers++; return timer },
@@ -861,7 +906,7 @@ test('Jev migration drops the separate TypeSafe key without decrypting it', () =
     assert.equal(loaded.jevEnabled, 'off')
     assert.equal(loaded.jevVisualContext, 'on')
     const saved = JSON.parse(fs.readFileSync(file, 'utf8'))
-    assert.equal(saved.version, 12)
+    assert.equal(saved.version, 14)
     assert.equal(Object.hasOwn(saved, 'typesafeApiKey'), false)
     assert.equal(Object.hasOwn(saved, 'typesafeVisualContext'), false)
     assert.equal(Object.hasOwn(loaded, 'typesafeApiKey'), false)
@@ -885,7 +930,7 @@ test('Jev thresholds migrate, validate atomically, persist, and reach the worker
     const defaults = [.75, .70, .65, .70, .80, .50, .95]
     const initial = store.publicSettings(store.loadSettings())
     keys.forEach((key, i) => assert.equal(Number(initial[key]), defaults[i]))
-    assert.equal(JSON.parse(fs.readFileSync(file)).version, 12)
+    assert.equal(JSON.parse(fs.readFileSync(file)).version, 14)
     const values = ['0', '1', '0.61', '0.72', '0.83', '0.54', '0.96']
     const saved = store.savePublicSettings({ ...initial, ...Object.fromEntries(keys.map((key, i) => [key, values[i]])) })
     const worker = store.getSettingsForBridge(store.loadSettings())
@@ -938,7 +983,7 @@ test('Jev review and web research stay opt-in across upgrades, downgrades and mi
       assert.equal(loaded.openrouterApiKey, 'kept-openrouter')
       assert.equal(loaded.jevEnabled, 'off', `v${version} loads Jev off`)
       assert.equal(loaded.sourceContextWebResearch, 'off', `v${version} loads research off`)
-      assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).version, 12)
+      assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).version, 14)
     }
     // An explicit opt-in on the current version survives a reload.
     store.savePublicSettings({ ...store.publicSettings(store.loadSettings()), jevEnabled: 'on', sourceContextWebResearch: 'on' })

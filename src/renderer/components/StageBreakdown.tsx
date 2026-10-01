@@ -55,7 +55,8 @@ export function SavedStageTimings({ outputDir, stages: provided, diagnostics: pr
   }, [outputDir, provided])
   const stages = provided === undefined ? loaded : parseStages(provided)
   if (!stages?.length) return null
-  return <details className="glass-well my-3 rounded-xl px-4 py-3"><summary className="cursor-pointer text-xs text-ink-muted">Processing time by stage</summary>
+  const totalMs = stages.reduce((sum, stage) => sum + Math.max(0, stage.elapsed_ms || 0), 0)
+  return <details className="glass-well my-3 rounded-xl px-4 py-3"><summary className="cursor-pointer text-xs text-ink-muted">Processing time by stage{totalMs > 0 && <span className="ml-2 font-mono tabular text-ink-subtle">{formatTimecode(totalMs)}</span>}</summary>
     <div className="mt-3"><StageBreakdown stages={stages} />{Boolean(diagnostics || providedDiagnostics) && <JobDiagnostics diagnostics={parseRunDiagnostics(providedDiagnostics) ?? diagnostics} saved />}</div>
   </details>
 }

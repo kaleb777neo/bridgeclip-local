@@ -11,6 +11,8 @@ import { randomUUID } from 'crypto'
  */
 export interface AppSettings extends JevThresholdSettings {
   openrouterApiKey: string
+  /** Free cloud planning through NVIDIA's hosted NIM API (build.nvidia.com). */
+  nvidiaApiKey: string
   /** Optional: connects social accounts for posting. Used only by the main process, never sent to the engine. */
   zernioApiKey: string
   /** Opt-in beta: Jev review of automatic clips via the existing OpenRouter key. Review & edit always uses Jev. */
@@ -19,32 +21,68 @@ export interface AppSettings extends JevThresholdSettings {
   jevVisualContext: string
   /** Opt-in beta: web research of public sources before transcription. */
   sourceContextWebResearch: string
+  /**
+   * 'cloud' routes all AI through OpenRouter with the user's key. 'nvidia'
+   * plans and repairs clips with NVIDIA's free NIM API and transcribes with
+   * local faster-whisper. 'local' runs everything on this machine; no key and
+   * no internet connection needed.
+   */
+  aiProvider: 'cloud' | 'nvidia' | 'local'
+  /** NVIDIA NIM planner slug (build.nvidia.com model id). */
+  nvidiaPlannerModel: string
+  /** Ollama base URL for the local backend. Loopback only; the engine's network guard enforces it. */
+  localLlmBaseUrl: string
+  /** Ollama model tag used for planning in local mode. */
+  localPlannerModel: string
+  /** faster-whisper size used for transcription in local mode. */
+  localWhisperModel: string
+  /** '' auto-detects; otherwise an ISO 639-1 code like 'ro' or 'en' pins Whisper's language. */
+  transcriptionLanguage: string
   outputDirectory: string
   pythonPath: string
   /** Names and jargon the speech-to-text should spell correctly, one per line. */
   customVocabulary: string
 }
 
-export type ApiKeyName = 'openrouterApiKey' | 'zernioApiKey'
-export type PublicSettings = Pick<AppSettings, 'outputDirectory' | 'pythonPath' | 'customVocabulary' | 'jevEnabled' | 'jevVisualContext' | 'sourceContextWebResearch' | keyof JevThresholdSettings> & {
+export type ApiKeyName = 'openrouterApiKey' | 'nvidiaApiKey' | 'zernioApiKey'
+export type PublicSettings = Pick<AppSettings, 'outputDirectory' | 'pythonPath' | 'customVocabulary' | 'jevEnabled' | 'jevVisualContext' | 'sourceContextWebResearch' | 'aiProvider' | 'nvidiaPlannerModel' | 'localLlmBaseUrl' | 'localPlannerModel' | 'localWhisperModel' | 'transcriptionLanguage' | keyof JevThresholdSettings> & {
   openrouterConfigured: boolean
+  nvidiaConfigured: boolean
   zernioConfigured: boolean
 }
 
-const SECRET_KEYS = ['openrouterApiKey', 'zernioApiKey'] as const
+const SECRET_KEYS = ['openrouterApiKey', 'nvidiaApiKey', 'zernioApiKey'] as const
 type SecretKey = (typeof SECRET_KEYS)[number]
+
+export const WHISPER_MODEL_OPTIONS = ['large-v3-turbo', 'large-v3', 'medium'] as const
+
+/** Planner models offered for the NVIDIA backend (build.nvidia.com ids). */
+export const NVIDIA_MODEL_OPTIONS = [
+  { id: 'deepseek-ai/deepseek-v3.1', label: 'DeepSeek V3.1' },
+  { id: 'meta/llama-3.3-70b-instruct', label: 'Llama 3.3 70B' },
+  { id: 'qwen/qwen3-235b-a22b', label: 'Qwen3 235B A22B' },
+  { id: 'nvidia/llama-3.3-nemotron-super-49b-v1.5', label: 'Nemotron Super 49B' },
+  { id: 'mistralai/mistral-small-3.1-24b-instruct', label: 'Mistral Small 3.1' }
+] as const
 
 const DEFAULT_SETTINGS: AppSettings = {
   ...JEV_DEFAULTS,
   ...JEV_FEATURE_DEFAULTS,
   openrouterApiKey: '',
+  nvidiaApiKey: '',
   zernioApiKey: '',
+  aiProvider: 'cloud',
+  nvidiaPlannerModel: 'deepseek-ai/deepseek-v3.1',
+  localLlmBaseUrl: 'http://127.0.0.1:11434',
+  localPlannerModel: 'qwen3:8b',
+  localWhisperModel: 'large-v3-turbo',
+  transcriptionLanguage: '',
   outputDirectory: join(app.getPath('home'), 'BridgeClip'),
   pythonPath: process.platform === 'win32' ? 'python' : 'python3',
   customVocabulary: ''
 }
 
-const SETTINGS_VERSION = 12
+const SETTINGS_VERSION = 14
 /**
  * Versions 9-11 (pre-release builds of this feature) saved Jev review and web
  * research as on by default, and older versions drop the fields entirely, so a
@@ -58,10 +96,17 @@ type PersistedSecret = { scheme: 'safeStorage' | 'base64'; value: string } | ''
 interface PersistedSettings extends JevThresholdSettings {
   version: number
   openrouterApiKey: PersistedSecret
+  nvidiaApiKey: PersistedSecret
   zernioApiKey: PersistedSecret
   jevEnabled: string
   jevVisualContext: string
   sourceContextWebResearch: string
+  aiProvider?: string
+  nvidiaPlannerModel?: string
+  localLlmBaseUrl?: string
+  localPlannerModel?: string
+  localWhisperModel?: string
+  transcriptionLanguage?: string
   outputDirectory: string
   pythonPath: string
   customVocabulary?: string
@@ -93,10 +138,19 @@ function normalizeSettings(settings: Partial<AppSettings>): AppSettings {
     jevCutThreshold: settings.jevCutThreshold ?? JEV_DEFAULTS.jevCutThreshold,
 
     openrouterApiKey: (settings.openrouterApiKey ?? DEFAULT_SETTINGS.openrouterApiKey).trim(),
+    nvidiaApiKey: (settings.nvidiaApiKey ?? DEFAULT_SETTINGS.nvidiaApiKey).trim(),
     zernioApiKey: (settings.zernioApiKey ?? DEFAULT_SETTINGS.zernioApiKey).trim(),
     jevEnabled: settings.jevEnabled ?? DEFAULT_SETTINGS.jevEnabled,
     jevVisualContext: settings.jevVisualContext ?? DEFAULT_SETTINGS.jevVisualContext,
     sourceContextWebResearch: settings.sourceContextWebResearch ?? DEFAULT_SETTINGS.sourceContextWebResearch,
+    aiProvider: settings.aiProvider === 'local' || settings.aiProvider === 'nvidia' ? settings.aiProvider : 'cloud',
+    nvidiaPlannerModel: normalizeNvidiaModel(settings.nvidiaPlannerModel),
+    localLlmBaseUrl: normalizeLocalBaseUrl(settings.localLlmBaseUrl),
+    localPlannerModel: (settings.localPlannerModel ?? DEFAULT_SETTINGS.localPlannerModel).trim() || DEFAULT_SETTINGS.localPlannerModel,
+    localWhisperModel: (WHISPER_MODEL_OPTIONS as readonly string[]).includes(settings.localWhisperModel ?? '')
+      ? settings.localWhisperModel as AppSettings['localWhisperModel']
+      : DEFAULT_SETTINGS.localWhisperModel,
+    transcriptionLanguage: normalizeLanguage(settings.transcriptionLanguage),
     outputDirectory: (settings.outputDirectory || DEFAULT_SETTINGS.outputDirectory).trim(),
     pythonPath: (settings.pythonPath || DEFAULT_SETTINGS.pythonPath).trim(),
     customVocabulary: vocabularyTerms(settings.customVocabulary ?? DEFAULT_SETTINGS.customVocabulary).join('\n')
@@ -121,6 +175,39 @@ function probability(value: unknown): string | null {
   const trimmed = value.trim()
   if (!/^\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(trimmed) || !Number.isFinite(Number(trimmed)) || Number(trimmed) > 1) return null
   return String(Number(trimmed))
+}
+
+/** Loopback http(s) URL for the local AI runtime; anything else falls back. */
+function normalizeLocalBaseUrl(value: unknown): string {
+  if (typeof value !== 'string') return DEFAULT_SETTINGS.localLlmBaseUrl
+  const trimmed = value.trim()
+  try {
+    const url = new URL(trimmed.includes('://') ? trimmed : `http://${trimmed}`)
+    const host = url.hostname.toLowerCase()
+    if (!['localhost', '127.0.0.1', '[::1]', '::1'].includes(host)) return DEFAULT_SETTINGS.localLlmBaseUrl
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return DEFAULT_SETTINGS.localLlmBaseUrl
+    return `${url.protocol}//${url.host}`
+  } catch {
+    return DEFAULT_SETTINGS.localLlmBaseUrl
+  }
+}
+
+/**
+ * NVIDIA NIM model slug ("vendor/model") or a curated option id; anything
+ * else falls back to the default planner.
+ */
+function normalizeNvidiaModel(value: unknown): string {
+  if (typeof value !== 'string') return DEFAULT_SETTINGS.nvidiaPlannerModel
+  const trimmed = value.trim()
+  if (!/^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._:-]*$/i.test(trimmed)) return DEFAULT_SETTINGS.nvidiaPlannerModel
+  return trimmed
+}
+
+/** '' (auto) or a lowercase ISO 639-1 code; anything else falls back to auto. */
+function normalizeLanguage(value: unknown): string {
+  if (typeof value !== 'string') return ''
+  const trimmed = value.trim().toLowerCase()
+  return /^[a-z]{2}$/.test(trimmed) ? trimmed : ''
 }
 
 /**
@@ -204,6 +291,12 @@ export function loadSettings(): AppSettings {
     const settings = normalizeSettings({
       ...secrets,
       ...savedJevSettings(raw),
+      aiProvider: typeof raw.aiProvider === 'string' ? raw.aiProvider : DEFAULT_SETTINGS.aiProvider,
+      nvidiaPlannerModel: typeof raw.nvidiaPlannerModel === 'string' ? raw.nvidiaPlannerModel : DEFAULT_SETTINGS.nvidiaPlannerModel,
+      localLlmBaseUrl: typeof raw.localLlmBaseUrl === 'string' ? raw.localLlmBaseUrl : DEFAULT_SETTINGS.localLlmBaseUrl,
+      localPlannerModel: typeof raw.localPlannerModel === 'string' ? raw.localPlannerModel : DEFAULT_SETTINGS.localPlannerModel,
+      localWhisperModel: typeof raw.localWhisperModel === 'string' ? raw.localWhisperModel : DEFAULT_SETTINGS.localWhisperModel,
+      transcriptionLanguage: typeof raw.transcriptionLanguage === 'string' ? raw.transcriptionLanguage : DEFAULT_SETTINGS.transcriptionLanguage,
       outputDirectory: typeof raw.outputDirectory === 'string' ? raw.outputDirectory : DEFAULT_SETTINGS.outputDirectory,
       pythonPath: typeof raw.pythonPath === 'string' ? raw.pythonPath : DEFAULT_SETTINGS.pythonPath,
       customVocabulary: typeof raw.customVocabulary === 'string' ? raw.customVocabulary : DEFAULT_SETTINGS.customVocabulary
@@ -231,10 +324,17 @@ function writeSettings(settings: AppSettings): void {
     jevCutThreshold: settings.jevCutThreshold,
 
     openrouterApiKey: encodeSecret(settings.openrouterApiKey),
+    nvidiaApiKey: encodeSecret(settings.nvidiaApiKey),
     zernioApiKey: encodeSecret(settings.zernioApiKey),
     jevEnabled: settings.jevEnabled,
     jevVisualContext: settings.jevVisualContext,
     sourceContextWebResearch: settings.sourceContextWebResearch,
+    aiProvider: settings.aiProvider,
+    nvidiaPlannerModel: settings.nvidiaPlannerModel,
+    localLlmBaseUrl: settings.localLlmBaseUrl,
+    localPlannerModel: settings.localPlannerModel,
+    localWhisperModel: settings.localWhisperModel,
+    transcriptionLanguage: settings.transcriptionLanguage,
     outputDirectory: settings.outputDirectory,
     pythonPath: settings.pythonPath,
     customVocabulary: settings.customVocabulary
@@ -274,14 +374,21 @@ export function publicSettings(settings: AppSettings): PublicSettings {
     pythonPath: settings.pythonPath,
     customVocabulary: settings.customVocabulary,
     openrouterConfigured: Boolean(settings.openrouterApiKey),
+    nvidiaConfigured: Boolean(settings.nvidiaApiKey),
     zernioConfigured: Boolean(settings.zernioApiKey),
     jevEnabled: settings.jevEnabled,
     jevVisualContext: settings.jevVisualContext,
-    sourceContextWebResearch: settings.sourceContextWebResearch
+    sourceContextWebResearch: settings.sourceContextWebResearch,
+    aiProvider: settings.aiProvider,
+    nvidiaPlannerModel: settings.nvidiaPlannerModel,
+    localLlmBaseUrl: settings.localLlmBaseUrl,
+    localPlannerModel: settings.localPlannerModel,
+    localWhisperModel: settings.localWhisperModel,
+    transcriptionLanguage: settings.transcriptionLanguage
   }
 }
 
-export function savePublicSettings(update: Pick<PublicSettings, 'outputDirectory' | 'pythonPath' | 'customVocabulary' | 'jevEnabled' | 'jevVisualContext' | 'sourceContextWebResearch' | keyof JevThresholdSettings>): PublicSettings {
+export function savePublicSettings(update: Pick<PublicSettings, 'outputDirectory' | 'pythonPath' | 'customVocabulary' | 'jevEnabled' | 'jevVisualContext' | 'sourceContextWebResearch' | 'aiProvider' | 'nvidiaPlannerModel' | 'localLlmBaseUrl' | 'localPlannerModel' | 'localWhisperModel' | 'transcriptionLanguage' | keyof JevThresholdSettings>): PublicSettings {
   const current = loadSettings()
   return publicSettings(saveSettings({
     ...current,
@@ -297,7 +404,13 @@ export function savePublicSettings(update: Pick<PublicSettings, 'outputDirectory
     customVocabulary: update.customVocabulary,
     jevEnabled: update.jevEnabled ?? current.jevEnabled,
     jevVisualContext: update.jevVisualContext ?? current.jevVisualContext,
-    sourceContextWebResearch: update.sourceContextWebResearch ?? current.sourceContextWebResearch
+    sourceContextWebResearch: update.sourceContextWebResearch ?? current.sourceContextWebResearch,
+    aiProvider: update.aiProvider ?? current.aiProvider,
+    nvidiaPlannerModel: update.nvidiaPlannerModel ?? current.nvidiaPlannerModel,
+    localLlmBaseUrl: update.localLlmBaseUrl ?? current.localLlmBaseUrl,
+    localPlannerModel: update.localPlannerModel ?? current.localPlannerModel,
+    localWhisperModel: update.localWhisperModel ?? current.localWhisperModel,
+    transcriptionLanguage: update.transcriptionLanguage ?? current.transcriptionLanguage
   }))
 }
 
@@ -329,7 +442,14 @@ export function replaceApiKey(key: ApiKeyName, value: string): PublicSettings {
 
 export function getSettingsForBridge(settings: AppSettings): Record<string, string> {
   return {
-    OPENROUTER_API_KEY: settings.openrouterApiKey,
+    OPENROUTER_API_KEY: settings.aiProvider === 'cloud' ? settings.openrouterApiKey : '',
+    NVIDIA_API_KEY: settings.aiProvider === 'nvidia' ? settings.nvidiaApiKey : '',
+    AI_BACKEND: settings.aiProvider,
+    NVIDIA_PLANNER_MODEL: settings.nvidiaPlannerModel,
+    LOCAL_LLM_BASE_URL: settings.localLlmBaseUrl,
+    LOCAL_PLANNER_MODEL: settings.localPlannerModel,
+    LOCAL_WHISPER_MODEL: settings.localWhisperModel,
+    TRANSCRIPTION_LANGUAGE: settings.transcriptionLanguage,
     SOURCE_CONTEXT_WEB_RESEARCH: settings.sourceContextWebResearch !== 'off' ? 'true' : 'false',
     JEV_THRESHOLD: settings.jevThreshold,
     JEV_SELF_CONTAINED_THRESHOLD: settings.jevSelfContainedThreshold,

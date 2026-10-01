@@ -153,6 +153,166 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(bridge.main(), 1)
         self.assertEqual(json.loads(output.getvalue())["type"], "error")
 
+    def test_nvidia_backend_disables_cloud_stages_and_requires_key(self):
+        observed = []
+        def get_settings():
+            observed.append({key: os.environ.get(key) for key in (
+                "AI_BACKEND", "JEV_ENABLED", "JEV_VISUAL_CONTEXT", "SOURCE_CONTEXT_WEB_RESEARCH", "LAYOUT_VISION_ENABLED"
+            )})
+            return types.SimpleNamespace(openrouter_api_key=None, nvidia_api_key=None)
+        modules = {
+            "clip_engine.config": types.SimpleNamespace(get_settings=get_settings, get_caption_preset=lambda name: None),
+            "clip_engine.bridge_contract": types.SimpleNamespace(BRIDGE_CONTRACT_VERSION=3),
+            "clip_engine.logging_safety": types.SimpleNamespace(install_safe_logging=lambda: None),
+            "clip_engine.services.ai_clipping_pipeline": types.SimpleNamespace(AIClippingPipeline=None, ClippingJobRequest=None, JobStatus=None),
+        }
+        output = io.StringIO()
+        with patch.dict(sys.modules, modules), patch.dict(os.environ, {"AI_BACKEND": "nvidia"}, clear=True), \
+                patch.object(bridge, "check_nvidia_backend", return_value=None), redirect_stdout(output):
+            self.assertFalse(asyncio.run(bridge.run(self.config())))
+        self.assertEqual(observed, [{
+            "AI_BACKEND": "nvidia", "JEV_ENABLED": "false", "JEV_VISUAL_CONTEXT": "false",
+            "SOURCE_CONTEXT_WEB_RESEARCH": "false", "LAYOUT_VISION_ENABLED": "false",
+        }])
+        self.assertIn("Missing required API keys: NVIDIA_API_KEY", output.getvalue())
+
+    def test_nvidia_backend_with_key_keeps_nvidia_models_in_economy(self):
+        from dataclasses import make_dataclass
+        Output = make_dataclass("Output", [("clips", list)])
+        observed = []
+        class Pipeline:
+            def __init__(self, **kwargs): pass
+            async def process_video(self, request):
+                return types.SimpleNamespace(status="completed", output=Output([]), job_id="job-123")
+        def get_settings():
+            observed.append({key: os.environ.get(key) for key in (
+                "PLANNER_MODEL", "EDITORIAL_REPAIR_MODEL", "CLIPPING_MODE")})
+            return types.SimpleNamespace(openrouter_api_key=None, nvidia_api_key="nvapi-test")
+        modules = {
+            "clip_engine.config": types.SimpleNamespace(get_settings=get_settings, get_caption_preset=lambda name: None),
+            "clip_engine.bridge_contract": types.SimpleNamespace(BRIDGE_CONTRACT_VERSION=3),
+            "clip_engine.logging_safety": types.SimpleNamespace(install_safe_logging=lambda: None),
+            "clip_engine.services.ai_clipping_pipeline": types.SimpleNamespace(
+                AIClippingPipeline=Pipeline, ClippingJobRequest=lambda **kwargs: kwargs,
+                JobStatus=types.SimpleNamespace(COMPLETED="completed")),
+        }
+        # Economy normally swaps in cheap OpenRouter slugs; NVIDIA NIM does not
+        # serve them, so the nvidia models selected via env must stay.
+        with patch.dict(sys.modules, modules), patch.dict(os.environ, {"AI_BACKEND": "nvidia"}, clear=True), \
+                patch.object(bridge, "check_nvidia_backend", return_value=None), redirect_stdout(io.StringIO()):
+            self.assertTrue(asyncio.run(bridge.run(self.config(clipping_mode="economy"))))
+        self.assertEqual(observed, [{
+            "PLANNER_MODEL": None, "EDITORIAL_REPAIR_MODEL": None, "CLIPPING_MODE": "economy",
+        }])
+
+    def test_nvidia_readiness_needs_whisper_but_not_ollama(self):
+        with patch.dict(sys.modules, {"faster_whisper": types.SimpleNamespace()}):
+            self.assertIsNone(bridge.check_nvidia_backend())
+        with patch.dict(sys.modules, {}):
+            real_modules = {name: sys.modules.pop(name) for name in ("faster_whisper",) if name in sys.modules}
+            try:
+                import builtins
+                original_import = builtins.__import__
+
+                def no_faster_whisper(name, *args, **kwargs):
+                    if name == "faster_whisper":
+                        raise ImportError(name)
+                    return original_import(name, *args, **kwargs)
+
+                with patch.object(builtins, "__import__", side_effect=no_faster_whisper):
+                    error = bridge.check_nvidia_backend()
+                self.assertIn("not installed", error)
+            finally:
+                sys.modules.update(real_modules)
+
+    def test_nvidia_failures_map_to_fixed_messages(self):
+        rejected = bridge.describe_failure("NVIDIA API error (401)")
+        self.assertEqual(rejected["message"], "NVIDIA rejected the API key.")
+        self.assertIn("nvapi-", rejected["hint"])
+        throttled = bridge.describe_failure("NVIDIA API error (429)")
+        self.assertEqual(throttled["message"], "NVIDIA's free tier rate limit was reached.")
+        # The NVIDIA entries must win over the generic OpenRouter key failures.
+        rejected_detail = bridge.describe_failure("NVIDIA API error (403): unauthorized")
+        self.assertEqual(rejected_detail["message"], "NVIDIA rejected the API key.")
+
+    def test_local_backend_disables_cloud_stages_and_skips_api_key(self):
+        observed = []
+        def get_settings():
+            observed.append({key: os.environ.get(key) for key in (
+                "AI_BACKEND", "JEV_ENABLED", "SOURCE_CONTEXT_WEB_RESEARCH", "LAYOUT_VISION_ENABLED"
+            )})
+            # No OpenRouter key: local mode must not require one.
+            return types.SimpleNamespace(openrouter_api_key=None)
+        modules = {
+            "clip_engine.config": types.SimpleNamespace(get_settings=get_settings, get_caption_preset=lambda name: None),
+            "clip_engine.bridge_contract": types.SimpleNamespace(BRIDGE_CONTRACT_VERSION=3),
+            "clip_engine.logging_safety": types.SimpleNamespace(install_safe_logging=lambda: None),
+            "clip_engine.services.ai_clipping_pipeline": types.SimpleNamespace(AIClippingPipeline=None, ClippingJobRequest=None, JobStatus=None),
+        }
+        local_env = {"AI_BACKEND": "local", "LOCAL_LLM_BASE_URL": "http://127.0.0.1:11434"}
+        not_ready = "The local AI runtime (Ollama) is not running."
+        with patch.dict(sys.modules, modules), patch.dict(os.environ, local_env, clear=True), \
+                patch.object(bridge, "check_local_backend", return_value=not_ready), redirect_stdout(io.StringIO()):
+            self.assertFalse(asyncio.run(bridge.run(self.config())))
+        self.assertEqual(observed, [{
+            "AI_BACKEND": "local", "JEV_ENABLED": "false",
+            "SOURCE_CONTEXT_WEB_RESEARCH": "false", "LAYOUT_VISION_ENABLED": "false",
+        }])
+
+    def test_local_backend_readiness_errors_are_actionable(self):
+        settings = types.SimpleNamespace(
+            local_llm_base_url="http://127.0.0.1:11434", planner_model="qwen3:8b")
+
+        class TagsResponse:
+            def __init__(self, models):
+                self._body = json.dumps({"models": models}).encode()
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with patch.dict(sys.modules, {"faster_whisper": types.SimpleNamespace()}):
+            import urllib.request
+            with patch.object(urllib.request, "urlopen", side_effect=OSError("down")):
+                error = bridge.check_local_backend(settings)
+            self.assertIn("not running", error)
+            with patch.object(urllib.request, "urlopen", return_value=TagsResponse([{"name": "llama3:8b"}])):
+                error = bridge.check_local_backend(settings)
+            self.assertIn("qwen3:8b", error)
+            with patch.object(urllib.request, "urlopen", return_value=TagsResponse([{"name": "qwen3:8b"}])):
+                self.assertIsNone(bridge.check_local_backend(settings))
+        with patch.dict(sys.modules, {}):
+            real_modules = {name: sys.modules.pop(name) for name in ("faster_whisper",) if name in sys.modules}
+            try:
+                import builtins
+                original_import = builtins.__import__
+
+                def no_faster_whisper(name, *args, **kwargs):
+                    if name == "faster_whisper":
+                        raise ImportError(name)
+                    return original_import(name, *args, **kwargs)
+
+                with patch.object(builtins, "__import__", side_effect=no_faster_whisper):
+                    error = bridge.check_local_backend(settings)
+                self.assertIn("not installed", error)
+            finally:
+                sys.modules.update(real_modules)
+
+    def test_local_ai_ports_only_allows_loopback_hosts(self):
+        with patch.dict(os.environ, {"LOCAL_LLM_BASE_URL": "http://127.0.0.1:11434"}, clear=False):
+            self.assertEqual(bridge._local_ai_ports(), (11434,))
+        with patch.dict(os.environ, {"LOCAL_LLM_BASE_URL": "http://localhost:11500/v1"}, clear=False):
+            self.assertEqual(bridge._local_ai_ports(), (11500,))
+        with patch.dict(os.environ, {"LOCAL_LLM_BASE_URL": "http://192.168.1.9:11434"}, clear=False):
+            self.assertEqual(bridge._local_ai_ports(), ())
+        with patch.dict(os.environ, {"LOCAL_LLM_BASE_URL": "not a url ://"}, clear=False):
+            self.assertEqual(bridge._local_ai_ports(), ())
+
     def test_advanced_models_are_applied_before_cached_settings_load(self):
         observed = []
         keys = ("CLIPPING_MODE", "PLANNER_MODEL", "ADVANCED_TRANSCRIPTION_MODEL", "PLANNER_FALLBACK_MODELS", "PLANNER_MAX_OUTPUT_TOKENS", "PLANNER_SUPPORTS_IMAGES")

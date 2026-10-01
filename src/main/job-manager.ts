@@ -94,7 +94,7 @@ function pump(): void {
     const job = jobs.get(jobId)
     if (!job || job.snapshot.status !== 'queued') continue
     running.add(jobId)
-    update(jobId, { status: 'pending', step: 'Starting…', startedAt: new Date().toISOString() })
+    update(jobId, { status: 'pending', step: 'Starting…', startedAt: new Date().toISOString(), statusAt: Date.now() })
     logger.info('jobs.start', { jobId, running: running.size, queued: queue.length })
     const sink: JobEventSink = {
       isDestroyed: () => false,
@@ -127,6 +127,9 @@ function onRunnerEvent(jobId: string, channel: string, payload: unknown): void {
     const diagnostics = parseRunDiagnostics(data.diagnostics)
     update(jobId, {
       status,
+      // Mark when this status began so the UI can time the active step even
+      // when the engine reports no per-stage measurements.
+      ...(status !== job.snapshot.status ? { statusAt: Date.now() } : {}),
       ...(stages ? { stages, progressAt: Date.now() } : {}),
       ...(diagnostics ? { diagnostics } : {}),
       percent: Math.max(0, Math.min(100, number(data.percent, job.snapshot.percent))),

@@ -426,6 +426,41 @@ export interface PostsRefreshResult {
   error: string | null
 }
 
+/** One platform entry of a calendar post, as Zernio's list endpoint reports it. */
+export interface CalendarPostTarget {
+  platform: string
+  handle: string | null
+  status: string | null
+  /** Public link on the platform, present once published. */
+  url: string | null
+}
+
+/**
+ * A post on the calendar. Unlike PostRecord this is not tied to BridgeClip:
+ * it comes straight from Zernio's list endpoint and covers the whole
+ * workspace, `external` ones (posted outside Zernio) included.
+ */
+export interface CalendarPost {
+  id: string
+  status: string
+  /** ISO timestamp the calendar places the post under. */
+  when: string
+  timezone: string | null
+  title: string | null
+  content: string | null
+  source: 'zernio' | 'external'
+  targets: CalendarPostTarget[]
+}
+
+export interface CalendarResult {
+  posts: CalendarPost[]
+  from: string
+  to: string
+  /** Set when the workspace has more posts in the window than the cap. */
+  truncated: boolean
+  error: string | null
+}
+
 const ACTIVE: PostStatus[] = ['scheduled', 'publishing']
 export function isPostActive(post: Pick<PostRecord, 'status'>): boolean {
   return ACTIVE.includes(post.status)

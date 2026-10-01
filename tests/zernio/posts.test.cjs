@@ -1171,3 +1171,39 @@ test('a not-found cancellation cannot write into a newly selected workspace', ()
   main.service.resetZernioState(() => null)
   assert.equal(main.posts.listPosts().find((post) => post.id === result.post.id).status, 'scheduled')
 }))
+
+test('calendar rows parse targets, platform links and sources; unusable rows drop', () => {
+  const parse = (item, source) => pure.payload.parseCalendarPost(item, source ?? 'zernio')
+  const row = parse({
+    _id: 'cal00000000000000000001', status: 'scheduled',
+    scheduledFor: '2026-10-03T18:00:00.000Z', timezone: 'Europe/Bucharest',
+    title: 'Demo title', content: 'Demo caption text',
+    platforms: [
+      { platform: 'tiktok', accountId: { _id: 'acc00000000000000000001', username: '@demo' }, status: 'pending' },
+      { platform: 'youtube', accountId: 'acc00000000000000000002', status: 'published',
+        platformPostUrl: 'https://www.youtube.com/watch?v=abcdefghijk' },
+      { platform: 'twitter', accountId: { username: 'evil' }, status: 'published',
+        platformPostUrl: 'https://evil.example/x' },
+      { platform: '', accountId: 'acc00000000000000000003' }
+    ]
+  })
+  assert.equal(row.id, 'cal00000000000000000001')
+  assert.equal(row.status, 'scheduled')
+  assert.equal(row.when, '2026-10-03T18:00:00.000Z')
+  assert.equal(row.timezone, 'Europe/Bucharest')
+  assert.equal(row.targets.length, 3)
+  assert.deepEqual(row.targets[0], { platform: 'tiktok', handle: 'demo', status: 'pending', url: null })
+  assert.equal(row.targets[1].url, 'https://www.youtube.com/watch?v=abcdefghijk')
+  // A link that is not on the platform's own site never reaches the renderer.
+  assert.equal(row.targets[2].url, null)
+
+  const external = parse({ _id: 'cal00000000000000000002', status: 'published', createdAt: '2026-10-01T09:00:00.000Z',
+    content: 'posted from the phone', platforms: [{ platform: 'instagram', accountId: { username: 'demo' } }] }, 'external')
+  assert.equal(external.source, 'external')
+  assert.equal(external.when, '2026-10-01T09:00:00.000Z')
+
+  assert.equal(parse({ _id: 'not a valid id!', status: 'scheduled', scheduledFor: '2026-10-03T18:00:00.000Z', platforms: [{ platform: 'tiktok', accountId: 'a' }] }), null, 'bad id')
+  assert.equal(parse({ _id: 'cal00000000000000000003', status: 'weird', scheduledFor: '2026-10-03', platforms: [{ platform: 'tiktok', accountId: 'a' }] }), null, 'unknown status')
+  assert.equal(parse({ _id: 'cal00000000000000000004', status: 'published', createdAt: null, platforms: [{ platform: 'tiktok', accountId: 'a' }] }), null, 'no timestamp')
+  assert.equal(parse({ _id: 'cal00000000000000000005', status: 'published', createdAt: '2026-10-01' }), null, 'no targets')
+})

@@ -133,6 +133,26 @@ test('failed settings write does not poison subsequent writes', async () => {
   assert.equal(useSettingsStore.getState().saving, false)
 })
 
+test('nvidia provider settings round-trip and merge with untouched fields', async () => {
+  const saved = []
+  const { useSettingsStore } = load({ settings: {
+    load: async () => ({
+      ...settings, aiProvider: 'nvidia', nvidiaConfigured: true,
+      nvidiaPlannerModel: 'meta/llama-3.3-70b-instruct'
+    }),
+    save: async (next) => { saved.push(next); return next }
+  } })
+  await useSettingsStore.getState().load()
+  assert.equal(useSettingsStore.getState().aiProvider, 'nvidia')
+  assert.equal(useSettingsStore.getState().nvidiaConfigured, true)
+  assert.equal(useSettingsStore.getState().nvidiaPlannerModel, 'meta/llama-3.3-70b-instruct')
+  await useSettingsStore.getState().save({ nvidiaPlannerModel: 'qwen/qwen3-235b-a22b' })
+  assert.equal(saved[0].nvidiaPlannerModel, 'qwen/qwen3-235b-a22b')
+  // The merged save still carries the provider fields the form did not touch.
+  assert.equal(saved[0].aiProvider, 'nvidia')
+  assert.equal(saved[0].nvidiaConfigured, true)
+})
+
 test('API key changes share the settings queue and keep the saving indicator active', async () => {
   const first = deferred()
   const keyWrite = deferred()

@@ -41,7 +41,7 @@ function fakeChild() {
   return child
 }
 
-function startRunner({ child, env = process.env, onSpawn = () => {} }) {
+function startRunner({ child, env = process.env, onSpawn = () => {}, bridgeEnv = {} }) {
   const sent = []
   const signals = []
   const settings = { openrouterApiKey: SECRET, outputDirectory: WORK_HOME, pythonPath: '/opt/python3', enginePath: WORK_HOME }
@@ -49,14 +49,14 @@ function startRunner({ child, env = process.env, onSpawn = () => {} }) {
     electron: { app: { isPackaged: false, getPath: () => WORK_HOME } },
     fs: { ...fs, existsSync: () => true },
     child_process: { execFile: require('node:child_process').execFile, spawn: (command, args, options) => { onSpawn(command, args, options); return child } },
-    './settings-store': { loadSettings: () => settings, getSettingsForBridge: () => ({ OPENROUTER_API_KEY: SECRET, LOCAL_MODE: 'true', LOCAL_OUTPUT_DIR: WORK_HOME }), vocabularyTerms: () => [] },
+    './settings-store': { loadSettings: () => settings, getSettingsForBridge: () => ({ OPENROUTER_API_KEY: SECRET, LOCAL_MODE: 'true', LOCAL_OUTPUT_DIR: WORK_HOME, ...bridgeEnv }), vocabularyTerms: () => [] },
     './logger': { logger: { info() {}, error() {}, warn() {} } },
     '../shared/job-output': jobOutput,
     '../shared/run-diagnostics': loadShared('run-diagnostics.ts'),
     '../shared/job-progress': loadShared('job-progress.ts'),
     './run-history': runHistory,
     '../shared/job-contract': jobContract,
-    './tools': { resolveBinary: () => '/staged/engine-bin/ffmpeg' }
+    './tools': { resolveBinary: () => '/staged/engine-bin/ffmpeg' }, './local-ai': { modelsDir: () => '/tmp/bridgeclip-models' }
   }, {
     process: { ...process, platform: 'darwin', env, kill: (pid, signal) => { signals.push({ pid, signal }) } }
   })
@@ -100,6 +100,31 @@ test('the worker gets a minimal environment: no proxies, interpreter hooks or in
   assert.equal(env.PATH.split(path.delimiter)[0], '/staged/engine-bin')
   assert.equal(env.PYTHONDONTWRITEBYTECODE, '1')
   assert.ok(env.BRIDGECLIP_WORK_ROOT.startsWith(WORK_HOME))
+  child.emit('close', 1, null)
+})
+
+test('the nvidia backend key reaches the worker env only, never argv or stdin', () => {
+  const child = fakeChild()
+  let workerInput = ''
+  child.stdin.on('data', (chunk) => { workerInput += chunk.toString() })
+  const NV_SECRET = 'nvapi-audit-secret'
+  let spawned
+  const { runner, window } = startRunner({
+    child,
+    env: { PATH: '/usr/bin:/bin', HOME: WORK_HOME },
+    onSpawn: (command, args, options) => { spawned = { command, args, options } },
+    bridgeEnv: {
+      OPENROUTER_API_KEY: '', AI_BACKEND: 'nvidia', NVIDIA_API_KEY: NV_SECRET,
+      NVIDIA_PLANNER_MODEL: 'deepseek-ai/deepseek-v3.1'
+    }
+  })
+  runner.startClipJob('audit-job', { videoUrl: path.join(WORK_HOME, 'video.mp4') }, window)
+  assert.ok(spawned, 'worker spawned')
+  assert.ok(!JSON.stringify(spawned.args).includes(NV_SECRET))
+  assert.ok(!workerInput.includes(NV_SECRET), 'stdin config carries no key')
+  assert.equal(spawned.options.env.NVIDIA_API_KEY, NV_SECRET)
+  assert.equal(spawned.options.env.AI_BACKEND, 'nvidia')
+  assert.equal(spawned.options.env.OPENROUTER_API_KEY, '')
   child.emit('close', 1, null)
 })
 

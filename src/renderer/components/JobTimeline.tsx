@@ -42,8 +42,11 @@ export function JobTimeline({ job }: { job: Job }): React.JSX.Element {
   }, [queued])
   const measured = !!job.stages?.length
   const stages = measured ? job.stages! : pendingStages(job)
+  // Without engine measurements only the active step is timed, from when its
+  // status first appeared; finished stages stay unknown rather than guessed.
+  const liveSince = measured ? job.progressAt : job.statusAt
   const elapsed = (stage: PipelineStage): number => stage.elapsed_ms +
-    (stage.state === 'running' && !queued && job.progressAt ? Math.max(0, now - job.progressAt) : 0)
+    (stage.state === 'running' && !queued && liveSince ? Math.max(0, now - liveSince) : 0)
   const total = measured ? stages.reduce((sum, stage) => sum + elapsed(stage), 0) : 0
   const completed = stages.filter(stage => stage.state === 'completed').length
   const skipped = stages.filter(stage => stage.state === 'skipped').length
@@ -57,7 +60,7 @@ export function JobTimeline({ job }: { job: Job }): React.JSX.Element {
       <progress className="studio-progress studio-overall-bar" aria-label="Overall estimated progress" max={100} value={queued ? 0 : pct} />
       <span className="font-mono text-xl tabular text-ink">{queued ? '—' : `${pct}%`}</span>
     </div>
-    {!measured && !queued && <p className="mb-3 text-xs text-ink-muted" role="status">{job.step || 'Starting the clipping engine…'}<span className="mt-1 block text-2xs text-ink-subtle">Detailed bars and timings appear on runs started with the updated engine.</span></p>}
+    {!measured && !queued && <p className="mb-3 text-xs text-ink-muted" role="status">{job.step || 'Starting the clipping engine…'}<span className="mt-1 block text-2xs text-ink-subtle">Detailed bars and stage timings appear on runs started with the updated engine. The current step is timed meanwhile.</span></p>}
     <ol aria-label="Stage progress" className="studio-stages">
       {stages.map((stage, index) => {
         const active = stage.state === 'running' && !queued
@@ -77,7 +80,7 @@ export function JobTimeline({ job }: { job: Job }): React.JSX.Element {
             {active && stage.percent !== null && <span className="font-mono tabular">{Math.floor(stage.percent)}%</span>}
           </div>
           <span className="studio-state">{stateLabel}</span>
-          <span className="studio-duration">{measured && (active || elapsed(stage) > 0 || done) ? formatTimecode(elapsed(stage)) : '—'}</span>
+          <span className="studio-duration">{(measured && (active || elapsed(stage) > 0 || done)) || (active && Boolean(liveSince)) ? formatTimecode(elapsed(stage)) : '—'}</span>
           {active && <div className="studio-detail" key={`${stage.id}-detail`}>
             <Icon size={23} aria-hidden="true" className="shrink-0 text-accent" />
             <div className="min-w-0"><p className="text-xs text-ink" aria-live="polite">{measured ? job.step || count || HINTS[stage.id] : 'Detailed progress is unavailable for this run.'}</p>

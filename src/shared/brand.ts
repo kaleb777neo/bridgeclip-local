@@ -12,6 +12,7 @@ export const DISCORD_URL = 'https://www.bridgemind.ai/discord'
 
 export const PROVIDER_LINKS = {
   openrouter: 'https://openrouter.ai/keys',
+  nvidia: 'https://build.nvidia.com',
   zernio: 'https://zernio.com/dashboard/api-keys'
 } as const
 

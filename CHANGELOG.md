@@ -8,6 +8,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Mai
 
 ### Added
 
+- **NVIDIA free cloud planning** in Settings → AI provider: clip selection runs on build.nvidia.com's free tier (~1000 credits, 40 requests per minute) with local Whisper transcription — a free middle ground between the paid cloud and fully offline mode. Jev review, web research and AI framing stay off, and rate limits are retried automatically.
 - **What to clip** in Create → Clips: describe the moments you want, such as "every time they talk about pricing". Leave it blank to get the strongest moments as before.
 - **Show title at the top** in Create → Captions turns off the title card on Automatic clips.
 - **Review & edit** workflow: look over clip candidates before exporting. Trim, split and extend cuts, change layouts and camera changes, fix and place captions, then bake one clip or every ready clip with **Bake all**. You can also swap in a higher-quality copy of the source video.

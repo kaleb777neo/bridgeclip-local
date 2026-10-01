@@ -2,7 +2,7 @@
 // turning Zernio's post objects into local history records. No Electron or
 // network here, so tests can exercise every branch directly.
 
-import { sanitizeProviderText } from './client'
+import { cleanHandle, sanitizeProviderText } from './client'
 import { isZernioId, isZernioPlatform, type ZernioPlatform } from '../../shared/zernio'
 import {
   EMPTY_TIKTOK_ACCOUNT,
@@ -10,6 +10,8 @@ import {
   PLATFORM_RULES,
   captionLength,
   isValidTimeZone,
+  type CalendarPost,
+  type CalendarPostTarget,
   type FacebookFormat,
   type PostClipRequest,
   type PostOptions,
@@ -284,6 +286,52 @@ export function buildCreatePostBody(request: PostClipRequest, context: PostBodyC
     body.tiktokSettings = tiktokSharedSettings(options.tiktok)
   }
   return body
+}
+
+// ---- Calendar (GET /v1/posts) ------------------------------------------------
+
+const CALENDAR_STATUSES = new Set(['draft', 'scheduled', 'publishing', 'published', 'partial', 'failed', 'cancelled'])
+
+/**
+ * One row of Zernio's post list as a CalendarPost. Returns null for rows
+ * without a usable id, a known status or any place-on-the-grid timestamp.
+ * `platforms[].accountId` may be an id string or an account object; links are
+ * only kept when they are https URLs on the entry's own platform site.
+ */
+export function parseCalendarPost(item: unknown, source: 'zernio' | 'external'): CalendarPost | null {
+  const post = asRecord(item)
+  const id = str(post._id) ?? str(post.id)
+  const status = str(post.status)
+  if (!isZernioId(id) || !status || !CALENDAR_STATUSES.has(status)) return null
+  const when = str(post.scheduledFor) ?? str(post.publishedAt) ?? str(post.createdAt)
+  if (!when || !Number.isFinite(Date.parse(when))) return null
+  const targets = (Array.isArray(post.platforms) ? post.platforms.map(asRecord) : [])
+    .map((entry): CalendarPostTarget | null => {
+      const platform = str(entry.platform)?.toLowerCase() ?? ''
+      if (!/^[a-z][a-z0-9_-]*$/.test(platform)) return null
+      const account = asRecord(entry.accountId)
+      const handle = cleanHandle(account.username) ?? cleanHandle(entry.username)
+      const rawUrl = str(entry.platformPostUrl)
+      const url = rawUrl && isPostUrl(rawUrl, platform) ? rawUrl : null
+      return {
+        platform,
+        handle,
+        status: str(entry.status) ?? null,
+        url
+      }
+    })
+    .filter((target): target is CalendarPostTarget => target !== null)
+  if (targets.length === 0) return null
+  return {
+    id,
+    status,
+    when,
+    timezone: str(post.timezone) ?? null,
+    title: sanitizeProviderText(post.title, 120) ?? null,
+    content: sanitizeProviderText(post.content, 200) ?? null,
+    source,
+    targets
+  }
 }
 
 // ---- Zernio post → local record ---------------------------------------------
