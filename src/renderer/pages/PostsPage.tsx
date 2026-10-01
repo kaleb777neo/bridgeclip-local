@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ArrowUpRight, CalendarClock, Clapperboard, RefreshCw, RotateCcw, Send, X } from 'lucide-react'
+import { PostsCalendar } from '../components/PostsCalendar'
 import { cn, formatRelativeDate, localFileUrl } from '../lib/utils'
 import { loadThumbnail } from '../lib/thumbnails'
 import { usePostsStore } from '../store/use-posts-store'
@@ -70,12 +71,14 @@ export function PostsPage({ onNavigate }: { onNavigate: (page: Page) => void }):
   )
 }
 
-/** Posts made from BridgeClip: scheduled, failed and recent, with cancel, retry and links. */
+/** Posts made from BridgeClip plus the workspace calendar: list or month grid. */
 function PostsList({ onNavigate }: { onNavigate: (page: Page) => void }): React.JSX.Element {
   const { posts, loaded, refreshing, error, clearError, refresh } = usePostsStore()
   const [showAll, setShowAll] = useState(false)
+  const [view, setView] = useState<'list' | 'calendar'>('list')
 
   useEffect(() => {
+    if (view !== 'list') return
     void usePostsStore.getState().load().then(() => usePostsStore.getState().refresh(false))
     const timer = setInterval(() => {
       if (document.visibilityState === 'visible') void usePostsStore.getState().refresh(false)
@@ -86,7 +89,7 @@ function PostsList({ onNavigate }: { onNavigate: (page: Page) => void }): React.
       clearInterval(timer)
       window.removeEventListener('focus', onFocus)
     }
-  }, [])
+  }, [view])
 
   const groups = useMemo(() => {
     const scheduled = posts.filter((p) => p.status === 'scheduled').sort((a, b) => (a.scheduledFor ?? '').localeCompare(b.scheduledFor ?? ''))
@@ -102,61 +105,81 @@ function PostsList({ onNavigate }: { onNavigate: (page: Page) => void }): React.
         title={TITLE}
         className="items-center"
         actions={
-          <Button
-            variant="ghost"
-            iconOnly
-            aria-label="Refresh posts"
-            title="Refresh"
-            onClick={() => void refresh(true)}
-            disabled={refreshing}
-            icon={<RefreshCw className={cn('h-3.5 w-3.5', refreshing && 'animate-spin')} />}
-          />
+          <div className="flex items-center gap-1">
+            <div role="tablist" aria-label="Posts view" className="glass-tile flex items-center rounded-full p-0.5">
+              {(['list', 'calendar'] as const).map((id) => (
+                <button key={id} type="button" role="tab" aria-selected={view === id}
+                  onClick={() => setView(id)}
+                  className={cn('rounded-full px-2.5 py-1 text-2xs capitalize transition-colors duration-150',
+                    view === id ? 'bg-white/[0.1] text-ink' : 'text-ink-muted hover:text-ink')}>
+                  {id === 'list' ? 'List' : 'Calendar'}
+                </button>
+              ))}
+            </div>
+            {view === 'list' && (
+              <Button
+                variant="ghost"
+                iconOnly
+                aria-label="Refresh posts"
+                title="Refresh"
+                onClick={() => void refresh(true)}
+                disabled={refreshing}
+                icon={<RefreshCw className={cn('h-3.5 w-3.5', refreshing && 'animate-spin')} />}
+              />
+            )}
+          </div>
         }
       />
 
       <div className="mt-4 space-y-3">
-        {error && (
-          <Callout tone="danger" onDismiss={clearError}>
-            {error}
-          </Callout>
-        )}
-
-        {!loaded ? (
-          <Panel padded={false}>
-            <p role="status" className="px-4 py-3 text-xs text-ink-muted">Loading your posts…</p>
-          </Panel>
-        ) : posts.length === 0 && error ? (
-          <Panel padded={false} className="flex items-center justify-between gap-3 py-2 pl-4 pr-2.5">
-            <p className="text-xs text-ink-muted">Your post history is unavailable right now.</p>
-            <Button size="sm" onClick={() => void usePostsStore.getState().load()}>Try again</Button>
-          </Panel>
-        ) : posts.length === 0 ? (
-          <EmptyState
-            icon={<Send />}
-            title="Nothing posted yet"
-            description="Open a run in the Library and choose Post on a clip. Scheduled posts wait here until they go out."
-            action={
-              <Button icon={<Clapperboard className="h-3.5 w-3.5" />} onClick={() => onNavigate('library')}>
-                Open Library
-              </Button>
-            }
-          />
+        {view === 'calendar' ? (
+          <PostsCalendar />
         ) : (
-          <Panel padded={false} className="overflow-hidden">
-            <PostGroup title="Scheduled" posts={groups.scheduled} />
-            <PostGroup title="Needs attention" posts={groups.attention} />
-            <PostGroup title="Recent" posts={recent} />
-            {groups.recent.length > RECENT_LIMIT && (
-              <div className="border-t border-white/[0.06] px-2.5 py-1.5">
-                <Button variant="ghost" size="sm" onClick={() => setShowAll((v) => !v)}>
-                  {showAll ? 'Show fewer' : `Show all ${groups.recent.length}`}
-                </Button>
-              </div>
+          <>
+            {error && (
+              <Callout tone="danger" onDismiss={clearError}>
+                {error}
+              </Callout>
             )}
-          </Panel>
-        )}
 
-        <p className="px-1 text-2xs text-ink-subtle">Zernio publishes scheduled posts even when BridgeClip is closed.</p>
+            {!loaded ? (
+              <Panel padded={false}>
+                <p role="status" className="px-4 py-3 text-xs text-ink-muted">Loading your posts…</p>
+              </Panel>
+            ) : posts.length === 0 && error ? (
+              <Panel padded={false} className="flex items-center justify-between gap-3 py-2 pl-4 pr-2.5">
+                <p className="text-xs text-ink-muted">Your post history is unavailable right now.</p>
+                <Button size="sm" onClick={() => void usePostsStore.getState().load()}>Try again</Button>
+              </Panel>
+            ) : posts.length === 0 ? (
+              <EmptyState
+                icon={<Send />}
+                title="Nothing posted yet"
+                description="Open a run in the Library and choose Post on a clip. Scheduled posts wait here until they go out."
+                action={
+                  <Button icon={<Clapperboard className="h-3.5 w-3.5" />} onClick={() => onNavigate('library')}>
+                    Open Library
+                  </Button>
+                }
+              />
+            ) : (
+              <Panel padded={false} className="overflow-hidden">
+                <PostGroup title="Scheduled" posts={groups.scheduled} />
+                <PostGroup title="Needs attention" posts={groups.attention} />
+                <PostGroup title="Recent" posts={recent} />
+                {groups.recent.length > RECENT_LIMIT && (
+                  <div className="border-t border-white/[0.06] px-2.5 py-1.5">
+                    <Button variant="ghost" size="sm" onClick={() => setShowAll((v) => !v)}>
+                      {showAll ? 'Show fewer' : `Show all ${groups.recent.length}`}
+                    </Button>
+                  </div>
+                )}
+              </Panel>
+            )}
+
+            <p className="px-1 text-2xs text-ink-subtle">Zernio publishes scheduled posts even when BridgeClip is closed.</p>
+          </>
+        )}
       </div>
     </>
   )
