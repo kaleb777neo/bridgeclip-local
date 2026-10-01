@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from network_guard import _guard_async_connect, _public_address
+import network_guard
 
 
 class NetworkGuardTests(unittest.TestCase):
@@ -19,6 +20,32 @@ class NetworkGuardTests(unittest.TestCase):
             self.assertEqual(_public_address(sock, ("8.8.8.8", 443)), ("8.8.8.8", 443))
         finally:
             sock.close()
+
+    def test_allowlisted_loopback_port_is_permitted_and_scoped(self):
+        network_guard._allowed_loopback_ports = frozenset({11434})
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                # The configured Ollama port on loopback passes through.
+                self.assertEqual(_public_address(sock, ("127.0.0.1", 11434)), ("127.0.0.1", 11434))
+                # Any other loopback port, and any private address, stays blocked.
+                for host, port in (("127.0.0.1", 8080), ("10.0.0.1", 11434), ("192.168.1.2", 11434)):
+                    with self.subTest(host=host, port=port), self.assertRaises(OSError):
+                        _public_address(sock, (host, port))
+                loopback = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 11434))]
+                with patch.object(socket, "getaddrinfo", return_value=loopback):
+                    self.assertEqual(_public_address(sock, ("localhost", 11434)), ("127.0.0.1", 11434))
+                # A hostname resolving partly off-loopback must not slip through.
+                mixed = [
+                    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 11434)),
+                    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 11434)),
+                ]
+                with patch.object(socket, "getaddrinfo", return_value=mixed), self.assertRaises(OSError):
+                    _public_address(sock, ("localhost", 11434))
+            finally:
+                sock.close()
+        finally:
+            network_guard._allowed_loopback_ports = frozenset()
 
     def test_rejects_private_dns_result_even_after_initial_url_validation(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -144,6 +171,25 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         assert 'Local network destinations are not allowed' in str(error)
     else:
         raise AssertionError('The guard allowed an arbitrary loopback connection')
+"""
+        done = subprocess.run(
+            [sys.executable, "-c", script], cwd=Path(__file__).parent,
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_install_keeps_new_event_loops_working_on_the_direct_fallback(self):
+        # Python 3.10+ defines the Windows socketpair fallback directly as
+        # `socket.socketpair` instead of aliasing `_fallback_socketpair`, so
+        # the guard must recognise the pure-Python implementation by module.
+        # Without that, every event loop created after install() fails.
+        script = """
+import asyncio
+import network_guard as guard
+
+guard.install()
+assert asyncio.run(asyncio.sleep(0, result=1)) == 1
+assert asyncio.run(asyncio.sleep(0, result=2)) == 2
 """
         done = subprocess.run(
             [sys.executable, "-c", script], cwd=Path(__file__).parent,

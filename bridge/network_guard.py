@@ -3,6 +3,10 @@
 The guard checks the address passed to connect, after DNS resolution. This
 also catches redirects and DNS changes made after the UI's initial URL check.
 It is installed only in BridgeClip's local worker process.
+
+The local AI backend (Ollama at 127.0.0.1) is the one exception: when the
+bridge enables it, loopback connections to the configured Ollama port are
+allowed. Everything else private stays blocked.
 """
 
 import ipaddress
@@ -12,6 +16,11 @@ import sys
 _original_connect = socket.socket.connect
 _original_connect_ex = socket.socket.connect_ex
 _installed = False
+_allowed_loopback_ports: frozenset[int] = frozenset()
+
+
+def _loopback_allowed(port: object) -> bool:
+    return isinstance(port, int) and port in _allowed_loopback_ports
 
 
 def _internal_socketpair(family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0):
@@ -64,6 +73,8 @@ def _public_address(sock: socket.socket, address):
     try:
         ip = ipaddress.ip_address(host)
         if not ip.is_global:
+            if ip.is_loopback and _loopback_allowed(port):
+                return address
             raise OSError("Local network destinations are not allowed")
         return address
     except ValueError:
@@ -72,7 +83,10 @@ def _public_address(sock: socket.socket, address):
     results = socket.getaddrinfo(host, port, sock.family, sock.type, sock.proto)
     if not results:
         raise OSError("Network destination could not be resolved")
-    if any(not ipaddress.ip_address(result[4][0]).is_global for result in results):
+    ips = [ipaddress.ip_address(result[4][0]) for result in results]
+    if all(ip.is_loopback for ip in ips) and _loopback_allowed(port):
+        return results[0][4]
+    if any(not ip.is_global for ip in ips):
         raise OSError("Local network destinations are not allowed")
     return results[0][4]
 
@@ -84,10 +98,11 @@ def _guard_async_connect(original):
     return guarded_sock_connect
 
 
-def install() -> None:
-    global _installed
+def install(allowed_loopback_ports: "tuple[int, ...] | list[int] | None" = None) -> None:
+    global _installed, _allowed_loopback_ports
     if _installed:
         return
+    _allowed_loopback_ports = frozenset(allowed_loopback_ports or ())
 
     def guarded_connect(sock, address):
         return _original_connect(sock, _public_address(sock, address))
@@ -100,8 +115,15 @@ def install() -> None:
     # Python's Windows socketpair fallback uses socket.connect() to reach its
     # own ephemeral loopback listener. Keep that private IPC working without
     # allowing any arbitrary local destination through guarded_connect().
+    # Python 3.10+ defines the fallback directly as `socket.socketpair` (it is
+    # no longer an alias of `_fallback_socketpair`), so detect the pure-Python
+    # implementation through its module instead of its identity.
     fallback_socketpair = getattr(socket, "_fallback_socketpair", None)
-    if fallback_socketpair is not None and socket.socketpair is fallback_socketpair:
+    pure_python_socketpair = (
+        (fallback_socketpair is not None and socket.socketpair is fallback_socketpair)
+        or getattr(socket.socketpair, "__module__", None) == "socket"
+    )
+    if pure_python_socketpair:
         socket.socketpair = _internal_socketpair
     # Windows Proactor connects through ConnectEx instead of socket.connect(),
     # so guard the event loop's destination before it reaches that API.
