@@ -672,6 +672,33 @@ export async function reschedulePost(id: unknown, scheduledFor: unknown, timezon
   })
 }
 
+/** The calendar's edit dialog: caption, title and accounts of a still-scheduled post. The video never changes. */
+export async function editScheduledPost(id: unknown, patch: unknown): Promise<PostRecord[]> {
+  const generation = workspaceGeneration
+  const post = requirePost(id)
+  if (post.status !== 'scheduled') throw new Error('Only scheduled posts can be edited.')
+  return changePost(post.id, async () => {
+    const value = patch && typeof patch === 'object' ? patch as Record<string, unknown> : {}
+    const title = typeof value.title === 'string' ? value.title.trim().slice(0, 200) : ''
+    const content = typeof value.content === 'string' ? value.content.trim().slice(0, 4000) : ''
+    const rawTargets = Array.isArray(value.targets) ? value.targets : []
+    if (rawTargets.length === 0 || rawTargets.length > 20) throw new Error('Choose the accounts to post to.')
+    const seen = new Set<string>()
+    const platforms = rawTargets.map((entry) => {
+      const target = entry && typeof entry === 'object' ? entry as Record<string, unknown> : {}
+      const accountId = typeof target.accountId === 'string' ? target.accountId : ''
+      if (!isZernioId(accountId) || !isZernioPlatform(target.platform) || seen.has(accountId)) {
+        throw new Error('One of the chosen accounts is no longer available.')
+      }
+      seen.add(accountId)
+      return { platform: target.platform, accountId }
+    })
+    const remote = await getClient().updatePost(post.id, { content, platforms, ...(title ? { title } : {}) })
+    assertWorkspace(generation)
+    return posts().save(applyZernioPost({ ...post, clipTitle: title || post.clipTitle }, remote, { now: new Date().toISOString() }))
+  })
+}
+
 export async function retryPost(id: unknown): Promise<PostRecord[]> {
   const generation = workspaceGeneration
   const post = requirePost(id)

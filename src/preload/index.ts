@@ -4,7 +4,7 @@ import type { AutomationReviewResult } from '../shared/automations'
 import type { CandidateEdit, EditorProgressSummary, EditorSession } from '../shared/clip-editor'
 import type { JobOutput } from '../shared/job-output'
 import type { EditAudit } from '../shared/editorial'
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type {
   ZernioConnectOptions,
   ZernioConnectResult,
@@ -172,6 +172,8 @@ export interface BridgeClipAPI {
       calendar: (from: string, to: string) => Promise<CalendarResult>
       cancel: (postId: string) => Promise<PostRecord[]>
       reschedule: (postId: string, scheduledFor: string, timezone: string) => Promise<PostRecord[]>
+      /** Edits the title, caption and accounts of a still-scheduled post. The video never changes. */
+      edit: (postId: string, patch: { title: string; content: string; targets: { platform: string; accountId: string }[] }) => Promise<PostRecord[]>
       retry: (postId: string) => Promise<PostRecord[]>
       dismiss: (postId: string) => Promise<PostRecord[]>
       open: (postId: string, targetIndex: number) => Promise<void>
@@ -214,6 +216,8 @@ export interface BridgeClipAPI {
   }
   dialog: {
     selectVideo: () => Promise<string | null>
+    /** The absolute path of a file the user actually dropped, authorized for posting; null for anything else. */
+    authorizeDrop: (file: File) => Promise<string | null>
   }
   clips: {
     bulkExport: (clips: { path: string; name: string }[]) => Promise<{ success: boolean; count: number; failedCount: number; destDir?: string }>
@@ -329,6 +333,7 @@ const api: BridgeClipAPI = {
       calendar: (from, to) => ipcRenderer.invoke('zernio:posts:calendar', from, to),
       cancel: (postId) => ipcRenderer.invoke('zernio:posts:cancel', postId),
       reschedule: (postId, scheduledFor, timezone) => ipcRenderer.invoke('zernio:posts:reschedule', postId, scheduledFor, timezone),
+      edit: (postId, patch) => ipcRenderer.invoke('zernio:posts:edit', postId, patch),
       retry: (postId) => ipcRenderer.invoke('zernio:posts:retry', postId),
       dismiss: (postId) => ipcRenderer.invoke('zernio:posts:dismiss', postId),
       open: (postId, targetIndex) => ipcRenderer.invoke('zernio:posts:open', postId, targetIndex),
@@ -363,7 +368,11 @@ const api: BridgeClipAPI = {
     showItemInFolder: (path) => ipcRenderer.invoke('shell:showItemInFolder', path)
   },
   dialog: {
-    selectVideo: () => ipcRenderer.invoke('dialog:selectVideo')
+    selectVideo: () => ipcRenderer.invoke('dialog:selectVideo'),
+    authorizeDrop: (file: File) => {
+      const path = webUtils.getPathForFile(file)
+      return path ? ipcRenderer.invoke('dialog:authorizeDrop', path) : Promise.resolve(null)
+    }
   },
   clips: {
     bulkExport: (clips) => ipcRenderer.invoke('clips:bulkExport', clips)

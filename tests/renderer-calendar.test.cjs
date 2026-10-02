@@ -9,7 +9,7 @@ const { buildSync } = require('esbuild')
 
 const bundle = buildSync({
   stdin: {
-    contents: `export { addMonths, chipTime, dayKey, monthGrid, monthTitle, shiftDay, WEEKDAY_LABELS } from './src/renderer/lib/calendar';`,
+    contents: `export { addDays, addMonths, chipTime, dayKey, layoutDayCards, minutesOfDay, monthGrid, monthTitle, shiftDay, timezoneLabel, WEEKDAY_LABELS, weekGrid } from './src/renderer/lib/calendar';`,
     resolveDir: path.resolve(__dirname, '..'),
     loader: 'ts'
   },
@@ -18,8 +18,10 @@ const bundle = buildSync({
 
 const mod = { exports: {} }
 vm.runInNewContext(bundle, { module: mod, exports: mod.exports, require, Intl, Date })
-const { addMonths, chipTime, dayKey, monthGrid, monthTitle, shiftDay, WEEKDAY_LABELS } = mod.exports
-
+const {
+  addDays, addMonths, chipTime, dayKey, layoutDayCards, minutesOfDay,
+  monthGrid, monthTitle, shiftDay, timezoneLabel, WEEKDAY_LABELS, weekGrid,
+} = mod.exports
 test('month grids start on Monday, keep six weeks and cover the whole month', () => {
   for (const [year, month] of [[2026, 9], [2026, 0], [2024, 1], [2025, 11]]) {
     const grid = monthGrid({ year, month })
@@ -83,4 +85,54 @@ test('chip time and day shifts stay in local time', () => {
   assert.equal(shiftDay('2026-02-28', 1), '2026-03-01')
   assert.equal(WEEKDAY_LABELS[0], 'Mon')
   assert.equal(WEEKDAY_LABELS[6], 'Sun')
+})
+
+test('week grids are Monday-start, seven days, and hold the anchor', () => {
+  // 2026-10-02 is a Friday: the week runs Mon 28 Sept to Sun 4 Oct.
+  const grid = weekGrid(new Date(2026, 9, 2), new Date(2026, 9, 2))
+  assert.equal(grid.cells.length, 7)
+  const firstDate = new Date(grid.cells[0].key + 'T00:00:00')
+  assert.equal((firstDate.getDay() + 6) % 7, 0, 'starts on Monday')
+  assert.equal(grid.cells[4].key, '2026-10-02')
+  assert.equal(grid.cells[4].isToday, true)
+  assert.equal(grid.from, '2026-09-28')
+  assert.equal(grid.to, '2026-10-04')
+  assert.equal(grid.title, '28 Sep – 4 Oct, 2026')
+  // A whole-month week collapses to "5 – 11 Oct, 2026".
+  const same = weekGrid(new Date(2026, 9, 7))
+  assert.equal(same.title, '5 – 11 Oct, 2026')
+})
+
+test('addDays crosses months and stays local', () => {
+  assert.equal(dayKey(addDays(new Date(2026, 9, 1), -1)), '2026-09-30')
+  assert.equal(dayKey(addDays(new Date(2026, 9, 31), 1)), '2026-11-01')
+})
+
+test('minutesOfDay reads local clock time', () => {
+  assert.equal(minutesOfDay('2026-10-02T11:04:00'), 11 * 60 + 4)
+  assert.equal(minutesOfDay('garbage'), 0)
+})
+
+test('timezone label names the offset and the city', () => {
+  const label = timezoneLabel(new Date(Date.UTC(2026, 9, 2, 12)))
+  assert.match(label, /^GMT[+-]\d{1,2}(:\d{2})?( · .+)?$/)
+})
+
+test('overlapping cards share lanes and the overflow collapses to one chip', () => {
+  const at = (m) => ({ item: `t${m}`, minutes: m })
+  const { cards, more } = layoutDayCards([at(600), at(605), at(610), at(615), at(620), at(900)])
+  // 600-620 is one cluster: three lanes visible, the rest behind a +2 chip.
+  // (Objects come from the vm realm; compare through JSON, not prototypes.)
+  assert.equal(JSON.stringify(cards.map((c) => [c.item, c.lane])),
+    JSON.stringify([['t600', 0], ['t605', 1], ['t610', 2], ['t900', 0]]))
+  assert.equal(JSON.stringify(more), JSON.stringify([{ minutes: 600, lane: 3, count: 2 }]))
+  // The 15:00 post is alone in its own cluster, back in lane 0.
+  assert.equal(JSON.stringify(cards.find((c) => c.item === 't900')),
+    JSON.stringify({ item: 't900', minutes: 900, lane: 0 }))
+})
+
+test('cards far apart do not stack', () => {
+  const { cards, more } = layoutDayCards([{ item: 'a', minutes: 600 }, { item: 'b', minutes: 640 }])
+  assert.equal(JSON.stringify(cards.map((c) => c.lane)), '[0,0]')
+  assert.equal(more.length, 0)
 })

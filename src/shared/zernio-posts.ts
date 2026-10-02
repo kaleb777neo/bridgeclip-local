@@ -429,6 +429,8 @@ export interface PostsRefreshResult {
 /** One platform entry of a calendar post, as Zernio's list endpoint reports it. */
 export interface CalendarPostTarget {
   platform: string
+  /** Zernio account id, kept so a scheduled post can be re-targeted by the edit dialog. */
+  accountId: string | null
   handle: string | null
   status: string | null
   /** Public link on the platform, present once published. */

@@ -303,18 +303,24 @@ export function parseCalendarPost(item: unknown, source: 'zernio' | 'external'):
   const id = str(post._id) ?? str(post.id)
   const status = str(post.status)
   if (!isZernioId(id) || !status || !CALENDAR_STATUSES.has(status)) return null
-  const when = str(post.scheduledFor) ?? str(post.publishedAt) ?? str(post.createdAt)
-  if (!when || !Number.isFinite(Date.parse(when))) return null
+  const whenRaw = str(post.scheduledFor) ?? str(post.publishedAt) ?? str(post.createdAt)
+  // Normalize to a full ISO timestamp: a date-only string from a provider feed
+  // would otherwise parse as UTC midnight and sort and bucket a day off.
+  const whenMs = typeof whenRaw === 'string' ? Date.parse(whenRaw) : NaN
+  if (!Number.isFinite(whenMs)) return null
+  const when = new Date(whenMs).toISOString()
   const targets = (Array.isArray(post.platforms) ? post.platforms.map(asRecord) : [])
     .map((entry): CalendarPostTarget | null => {
       const platform = str(entry.platform)?.toLowerCase() ?? ''
       if (!/^[a-z][a-z0-9_-]*$/.test(platform)) return null
       const account = asRecord(entry.accountId)
+      const accountId = str(entry.accountId) ?? str(account._id) ?? str(account.id) ?? null
       const handle = cleanHandle(account.username) ?? cleanHandle(entry.username)
       const rawUrl = str(entry.platformPostUrl)
       const url = rawUrl && isPostUrl(rawUrl, platform) ? rawUrl : null
       return {
         platform,
+        accountId: accountId && isZernioId(accountId) ? accountId : null,
         handle,
         status: str(entry.status) ?? null,
         url

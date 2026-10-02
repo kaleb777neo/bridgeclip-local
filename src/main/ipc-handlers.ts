@@ -47,6 +47,7 @@ import {
   cancelPost,
   cancelUpload,
   dismissPost,
+  editScheduledPost,
   getTikTokCreatorInfo,
   listPosts,
   openCalendarPostLink,
@@ -132,6 +133,7 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
   handle('zernio:posts:refresh', (_event, force: unknown) => refreshPosts(force))
   handle('zernio:posts:cancel', (_event, postId: unknown) => cancelPost(postId))
   handle('zernio:posts:reschedule', (_event, postId: unknown, scheduledFor: unknown, timezone: unknown) => reschedulePost(postId, scheduledFor, timezone))
+  handle('zernio:posts:edit', (_event, postId: unknown, patch: unknown) => editScheduledPost(postId, patch))
   handle('zernio:posts:retry', (_event, postId: unknown) => retryPost(postId))
   handle('zernio:posts:dismiss', (_event, postId: unknown) => dismissPost(postId))
   handle('zernio:posts:open', (_event, postId: unknown, targetIndex: unknown) => openPostLink(postId, targetIndex))
@@ -394,6 +396,17 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
 
     if (result.canceled || result.filePaths.length === 0) return null
     return authorizeMedia(result.filePaths[0])
+  })
+
+  // A file dropped on the calendar's upload zone arrives as an absolute path; authorizeMedia
+  // rejects anything that isn't a real supported media file, same gate the picker uses.
+  handle('dialog:authorizeDrop', (_event, path: unknown) => {
+    if (typeof path !== 'string') return null
+    try {
+      return authorizeMedia(path)
+    } catch {
+      return null
+    }
   })
 
   handle('clips:bulkExport', async (_event, clips: { path: string; name: string }[]) => {

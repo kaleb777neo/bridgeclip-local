@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
-import { ArrowUpRight, CalendarClock, Clapperboard, RefreshCw, RotateCcw, Send, X } from 'lucide-react'
-import { PostsCalendar } from '../components/PostsCalendar'
+import { ArrowUpRight, CalendarClock, Clapperboard, Clock3, RefreshCw, RotateCcw, Send, X } from 'lucide-react'
+import { PostsCalendar, type CalendarMode } from '../components/PostsCalendar'
 import { cn, formatRelativeDate, localFileUrl } from '../lib/utils'
 import { loadThumbnail } from '../lib/thumbnails'
 import { usePostsStore } from '../store/use-posts-store'
 import { useSettingsStore } from '../store/use-settings-store'
 import { scheduleError, scheduleWindow, type PostRecord } from '../../shared/zernio-posts'
+import { timezoneLabel } from '../lib/calendar'
 import { PlatformIcon, platformName } from '../components/PlatformIcon'
-import { formatScheduled, targetBadge } from '../components/PostDialog'
+import { formatScheduled, targetBadge, PostDialog } from '../components/PostDialog'
+import { SchedulePostDialog, type ScheduleDraft } from '../components/SchedulePostDialog'
 import { Page as PageColumn } from '../components/ui/Page'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Panel } from '../components/ui/Panel'
@@ -51,10 +53,11 @@ function whenText(post: PostRecord): string {
 
 export function PostsPage({ onNavigate }: { onNavigate: (page: Page) => void }): React.JSX.Element {
   const configured = useSettingsStore((s) => s.zernioConfigured)
+  const [view, setView] = useState<'list' | 'calendar'>('list')
   return (
-    <PageColumn width="narrow">
+    <PageColumn width={configured && view === 'calendar' ? 'wide' : 'narrow'}>
       {configured ? (
-        <PostsList onNavigate={onNavigate} />
+        <PostsList view={view} onViewChange={setView} onNavigate={onNavigate} />
       ) : (
         <>
           <PageHeader title={TITLE} />
@@ -72,10 +75,18 @@ export function PostsPage({ onNavigate }: { onNavigate: (page: Page) => void }):
 }
 
 /** Posts made from BridgeClip plus the workspace calendar: list or month grid. */
-function PostsList({ onNavigate }: { onNavigate: (page: Page) => void }): React.JSX.Element {
+function PostsList({ view, onViewChange, onNavigate }: {
+  view: 'list' | 'calendar'
+  onViewChange: (view: 'list' | 'calendar') => void
+  onNavigate: (page: Page) => void
+}): React.JSX.Element {
   const { posts, loaded, refreshing, error, clearError, refresh } = usePostsStore()
+  const [calendarMode, setCalendarMode] = useState<CalendarMode>('week')
   const [showAll, setShowAll] = useState(false)
-  const [view, setView] = useState<'list' | 'calendar'>('list')
+  /** The Schedule Post dialog, with the calendar slot its "+" was clicked on (if any). */
+  const [schedule, setSchedule] = useState<{ slot: { key: string; hour: number } | null } | null>(null)
+  const [draft, setDraft] = useState<ScheduleDraft | null>(null)
+  const [calendarReload, setCalendarReload] = useState(0)
 
   useEffect(() => {
     if (view !== 'list') return
@@ -102,21 +113,34 @@ function PostsList({ onNavigate }: { onNavigate: (page: Page) => void }): React.
   return (
     <>
       <PageHeader
-        title={TITLE}
         className="items-center"
+        title={view === 'calendar' ? (
+          <span className="flex flex-wrap items-center gap-2.5">
+            Calendar
+            <span className={cn('inline-flex h-6 items-center gap-1.5 rounded-full px-2.5 text-2xs text-ink-muted', WELL)}>
+              <Clock3 aria-hidden className="h-3 w-3" />{timezoneLabel()}
+            </span>
+          </span>
+        ) : TITLE}
         actions={
           <div className="flex items-center gap-1">
             <div role="tablist" aria-label="Posts view" className="glass-tile flex items-center rounded-full p-0.5">
               {(['list', 'calendar'] as const).map((id) => (
                 <button key={id} type="button" role="tab" aria-selected={view === id}
-                  onClick={() => setView(id)}
+                  onClick={() => onViewChange(id)}
                   className={cn('rounded-full px-2.5 py-1 text-2xs capitalize transition-colors duration-150',
                     view === id ? 'bg-white/[0.1] text-ink' : 'text-ink-muted hover:text-ink')}>
                   {id === 'list' ? 'List' : 'Calendar'}
                 </button>
               ))}
             </div>
-            {view === 'list' && (
+            {view === 'calendar' ? (
+              <Button size="sm" variant="primary" icon={<Send className="h-3.5 w-3.5" />}
+                tooltip="Schedule a clip from the Library or a video file"
+                onClick={() => setSchedule({ slot: null })}>
+                Schedule post
+              </Button>
+            ) : (
               <Button
                 variant="ghost"
                 iconOnly
@@ -133,7 +157,8 @@ function PostsList({ onNavigate }: { onNavigate: (page: Page) => void }): React.
 
       <div className="mt-4 space-y-3">
         {view === 'calendar' ? (
-          <PostsCalendar />
+          <PostsCalendar mode={calendarMode} onModeChange={setCalendarMode} onNavigate={onNavigate}
+            onSchedule={(slot) => setSchedule({ slot })} reloadSignal={calendarReload} />
         ) : (
           <>
             {error && (
@@ -181,6 +206,19 @@ function PostsList({ onNavigate }: { onNavigate: (page: Page) => void }): React.
           </>
         )}
       </div>
+
+      {schedule && (
+        <SchedulePostDialog slot={schedule.slot} onClose={() => setSchedule(null)}
+          onConnect={() => { setSchedule(null); onNavigate('accounts') }}
+          onNext={(next) => { setSchedule(null); setDraft(next) }} />
+      )}
+      {draft && (
+        <PostDialog clips={[draft.clip]}
+          initial={{ caption: draft.description || undefined, accountIds: draft.accountIds, scheduleValue: draft.scheduleValue }}
+          onPosted={() => setCalendarReload((n) => n + 1)}
+          onClose={() => setDraft(null)}
+          onNavigate={onNavigate} />
+      )}
     </>
   )
 }

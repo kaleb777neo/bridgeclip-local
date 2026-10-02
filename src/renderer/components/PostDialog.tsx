@@ -63,7 +63,16 @@ interface PostDialogProps {
   /** One clip, or several posted one after another with the same accounts and options. */
   clips: PostableClip[]
   onClose: () => void
+  /** Called once a post was actually created, so callers can refetch only when it matters. */
+  onPosted?: () => void
   onNavigate?: (page: Page) => void
+  /** Prefill from the calendar's Schedule Post dialog. */
+  initial?: {
+    caption?: string
+    accountIds?: string[]
+    /** A `YYYY-MM-DDTHH:mm` local value; the dialog opens in schedule mode with it. */
+    scheduleValue?: string | null
+  }
 }
 
 type Phase = 'editing' | 'sending' | 'done'
@@ -132,7 +141,7 @@ function isCreatorInfo(value: CreatorInfoState | undefined): value is TikTokCrea
   return typeof value === 'object' && value !== null && 'privacyLevels' in value
 }
 
-export function PostDialog({ clips, onClose, onNavigate }: PostDialogProps): React.JSX.Element {
+export function PostDialog({ clips, onClose, onPosted, onNavigate, initial }: PostDialogProps): React.JSX.Element {
   const zernioConfigured = useSettingsStore((s) => s.zernioConfigured)
   const writingConfigured = useSettingsStore((s) => s.openrouterConfigured)
   const [enhancementOpen, setEnhancementOpen] = useState(false)
@@ -154,7 +163,7 @@ export function PostDialog({ clips, onClose, onNavigate }: PostDialogProps): Rea
   // Per clip.
   const [media, setMedia] = useState<ClipMediaInfo | null>(null)
   const [thumb, setThumb] = useState<string | null>(null)
-  const [caption, setCaption] = useState(() => defaultCaption(clip.title, clip.tags))
+  const [caption, setCaption] = useState(() => initial?.caption?.trim() || defaultCaption(clip.title, clip.tags))
   const [youtube, setYoutube] = useState<YouTubePostOptions>(() => ({ title: youtubeTitleFor(clip.title) || 'Untitled clip', visibility: 'public', madeForKids: false }))
   const [phase, setPhase] = useState<Phase>('editing')
   const [progress, setProgress] = useState<PostProgress | null>(null)
@@ -162,13 +171,13 @@ export function PostDialog({ clips, onClose, onNavigate }: PostDialogProps): Rea
   const [result, setResult] = useState<PostClipResult | null>(null)
 
   // Kept across clips in a batch.
-  const [selected, setSelected] = useState<string[]>([])
+  const [selected, setSelected] = useState<string[]>(() => initial?.accountIds ?? [])
   const [tiktok, setTiktok] = useState<TikTokPostOptions>(EMPTY_TIKTOK)
   const [creatorInfo, setCreatorInfo] = useState<Record<string, CreatorInfoState>>({})
   const [shareToFeed, setShareToFeed] = useState(true)
   const [facebookFormat, setFacebookFormat] = useState<FacebookFormat | null>(null)
-  const [mode, setMode] = useState<'now' | 'schedule'>('now')
-  const [scheduleValue, setScheduleValue] = useState(defaultScheduleValue)
+  const [mode, setMode] = useState<'now' | 'schedule'>(() => (initial?.scheduleValue ? 'schedule' : 'now'))
+  const [scheduleValue, setScheduleValue] = useState(() => initial?.scheduleValue || defaultScheduleValue())
   const [now, setNow] = useState(() => Date.now())
 
   const dialogRef = useRef<HTMLDivElement>(null)
@@ -213,10 +222,13 @@ export function PostDialog({ clips, onClose, onNavigate }: PostDialogProps): Rea
     [accounts, profileNames]
   )
   // An account disconnected while this dialog was open cannot remain selected.
+  // Before the accounts first load the list is legitimately empty; pruning then
+  // would silently wipe the ids prefilled from the calendar's Schedule Post flow.
   useEffect(() => {
+    if (!accountsLoaded) return
     const availableIds = new Set(postable.map((account) => account.id))
     setSelected((current) => current.every((id) => availableIds.has(id)) ? current : current.filter((id) => availableIds.has(id)))
-  }, [postable])
+  }, [postable, accountsLoaded])
   const selectedAccounts = postable.filter((a) => selected.includes(a.id) && isPostableAccount(a))
   const unavailableSelected = selected.filter((id) => !selectedAccounts.some((account) => account.id === id))
   const platforms = [...new Set(selectedAccounts.map((a) => a.platform as ZernioPlatform))]
@@ -375,7 +387,10 @@ export function PostDialog({ clips, onClose, onNavigate }: PostDialogProps): Rea
           ...(has('threads') && threadsTopicTag.trim() ? { threads: { topicTag: threadsTopicTag.trim() } } : {})
         }
       })
-      if (outcome.post) usePostsStore.getState().upsert(outcome.post)
+      if (outcome.post) {
+        usePostsStore.getState().upsert(outcome.post)
+        onPosted?.()
+      }
       setResult(outcome)
       setPhase('done')
     } catch (err) {

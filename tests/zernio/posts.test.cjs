@@ -1192,7 +1192,7 @@ test('calendar rows parse targets, platform links and sources; unusable rows dro
   assert.equal(row.when, '2026-10-03T18:00:00.000Z')
   assert.equal(row.timezone, 'Europe/Bucharest')
   assert.equal(row.targets.length, 3)
-  assert.deepEqual(row.targets[0], { platform: 'tiktok', handle: 'demo', status: 'pending', url: null })
+  assert.deepEqual(row.targets[0], { platform: 'tiktok', accountId: 'acc00000000000000000001', handle: 'demo', status: 'pending', url: null })
   assert.equal(row.targets[1].url, 'https://www.youtube.com/watch?v=abcdefghijk')
   // A link that is not on the platform's own site never reaches the renderer.
   assert.equal(row.targets[2].url, null)
