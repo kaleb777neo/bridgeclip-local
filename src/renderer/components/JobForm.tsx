@@ -1,9 +1,11 @@
 import { normalizeVideoSource, twitchSourceError } from '../../shared/video-source'
-import { useEffect, useMemo, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { ArrowLeft, ArrowRight, Check, CheckCircle2, Clock3, ListVideo, Minus, Plus, Sparkles } from 'lucide-react'
-import { cn, MOD_KEY, parseTimecode, sourceLabel } from '../lib/utils'
-import { useDraftStore, type ClipDraft, type WizardStep } from '../store/use-draft-store'
+import { cn, basename, MOD_KEY, parseTimecode, sourceLabel } from '../lib/utils'
+import { getApi } from '../lib/ipc'
+import { useDraftStore, type ClipDraft, type WizardAspectRatio, type WizardStep } from '../store/use-draft-store'
 import { useActiveJobs } from '../store/use-job-store'
+import type { BrandTemplate } from '../../shared/templates'
 import type { ClipJobRequest } from '../../shared/jobs'
 import { MAX_PARALLEL_JOBS } from '../../shared/jobs'
 import { CaptionPresetPicker, CAPTION_PRESET_NAMES } from './CaptionPresetPicker'
@@ -26,7 +28,8 @@ const DURATIONS = DURATION_OPTIONS
 
 const FORMATS = [
   { id: '9:16', label: 'Vertical', hint: 'Shorts, Reels, TikTok', w: 12, h: 21 },
-  { id: '16:9', label: 'Horizontal', hint: 'YouTube, X, LinkedIn', w: 24, h: 14 }
+  { id: '1:1', label: 'Square', hint: 'Feed, X, LinkedIn', w: 18, h: 18 },
+  { id: '16:9', label: 'Horizontal', hint: 'YouTube, Threads', w: 24, h: 14 }
 ] as const
 
 const LAYOUT_STYLES = [
@@ -61,6 +64,10 @@ export function parseTrimRange(enabled: boolean, startText: string, endText: str
 /** The run request for the current draft. */
 export function buildJobRequest(draft: ClipDraft, trim: { start: number | null; end: number | null }): ClipJobRequest {
   if (!draft.workflow) throw new Error('Choose a workflow before creating clips.')
+  // Review & edit exports one format, vertical or horizontal, from the editor.
+  const ratios: WizardAspectRatio[] = draft.workflow === 'review'
+    ? (draft.aspectRatios[0] === '1:1' ? ['9:16'] : [draft.aspectRatios[0]])
+    : draft.aspectRatios
   return {
     videoUrl: normalizeVideoSource(draft.source),
     workflow: draft.workflow,
@@ -70,19 +77,70 @@ export function buildJobRequest(draft: ClipDraft, trim: { start: number | null; 
     maxClips: draft.autoClipCount ? null : draft.maxClips,
     autoClipCount: draft.autoClipCount,
     durationRanges: draft.durations.length > 0 ? draft.durations : null,
-    aspectRatio: draft.aspectRatio,
+    aspectRatio: ratios[0],
+    // With a pack selected the full format list always travels with the job: main only fills
+    // unset fields, so sending the user's current choice is what keeps manual edits winning.
+    ...(ratios.length > 1 || draft.templateId ? { aspectRatios: [...ratios] } : {}),
     layoutStyle: draft.layoutStyle,
-    layoutVision: draft.clippingMode !== 'economy' && draft.aspectRatio === '9:16' && draft.layoutStyle === 'auto' && draft.layoutVision,
+    layoutVision: draft.clippingMode !== 'economy' && ratios[0] !== '16:9' && draft.layoutStyle === 'auto' && draft.layoutVision,
     pacing: draft.pacing,
     videoSpeed: draft.videoSpeed ?? 1,
     includeCaptions: draft.includeCaptions,
     captionPreset: draft.captionPreset,
+    ...(draft.srtPath ? { srtPath: draft.srtPath } : {}),
     includeTitle: draft.includeTitle,
     startTimeSeconds: trim.start,
     endTimeSeconds: trim.end,
-    bannerPlatform: null,
-    bannerChannelUrl: null
+    bannerPlatform: draft.bannerPlatform ?? null,
+    bannerChannelUrl: draft.bannerChannelUrl ?? null,
+    ...(draft.templateId ? { templateId: draft.templateId } : {})
   }
+}
+
+/**
+ * Applying a pack writes its preset and formats into the draft; they stay
+ * manually editable, and a later manual edit beats the pack (main fills only
+ * unset request fields). `None` clears the pack but keeps the derived values.
+ */
+export function draftPatchForTemplate(template: BrandTemplate | null): Partial<ClipDraft> {
+  if (!template) return { templateId: null }
+  return {
+    templateId: template.id,
+    captionPreset: template.captionPresetId,
+    aspectRatios: [...template.formats] as WizardAspectRatio[],
+    // Per-channel render settings: the same fill-only-what-the-pack-carries rule,
+    // so later manual edits in the wizard still win at submit time.
+    ...(template.pacing !== undefined ? { pacing: template.pacing } : {}),
+    ...(template.layoutStyle !== undefined ? { layoutStyle: template.layoutStyle } : {}),
+    ...(template.includeTitle !== undefined ? { includeTitle: template.includeTitle } : {}),
+    ...(template.banner ? { bannerPlatform: template.banner.platform, bannerChannelUrl: template.banner.channelUrl } : {})
+  }
+}
+
+/** "None" + one chip per pack; shown above the wizard steps once templates exist. */
+export function TemplateSelector({ templates, selectedId, onSelect }: {
+  templates: BrandTemplate[]
+  selectedId: string | null
+  onSelect: (id: string | null) => void
+}): React.JSX.Element {
+  return (
+    <section aria-label="Brand template" className="flex flex-wrap items-center gap-1.5">
+      <span className="eyebrow mr-1 text-2xs text-ink-subtle">Brand template</span>
+      {[{ id: null as string | null, name: 'None' }, ...templates].map((t) => (
+        <button
+          key={t.id ?? '__none'}
+          type="button"
+          aria-pressed={selectedId === t.id}
+          title={t.id ? undefined : 'No brand template'}
+          onClick={() => onSelect(t.id)}
+          className={cn('glass-tile glass-tile-hover rounded-full px-3 py-1 text-xs', selectedId === t.id ? 'glass-selected text-ink' : 'text-ink-muted hover:text-ink')}
+        >
+          {t.name}
+          {t.id && templates.find((x) => x.id === t.id)?.builtIn ? <span className="ml-1 text-2xs text-ink-faint">built-in</span> : null}
+        </button>
+      ))}
+    </section>
+  )
 }
 
 interface JobFormProps {
@@ -105,6 +163,26 @@ type Update = (patch: Partial<ClipDraft>) => void
 export function JobForm({ onSubmit, onViewJob, blockedReason, submitting, className }: JobFormProps): React.JSX.Element {
   const draft = useDraftStore()
   const { update, step, setStep } = draft
+  const [templates, setTemplates] = useState<BrandTemplate[]>([])
+
+  // Brand packs load once per mount; the page keeps no separate copy.
+  useEffect(() => {
+    let active = true
+    // Brand packs load once per mount; a configured default pack pre-applies
+    // to fresh drafts (no pack chosen yet). Manual edits in the wizard still win.
+    try {
+      void Promise.all([getApi().templates.list(), getApi().settings.load()]).then(([list, settings]) => {
+        if (!active) return
+        setTemplates(list)
+        if (settings.defaultTemplateId && !draft.templateId) {
+          const pack = list.find((tpl) => tpl.id === settings.defaultTemplateId)
+          if (pack) update(draftPatchForTemplate(pack))
+        }
+      }).catch(() => {})
+    } catch { /* no bridge (tests) */ }
+    return () => { active = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const trim = useMemo(
     () => parseTrimRange(draft.trimOpen, draft.trimStart, draft.trimEnd),
@@ -149,6 +227,13 @@ export function JobForm({ onSubmit, onViewJob, blockedReason, submitting, classN
 
   return (
     <div className={cn('space-y-3', className)}>
+      {templates.length > 0 && (
+        <TemplateSelector
+          templates={templates}
+          selectedId={draft.templateId}
+          onSelect={(id) => update(draftPatchForTemplate(id === null ? null : templates.find((t) => t.id === id) ?? null))}
+        />
+      )}
       <Stepper current={step} reachable={videoValid ? WIZARD_STEPS.length - 1 : 0} onSelect={goTo} />
 
       {step === 'captions' && draft.workflow === 'review' && (
@@ -296,21 +381,27 @@ function VideoStep({ draft, update, trimError, disabled }: { draft: ClipDraft; u
 
 /** Format, framing and pacing. Exported for the keyboard-navigation test. */
 export function FormatStep({ draft, update }: { draft: ClipDraft; update: Update }): React.JSX.Element {
+  const review = draft.workflow === 'review'
+  const formats = review ? FORMATS.filter((f) => f.id !== '1:1') : FORMATS
+  const toggleFormat = (id: WizardAspectRatio): void => {
+    if (review || draft.aspectRatios.includes(id)) {
+      const next = draft.aspectRatios.filter((r) => r !== id)
+      if (review || next.length === 0) update({ aspectRatios: [id] })
+      else update({ aspectRatios: next })
+    } else update({ aspectRatios: [...draft.aspectRatios, id] })
+  }
   return (
     <div className="space-y-4">
-      <Group label="Format">
-        <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="Format">
-          {FORMATS.map((f) => {
-            const selected = draft.aspectRatio === f.id
+      <Group label="Format" aside={!review && draft.aspectRatios.length > 1 ? `${draft.aspectRatios.length} formats · ${draft.aspectRatios.join(' + ')}` : undefined}>
+        <div className={cn('grid gap-2', review ? 'grid-cols-2' : 'grid-cols-3')} role="group" aria-label="Format">
+          {formats.map((f) => {
+            const selected = draft.aspectRatios.includes(f.id)
             return (
               <button
                 key={f.id}
                 type="button"
-                role="radio"
-                aria-checked={selected}
-                tabIndex={selected ? 0 : -1}
-                onKeyDown={onRadioKeyDown}
-                onClick={() => update({ aspectRatio: f.id })}
+                aria-pressed={selected}
+                onClick={() => toggleFormat(f.id)}
                 className={cn('glass-tile glass-tile-hover flex items-center gap-3 rounded-xl px-3 py-2.5 text-left', selected && 'glass-selected')}
               >
                 <span className="flex h-6 w-7 shrink-0 items-center justify-center">
@@ -332,9 +423,24 @@ export function FormatStep({ draft, update }: { draft: ClipDraft; update: Update
             )
           })}
         </div>
+        {!review && (
+          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            <Button
+              size="sm"
+              variant="ghost"
+              aria-pressed={draft.aspectRatios.join() === '9:16,1:1'}
+              onClick={() => update({ aspectRatios: ['9:16', '1:1'] })}
+            >
+              Auto for my platforms
+            </Button>
+            {draft.aspectRatios.length > 1 && (
+              <p className="text-2xs text-ink-subtle">Extra formats reuse each clip's framing and edits — two formats roughly double render time, with no extra AI cost.</p>
+            )}
+          </div>
+        )}
       </Group>
 
-      {draft.aspectRatio === '9:16' && (
+      {draft.aspectRatios.some((ratio) => ratio !== '16:9') && (
         <Group label="Framing">
           <div className="grid grid-cols-3 gap-2" role="radiogroup" aria-label="Framing">
             {LAYOUT_STYLES.map((style) => {
@@ -543,17 +649,38 @@ export function CaptionsStep({ draft, update }: { draft: ClipDraft; update: Upda
         description="Turn off for clips without word-by-word captions."
         control={<Switch label="Captions" checked={draft.includeCaptions} onChange={(includeCaptions) => update({ includeCaptions })} />}
       />
-      <div
-        className={cn('transition-[opacity,filter] duration-300 ease-out', !draft.includeCaptions && 'pointer-events-none opacity-35 saturate-50')}
-        aria-disabled={!draft.includeCaptions}
-      >
+      <SettingRow
+        title="Use your own .srt transcript"
+        description={draft.srtName ? `Uploaded: ${draft.srtName}. AI transcription is skipped for this video.` : 'Optional. Perfectly timed captions for difficult speech, branded content, or videos that already have clean subtitles.'}
+        control={
+          <div className="flex items-center gap-2">
+            {draft.srtName && (
+              <Button size="sm" variant="ghost" aria-label="Remove the uploaded .srt" onClick={() => update({ srtPath: null, srtName: null })}>Remove</Button>
+            )}
+            <Button size="sm" disabled={!draft.includeCaptions} onClick={async () => {
+              const picked = await getApi().dialog.selectSrt()
+              if (picked) {
+                update({ srtPath: picked, srtName: basename(picked) })
+              }
+            }}>{draft.srtName ? 'Change .srt' : 'Upload .srt'}</Button>
+          </div>
+        }
+      />
+      <div className={cn('transition-opacity duration-300 ease-out', !draft.includeCaptions && 'opacity-80')}>
         <CaptionPresetPicker
           showPreview
           value={draft.captionPreset}
-          onChange={(captionPreset) => update({ captionPreset })}
-          disabled={!draft.includeCaptions}
+          onChange={(captionPreset) => update({ captionPreset, includeCaptions: true })}
+          allowNone
+          noneSelected={!draft.includeCaptions}
+          onSelectNone={() => update({ includeCaptions: false })}
         />
       </div>
+      <label className="flex items-center justify-between gap-2 text-xs text-ink">
+        <span>Only add caption without clipping <span className="text-ink-subtle">Beta</span> — caption the whole video as one clip</span>
+        <input type="checkbox" aria-label="Only add caption without clipping" checked={draft.captionsOnly}
+          onChange={(e) => update({ captionsOnly: e.target.checked, includeCaptions: true })} />
+      </label>
     </div>
   )
 }
@@ -569,9 +696,14 @@ function ReviewStep({ draft, trim, onEdit }: {
   const lengths = draft.durations.length === 0
     ? 'Any length'
     : DURATIONS.filter((d) => draft.durations.includes(d.id)).map((d) => d.range).join(', ')
-  const framing = draft.aspectRatio === '9:16'
+  const review = draft.workflow === 'review'
+  const ratios: WizardAspectRatio[] = review
+    ? (draft.aspectRatios[0] === '1:1' ? ['9:16'] : draft.aspectRatios.slice(0, 1))
+    : draft.aspectRatios
+  const framing = ratios.some((ratio) => ratio !== '16:9')
     ? `${LAYOUT_STYLES.find((s) => s.id === draft.layoutStyle)?.label ?? 'Smart'} framing${draft.clippingMode !== 'economy' && draft.layoutStyle === 'auto' && draft.layoutVision ? ' · AI vision' : ''}`
     : 'Whole frame'
+  const formatNames = ratios.map((r) => `${FORMATS.find((f) => f.id === r)?.label ?? r} ${r}`).join(' + ')
   const trimLabel = draft.trimOpen && (trim.start != null || trim.end != null)
     ? ` · ${trim.start != null ? formatSeconds(trim.start) : 'start'} to ${trim.end != null ? formatSeconds(trim.end) : 'end'}`
     : ''
@@ -579,7 +711,7 @@ function ReviewStep({ draft, trim, onEdit }: {
   const rows: { step: WizardStep; label: string; value: string }[] = [
     { step: 'video', label: 'Workflow', value: draft.workflow === 'review' ? 'Review & edit · export when ready' : 'Automatic' },
     { step: 'video', label: 'Video', value: `${sourceLabel(draft.source)}${trimLabel}` },
-    { step: 'format', label: 'Format', value: `${FORMATS.find((f) => f.id === draft.aspectRatio)?.label ?? draft.aspectRatio} ${draft.aspectRatio} · ${framing}` },
+    { step: 'format', label: 'Format', value: `${formatNames} · ${framing}` },
     { step: 'format', label: 'Pacing', value: draft.workflow === 'review' ? 'Manual · choose your own cuts in the editor' : draft.pacing === 'tight' ? 'Cut dead air' : 'Keep pauses' },
     { step: 'format', label: 'Speed', value: `${draft.videoSpeed ?? 1}×${(draft.videoSpeed ?? 1) === 1 ? ' · Normal' : ' · All exported clips'}` },
     { step: 'clips', label: 'Mode', value: draft.clippingMode === 'advanced' ? 'Advanced · custom models' : draft.clippingMode === 'economy' ? 'Economy · lower cost' : 'Quality · higher accuracy' },
@@ -588,6 +720,7 @@ function ReviewStep({ draft, trim, onEdit }: {
     { step: 'captions', label: 'Captions', value: draft.includeCaptions ? CAPTION_PRESET_NAMES[draft.captionPreset] ?? draft.captionPreset : 'Off' }
   ]
   if (draft.workflow !== 'review') rows.push({ step: 'captions', label: 'Title', value: draft.includeTitle ? 'Shown at the top' : 'Off' })
+  if (draft.bannerPlatform && draft.bannerChannelUrl) rows.push({ step: 'format', label: 'Banner', value: `${draft.bannerPlatform} · ${draft.bannerChannelUrl}` })
   if (draft.clippingMode === 'advanced') rows.splice(5, 0,
     { step: 'clips', label: 'Transcribe', value: draft.transcriptionModel || 'Choose a model' },
     { step: 'clips', label: 'Plan', value: draft.plannerModel || 'Choose a model' })

@@ -144,7 +144,7 @@ def test_unavailable_judgment_never_accepts_or_pays_for_repairs(monkeypatch):
 
 def test_repair_can_cross_both_preferred_edges_but_requires_fresh_jev_pass(monkeypatch):
     r, calls = reviewer(lambda state, q: 'setup' in state['retained_dialogue'] and 'qualification' in state['retained_dialogue'])
-    async def completion(_client, payload):
+    async def completion(_client, payload, provider="openrouter"):
         from clip_engine.services.sponsor_policy import SPONSOR_DISCOVERY_RULE
         assert SPONSOR_DISCOVERY_RULE in payload['messages'][0]['content']
         assert payload['model'] == 'fixture/cheap'
@@ -249,7 +249,7 @@ def repair_response(text, finish='stop', reasoning=200):
 def test_output_limit_retries_once_and_requires_fresh_judgment(monkeypatch, partial):
     r, judgments = reviewer(lambda state, q: 'setup' in state['retained_dialogue'] and 'qualification' in state['retained_dialogue'])
     calls = []
-    async def completion(_client, payload):
+    async def completion(_client, payload, provider="openrouter"):
         calls.append(payload)
         if len(calls) == 1:
             return repair_response(partial, 'length', 767), {'cost': .001, 'completion_tokens': 785}
@@ -320,7 +320,7 @@ def test_unchanged_first_repair_gets_wider_context_and_failed_check_feedback(mon
     r.segments.append(TranscriptSegment(100000, 102000, 'Later context.'))
     r.duration_ms = 110000
     payloads = []
-    async def completion(_client, payload):
+    async def completion(_client, payload, provider="openrouter"):
         payloads.append(payload)
         state = json.loads(payload['messages'][1]['content'])
         assert {c['name'] for c in state['failed_checks']} == {'opening_context', 'self_contained', 'complete_ending', 'logical_flow', 'faithful_to_source', 'title_supported'}
@@ -428,7 +428,7 @@ def test_opening_reference_is_repaired_even_when_general_context_passes(monkeypa
             answers['opening_context']['noul'] = .95 if 'Here is an example' in state['retained_dialogue'] else .1
         return {'status': 'success', 'answers': answers}
     r.service.evaluate = evaluate
-    async def completion(client, payload):
+    async def completion(client, payload, provider="openrouter"):
         state = json.loads(payload['messages'][1]['content'])
         assert [c['name'] for c in state['failed_checks']] == ['opening_context']
         assert 'actual referenced example' in payload['messages'][0]['content']

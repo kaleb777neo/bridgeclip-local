@@ -1,10 +1,18 @@
 import type { RunDiagnostics } from './run-diagnostics'
 import type { PipelineStage } from './job-progress'
 import type { JobOutput } from './job-output'
+import type { OverlayPosition } from './clip-editor'
+
+/** Brand-template logo snapshot; main owns the asset, so `path` is absolute. */
+export interface JobLogoOverlay { path: string; position: OverlayPosition; /** Fraction of output width, 0.05–0.5. */ scale: number; /** 0.1–1. */ opacity: number; /** Corner inset as a fraction of output width; absent keeps the engine margin. */ margin?: number }
+/** Brand-template CTA badge snapshot, burned in for the whole clip. */
+export interface JobCtaBadge { kind: 'subscribe' | 'follow'; position: OverlayPosition; margin?: number }
+/** Brand-template intro/outro video snapshot; main owns the asset, so `path` is absolute. */
+export interface JobBrandVideo { path: string }
 
 /** Options for one clipping run, as the Create wizard submits them. */
 export interface ClipJobRequest {
-  workflow?: 'automatic' | 'review'
+  workflow?: 'automatic' | 'review' | 'captions-only'
   videoUrl: string
   /** Missing on older queued requests; those retain the original quality mode. */
   clippingMode?: 'quality' | 'economy' | 'advanced'
@@ -17,6 +25,8 @@ export interface ClipJobRequest {
   autoClipCount: boolean
   durationRanges: string[] | null
   aspectRatio: string
+  /** Output formats for every clip; aspectRatio stays the primary (= [0]). Missing on older requests. */
+  aspectRatios?: string[]
   layoutStyle: string
   layoutVision: boolean
   pacing: string
@@ -30,10 +40,26 @@ export interface ClipJobRequest {
   endTimeSeconds: number | null
   bannerPlatform: string | null
   bannerChannelUrl: string | null
+  /** User-uploaded .srt replacing AI transcription; main validates the path. */
+  srtPath?: string
+  /** Brand pack applied at creation; provenance only — the fields below are the snapshot. */
+  templateId?: string
+  /** Brand-template overlays materialized onto every clip of the run. */
+  logo?: JobLogoOverlay
+  ctaBadges?: JobCtaBadge[]
+  /** Brand-template intro/outro videos appended around every clip of the run. */
+  intro?: JobBrandVideo
+  outro?: JobBrandVideo
 }
 
 /** How many clipping runs the main process lets run at once; the rest wait in a queue. */
 export const MAX_PARALLEL_JOBS = 2
+
+/** Requested output formats, primary first; older requests carry only aspectRatio. */
+export function jobAspectRatios(request: { aspectRatio: string; aspectRatios?: string[] }): string[] {
+  return request.aspectRatios?.length ? request.aspectRatios : [request.aspectRatio]
+}
+
 /** Finished runs retained in the live session; older runs remain on disk. */
 export const MAX_FINISHED_JOBS = 50
 

@@ -94,13 +94,16 @@ class TestConfig:
         assert is_longform("16:9", 300)
         assert not is_longform("16:9", 120)
         assert not is_longform("9:16", 600)
+        # 1:1 is a short-form feed format; it never plans or renders longform.
+        assert not is_longform("1:1", 600)
+        assert not is_longform("1:1", 300)
 
 
 class TestPlanning:
     def run_plan(self, monkeypatch, transcript, ranges, aspect, clips=(), jev=False):
         payloads = []
 
-        async def fake_completion(client, payload):
+        async def fake_completion(client, payload, **_backend):
             payloads.append(payload)
             usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "cost": 0.0}
             return completion(list(clips)), usage

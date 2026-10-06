@@ -64,6 +64,27 @@ def _internal_socketpair(family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0
     return server, client
 
 
+def _public_ip(ip):
+    """`is_global` with 6to4/Teredo/mapped-IPv4 unpacking and 192.0.0.0/24 fixed.
+
+    The stdlib only learned to look inside those tunnels in 3.13, and only
+    classified the IETF protocol-assignment range as non-global in later
+    releases; on older runtimes `2002:7f00:1::` (6to4-wrapped 127.0.0.1)
+    counts as global.
+    """
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        elif ip.sixtofour is not None:
+            ip = ip.sixtofour
+        elif ip.teredo is not None:
+            server, client = ip.teredo
+            return _public_ip(server) and _public_ip(client)
+    if ip.version == 4 and ip in ipaddress.IPv4Network('192.0.0.0/24'):
+        return False
+    return ip.is_global
+
+
 def _public_address(sock: socket.socket, address):
     if sock.family not in (socket.AF_INET, socket.AF_INET6):
         return address
@@ -72,7 +93,7 @@ def _public_address(sock: socket.socket, address):
     host, port = address[:2]
     try:
         ip = ipaddress.ip_address(host)
-        if not ip.is_global:
+        if not _public_ip(ip):
             if ip.is_loopback and _loopback_allowed(port):
                 return address
             raise OSError("Local network destinations are not allowed")
@@ -86,7 +107,7 @@ def _public_address(sock: socket.socket, address):
     ips = [ipaddress.ip_address(result[4][0]) for result in results]
     if all(ip.is_loopback for ip in ips) and _loopback_allowed(port):
         return results[0][4]
-    if any(not ip.is_global for ip in ips):
+    if any(not _public_ip(ip) for ip in ips):
         raise OSError("Local network destinations are not allowed")
     return results[0][4]
 

@@ -282,7 +282,7 @@ def test_splits_with_nonzero_window_and_ignores_ambiguous_faces():
 def test_vision_cache_distinguishes_geometry_with_identical_colors(monkeypatch):
     analyzer = LayoutAnalyzer()
     calls = []
-    async def completion(client, payload):
+    async def completion(client, payload, provider="openrouter"):
         calls.append(payload)
         return {"choices": [{"message": {"content": json.dumps(CAM_RESULT)}}]}, {"cost": 0.001}
     async def client():

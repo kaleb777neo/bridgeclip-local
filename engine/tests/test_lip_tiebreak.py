@@ -10,14 +10,10 @@ import numpy as np
 import pytest
 
 from clip_engine.services.layout_analyzer import (
-    Box, FaceTrack, FrameInfo, LayoutType, LayoutAnalyzer,
-    _box_at, _mouth_crop, competing_faces, heuristic_layout, pick_talking_track,
-    retarget_subject, track_faces,
+    Box, FrameInfo, LayoutType, LayoutAnalyzer, LIP_FPS,
+    _box_at, _mouth_crop, apply_speaker_timeline, competing_faces, heuristic_layout,
+    pick_speaker_timeline, pick_talking_track, track_faces,
 )
-
-
-def steady_box_track(box, duration=8000, start=0):
-    return FaceTrack(samples=[(t, box) for t in range(start, duration, 250)])
 
 
 # ---------------------------------------------------------------------------
@@ -29,10 +25,15 @@ def test_no_rival_when_a_single_face_dominates():
     assert competing_faces(track_faces(observations), len(observations)) is None
 
 
-def test_balanced_two_shot_needs_no_tiebreak():
+def test_split_screen_two_faces_get_a_tiebreak():
+    # Two comparable faces far apart (a broadcast split screen) can never share
+    # a narrow talking-head crop, so the camera must decode who is talking
+    # rather than assume both are framed.
     left, right = Box(.18, .2, .14, .3), Box(.65, .2, .14, .3)
     observations = [FrameInfo(t, [left, right], None) for t in range(0, 8000, 250)]
-    assert competing_faces(track_faces(observations), len(observations)) is None
+    rivals = competing_faces(track_faces(observations), len(observations))
+    assert rivals is not None and len(rivals) == 2
+    assert rivals[0].median_box().cx < rivals[1].median_box().cx
 
 
 def test_tiny_corner_face_is_not_a_rival():
@@ -101,6 +102,55 @@ def test_short_track_without_enough_samples_cannot_win():
 
 
 # ---------------------------------------------------------------------------
+# pick_speaker_timeline: mid-shot turn-taking with hysteresis
+
+def _windowed(track0_windows, track1_windows, frames_per_window=24):
+    """Build per-frame mouth deltas from a per-window loud/quiet pattern."""
+    loud, quiet = 8.0, 0.3
+    def expand(flags):
+        out = []
+        for f in flags:
+            out += [loud if f else quiet] * frames_per_window
+        return out
+    return [expand(track0_windows), expand(track1_windows)]
+
+
+def test_timeline_holds_current_speaker_then_switches_after_confirmation():
+    # Windows: man talks (0,1), woman talks (2,3,4). The switch commits only
+    # once the woman wins two consecutive windows (LIP_SWITCH_CONFIRM).
+    deltas = _windowed([1, 1, 0, 0, 0], [0, 0, 1, 1, 1])
+    timeline = pick_speaker_timeline(deltas, 10000)
+    assert timeline[0] == (0, 0)
+    assert timeline[-1] == (6000, 1)  # confirmed at window 3 -> 6s
+    assert any(i > 0 for _t, i in timeline)
+
+
+def test_timeline_ignores_a_single_noisy_window():
+    # The woman wins only one middle window: not enough to jerk the camera.
+    deltas = _windowed([1, 1, 1, 1], [0, 0, 1, 0])
+    timeline = pick_speaker_timeline(deltas, 8000)
+    assert timeline == [(0, 0)]
+
+
+def test_timeline_stays_when_no_one_clearly_talks():
+    deltas = _windowed([0, 0, 0, 0], [0, 0, 0, 0])
+    assert pick_speaker_timeline(deltas, 8000) == [(0, 0)]
+
+
+# ---------------------------------------------------------------------------
+# apply_speaker_timeline: the camera pans between split-screen speakers
+
+def test_apply_speaker_timeline_follows_the_switching_speaker():
+    left, right = Box(.14, .2, .14, .3), Box(.78, .2, .14, .3)
+    observations = [FrameInfo(t, [left, right], None) for t in range(0, 8000, 250)]
+    rivals = competing_faces(track_faces(observations), len(observations))
+    shot = heuristic_layout(observations, 0, 8000, 1920, 1080)
+    apply_speaker_timeline(shot, rivals, [(0, 0), (6000, 1)], 0, 8000, 1920, 1080)
+    assert shot.focus_path[0][1] < .45   # started on the left-hand man
+    assert shot.focus_path[-1][1] > .55  # ended on the right-hand woman
+
+
+# ---------------------------------------------------------------------------
 # _mouth_crop
 
 def test_mouth_crop_is_fixed_size():
@@ -115,16 +165,17 @@ def test_mouth_crop_rejects_a_face_too_small_to_read():
 
 
 # ---------------------------------------------------------------------------
-# retarget_subject
+# apply_speaker_timeline: single switch retargets to the new face
 
-def test_retarget_moves_the_focus_path_to_the_new_face():
+def test_apply_speaker_timeline_moves_the_focus_path_to_the_new_face():
     listener, speaker = Box(.30, .18, .16, .34), Box(.46, .24, .13, .28)
-    shot = heuristic_layout([FrameInfo(t, [listener, speaker], None)
-                             for t in range(0, 8000, 250)], 0, 8000, 1920, 1080)
+    observations = [FrameInfo(t, [listener, speaker], None) for t in range(0, 8000, 250)]
+    shot = heuristic_layout(observations, 0, 8000, 1920, 1080)
     assert shot.layout == LayoutType.TALKING_HEAD
     assert shot.people[0] == listener  # the larger face held the lock
-    retarget_subject(shot, steady_box_track(speaker), 0, 8000, 1920, 1080)
-    assert shot.people[0].cx == pytest.approx(speaker.cx)
+    rivals = competing_faces(track_faces(observations), len(observations))
+    apply_speaker_timeline(shot, rivals, [(0, 0), (4000, 1)], 0, 8000, 1920, 1080)
+    assert shot.people[0].cx == pytest.approx(speaker.cx, abs=.05)
     assert shot.focus_path[-1][1] == pytest.approx(speaker.cx, abs=.05)
 
 
@@ -159,7 +210,9 @@ def _run_analyze(monkeypatch, deltas):
 
 
 def test_analyze_switches_subject_to_the_talking_face(monkeypatch):
-    plan, calls = _run_analyze(monkeypatch, [[0.4] * 20, [8.0] * 20])
+    # The right-hand speaker is loud for the whole shot: after two confirmed
+    # windows the camera commits to her and stays.
+    plan, calls = _run_analyze(monkeypatch, [[0.4] * 60, [8.0] * 60])
     assert len(calls) == 1  # one decode for the one ambiguous shot
     shot = next(s for s in plan.shots if s.layout == LayoutType.TALKING_HEAD)
     assert shot.focus_path[-1][1] > .44  # followed the right-hand speaker, not .38

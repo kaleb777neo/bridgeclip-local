@@ -463,6 +463,7 @@ export function startClipJob(
     auto_clip_count: config.autoClipCount,
     duration_ranges: config.durationRanges,
     aspect_ratio: config.aspectRatio,
+    aspect_ratios: config.aspectRatios?.length ? config.aspectRatios : [config.aspectRatio],
     layout_style: config.layoutStyle || 'auto',
     layout_vision_enabled: config.clippingMode === 'economy' ? false : config.layoutVision,
     pacing: config.pacing || 'tight',
@@ -471,10 +472,17 @@ export function startClipJob(
     caption_preset: config.captionPreset,
     include_title: config.includeTitle ?? true,
     keyterms: vocabularyTerms(settings.customVocabulary),
+    ...(config.srtPath ? { srt_path: config.srtPath } : {}),
     start_time_seconds: config.startTimeSeconds,
     end_time_seconds: config.endTimeSeconds,
     banner_platform: config.bannerPlatform,
     banner_channel_url: config.bannerChannelUrl,
+    // Brand-template snapshot; main resolved the logo path, the engine only reads it.
+    ...(config.templateId ? { template_id: config.templateId } : {}),
+    ...(config.logo ? { logo: config.logo } : {}),
+    ...(config.ctaBadges?.length ? { cta_badges: config.ctaBadges } : {}),
+    ...(config.intro ? { intro: config.intro } : {}),
+    ...(config.outro ? { outro: config.outro } : {}),
     output_dir: settings.outputDirectory
   })
 
@@ -495,7 +503,10 @@ export function startClipJob(
     // weights are downloaded once and reused by every job.
     BRIDGECLIP_MODELS_DIR: modelsDir(),
     PYTHONUNBUFFERED: '1',
-    PYTHONDONTWRITEBYTECODE: '1'
+    PYTHONDONTWRITEBYTECODE: '1',
+    // The config JSON on stdin is UTF-8; without this Python's text layer on
+    // Windows decodes it with the ANSI code page and diacritics turn to mojibake.
+    PYTHONUTF8: '1'
   }
 
   const ffmpeg = resolveBinary('ffmpeg')

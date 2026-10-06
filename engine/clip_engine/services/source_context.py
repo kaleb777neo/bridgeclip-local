@@ -1,5 +1,6 @@
 """A bounded, pre-transcription editorial brief. Background is never clip evidence."""
 import asyncio
+from clip_engine import asyncio_compat  # Installs asyncio.timeout on Python 3.10
 import json
 import math
 import re

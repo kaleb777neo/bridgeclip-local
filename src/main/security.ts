@@ -32,7 +32,7 @@ export function isWithinDirectory(path: string, directory: string): boolean {
   } catch { return false }
 }
 
-const mediaExtensions = new Set(['.mp4', '.m4v', '.mkv', '.webm', '.avi', '.mov', '.flv', '.jpg', '.jpeg', '.png', '.webp'])
+const mediaExtensions = new Set(['.mp4', '.m4v', '.mkv', '.webm', '.avi', '.mov', '.flv', '.jpg', '.jpeg', '.png', '.webp', '.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac'])
 const selectedMedia = new Map<string, { dev: number; ino: number }>()
 export function authorizeMedia(path: string): string {
   const canonical = realpathSync(path)

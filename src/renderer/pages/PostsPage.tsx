@@ -158,7 +158,13 @@ function PostsList({ view, onViewChange, onNavigate }: {
       <div className="mt-4 space-y-3">
         {view === 'calendar' ? (
           <PostsCalendar mode={calendarMode} onModeChange={setCalendarMode} onNavigate={onNavigate}
-            onSchedule={(slot) => setSchedule({ slot })} reloadSignal={calendarReload} />
+            onSchedule={(slot) => setSchedule({ slot })} reloadSignal={calendarReload}
+            onReschedule={async (post, whenIso) => {
+              const timezone = post.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+              const ok = await usePostsStore.getState().reschedule(post.id, whenIso, timezone)
+              if (ok) setCalendarReload((n) => n + 1)
+              return ok
+            }} />
         ) : (
           <>
             {error && (

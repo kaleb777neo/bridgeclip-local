@@ -514,7 +514,7 @@ export class ZernioClient {
     options: { body?: unknown; requestId?: string; timeoutMs?: number } = {}
   ): Promise<{ status: number; body: JsonRecord }> {
     const startedAt = Date.now()
-    const labels = new Set(['posts', 'retry', 'media', 'presign', 'accounts', 'tiktok', 'creator-info'])
+    const labels = new Set(['posts', 'retry', 'media', 'presign', 'accounts', 'tiktok', 'creator-info', 'analytics', 'dashboard', 'best-time'])
     const operation = path.split('?')[0].split('/').filter(Boolean).map((part) => labels.has(part) ? part : 'item').join('.')
     const context = { traceId: this.traceId, requestId: randomUUID(), method, operation }
     logger.info('zernio.post.request.start', context)
@@ -649,6 +649,17 @@ export class ZernioClient {
   /** Allowed privacy levels, interaction toggles and limits for a TikTok account. */
   async getTikTokCreatorInfo(accountId: string): Promise<JsonRecord> {
     return (await this.postingRequest('GET', `/accounts/${encodeURIComponent(accountId)}/tiktok/creator-info?mediaType=video`)).body
+  }
+
+  /** GET /v1/analytics/dashboard — window totals, followers, daily series and top posts (UTC days). */
+  async getAnalyticsDashboard(fromDate: string, toDate: string): Promise<JsonRecord> {
+    const params = new URLSearchParams({ fromDate, toDate, compare: 'previous_period', topPosts: '6', recentPosts: '0' })
+    return (await this.postingRequest('GET', `/analytics/dashboard?${params}`)).body
+  }
+
+  /** GET /v1/analytics/best-time — average engagement per weekday/UTC-hour slot over all history. */
+  async getBestTimeToPost(): Promise<JsonRecord> {
+    return (await this.postingRequest('GET', '/analytics/best-time')).body
   }
 }
 

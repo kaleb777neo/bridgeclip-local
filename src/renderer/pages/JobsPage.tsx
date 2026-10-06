@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Ban, FileText, FolderOpen, ListVideo, Pencil, Plus, RefreshCw, RotateCcw, Search, X } from 'lucide-react'
+import { Ban, FileText, FolderOpen, ListVideo, Pencil, Plus, RefreshCw, RotateCcw, Search, Trash2, X } from 'lucide-react'
 import type { HistoryEntry } from '../../preload/index'
 import { MAX_PARALLEL_JOBS } from '../../shared/jobs'
 import { EditInspector, InspectEditsButton } from '../components/EditInspector'
@@ -10,6 +10,7 @@ import { StatusDot } from '../components/ui/Badge'
 import { Button } from '../components/ui/Button'
 import { ActionMenu } from '../components/ui/ActionMenu'
 import { Callout } from '../components/ui/Callout'
+import { ConfirmDialog, type ConfirmRequest } from '../components/ui/ConfirmDialog'
 import { EmptyState } from '../components/ui/EmptyState'
 import { TextInput } from '../components/ui/Field'
 import { Page } from '../components/ui/Page'
@@ -60,6 +61,8 @@ export function JobsPage({ onNavigate, onViewLibrary }: {
   const [error, setError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [jobsLoaded, setJobsLoaded] = useState(false)
+  const [confirm, setConfirm] = useState<ConfirmRequest | null>(null)
+  const closeConfirm = useCallback(() => setConfirm(null), [])
   const requestId = useRef(0)
 
   const load = useCallback(async (manual = false) => {
@@ -142,6 +145,29 @@ export function JobsPage({ onNavigate, onViewLibrary }: {
     }
   }
 
+  const removeRun = async (entry: HistoryEntry): Promise<void> => {
+    setError(null)
+    try {
+      await getApi().job.deleteRun(entry.outputDir)
+      await load()
+    } catch (err) {
+      setError(errorMessage(err, 'Could not delete this run. Refresh the list to check its files.'))
+    }
+  }
+
+  const confirmDelete = (entry: HistoryEntry): void => setConfirm({
+    title: entry.status === 'completed' ? 'Delete this run?' : 'Delete this unfinished run?',
+    body: <>
+      {entry.status === 'completed'
+        ? <>Permanently delete “{entry.videoTitle}” and its {entry.clipCount} clip{entry.clipCount === 1 ? '' : 's'}, plus every other file in the run folder? Published posts and copies saved outside this folder remain.</>
+        : <>Permanently delete this {STATUS[entry.status].label.toLowerCase()} run and every file in its folder? There is no completed output to recover.</>}
+      {' '}This cannot be undone.
+      <span className="mt-3 block break-all text-xs text-ink-subtle">{entry.outputDir}</span>
+    </>,
+    confirmLabel: 'Delete files',
+    onConfirm: () => { void removeRun(entry) }
+  })
+
   const back = <BackLink label="All jobs" onClick={() => focusJob(null)} />
   const errorCallout = error && (
     <Page width="focus" className="pb-0">
@@ -161,32 +187,36 @@ export function JobsPage({ onNavigate, onViewLibrary }: {
   }
 
   return (
-    <JobsList
-      active={active}
-      entries={entries}
-      filter={filter}
-      query={query}
-      error={error}
-      refreshing={refreshing}
-      onFilter={setFilter}
-      onQuery={setQuery}
-      onDismissError={() => setError(null)}
-      onRefresh={() => { void load(true) }}
-      onNew={() => onNavigate('clip')}
-      onOpenJob={(job) => { focusJob(job.id); document.getElementById('page-scroll')?.scrollTo({ top: 0 }) }}
-      onCancel={(job) => { void cancel(job) }}
-      onOpenEntry={(entry) => {
-        if (entry.status === 'completed') {
-          focusJob(null)
-          onViewLibrary(entry.outputDir)
-        } else if (useJobStore.getState().jobs[entry.jobId]) focusJob(entry.jobId)
-      }}
-      onOpenFolder={(dir) => { void openFolder(dir) }}
-    />
+    <>
+      <JobsList
+        active={active}
+        entries={entries}
+        filter={filter}
+        query={query}
+        error={error}
+        refreshing={refreshing}
+        onFilter={setFilter}
+        onQuery={setQuery}
+        onDismissError={() => setError(null)}
+        onRefresh={() => { void load(true) }}
+        onNew={() => onNavigate('clip')}
+        onOpenJob={(job) => { focusJob(job.id); document.getElementById('page-scroll')?.scrollTo({ top: 0 }) }}
+        onCancel={(job) => { void cancel(job) }}
+        onOpenEntry={(entry) => {
+          if (entry.status === 'completed') {
+            focusJob(null)
+            onViewLibrary(entry.outputDir)
+          } else if (useJobStore.getState().jobs[entry.jobId]) focusJob(entry.jobId)
+        }}
+        onOpenFolder={(dir) => { void openFolder(dir) }}
+        onDelete={confirmDelete}
+      />
+      {confirm && <ConfirmDialog request={confirm} onClose={closeConfirm} />}
+    </>
   )
 }
 
-function JobsList({ active, entries, filter, query, error, refreshing, onFilter, onQuery, onDismissError, onRefresh, onNew, onOpenJob, onCancel, onOpenEntry, onOpenFolder }: {
+function JobsList({ active, entries, filter, query, error, refreshing, onFilter, onQuery, onDismissError, onRefresh, onNew, onOpenJob, onCancel, onOpenEntry, onOpenFolder, onDelete }: {
   active: Job[]
   entries: HistoryEntry[] | null
   filter: Filter
@@ -202,6 +232,7 @@ function JobsList({ active, entries, filter, query, error, refreshing, onFilter,
   onCancel: (job: Job) => void
   onOpenEntry: (entry: HistoryEntry) => void
   onOpenFolder: (dir: string) => void
+  onDelete: (entry: HistoryEntry) => void
 }): React.JSX.Element {
   const sessionJobs = useJobStore((s) => s.jobs)
   const liveIds = useMemo(() => new Set(active.map((job) => job.id)), [active])
@@ -331,7 +362,7 @@ function JobsList({ active, entries, filter, query, error, refreshing, onFilter,
               ) : (
                 <ul className="divide-y divide-white/[0.05]">
                   {visible.map((entry) => (
-                    <PreviousJobRow key={entry.jobId} entry={entry} hasDetails={Boolean(sessionJobs[entry.jobId])} onOpen={() => onOpenEntry(entry)} onOpenFolder={() => onOpenFolder(entry.outputDir)} />
+                    <PreviousJobRow key={entry.jobId} entry={entry} hasDetails={Boolean(sessionJobs[entry.jobId])} onOpen={() => onOpenEntry(entry)} onOpenFolder={() => onOpenFolder(entry.outputDir)} onDelete={() => onDelete(entry)} />
                   ))}
                 </ul>
               )}
@@ -425,7 +456,7 @@ const STATUS_TEXT: Record<HistoryEntry['status'], string> = {
 }
 
 /** One line per run: status, title, then clips, run time, cost and date in aligned columns. */
-function PreviousJobRow({ entry, hasDetails, onOpen, onOpenFolder }: { entry: HistoryEntry; hasDetails: boolean; onOpen: () => void; onOpenFolder: () => void }): React.JSX.Element {
+function PreviousJobRow({ entry, hasDetails, onOpen, onOpenFolder, onDelete }: { entry: HistoryEntry; hasDetails: boolean; onOpen: () => void; onOpenFolder: () => void; onDelete: () => void }): React.JSX.Element {
   const [inspecting, setInspecting] = useState(false)
   const [progress, setProgress] = useState<{ outputDir: string; remaining: number } | null>(null)
   const closeInspector = useCallback(() => setInspecting(false), [])
@@ -486,7 +517,8 @@ function PreviousJobRow({ entry, hasDetails, onOpen, onOpenFolder }: { entry: Hi
       <ActionMenu label={`Actions for ${entry.videoTitle}`} actions={[
         { label: completed ? 'Open in Library' : 'Open job', icon: <ListVideo className="h-3.5 w-3.5" />, disabled: !openable, onSelect: onOpen },
         { label: 'Open folder', icon: <FolderOpen className="h-3.5 w-3.5" />, onSelect: onOpenFolder },
-        { label: 'Details', icon: <FileText className="h-3.5 w-3.5" />, onSelect: () => setInspecting(true) }
+        { label: 'Details', icon: <FileText className="h-3.5 w-3.5" />, onSelect: () => setInspecting(true) },
+        { label: 'Delete run', icon: <Trash2 className="h-3.5 w-3.5" />, danger: true, onSelect: onDelete }
       ]} />
       {inspecting && <EditInspector outputDir={entry.outputDir} onClose={closeInspector} />}
     </li>

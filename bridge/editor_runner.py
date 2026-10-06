@@ -9,7 +9,7 @@ import signal
 from bridge_runner import reserve_stdout_for_protocol, emit
 
 logger = logging.getLogger('editor_runner')
-ACTIONS = ('review', 'export', 'replace-source', 'scan-cameras')
+ACTIONS = ('review', 'export', 'replace-source', 'scan-cameras', 'auto-frame', 'create-project', 'build-preview', 'import-audio', 'motion-render', 'voice-voices', 'voice-preview')
 # Keep in sync with EDITOR_ERROR_CODES in manual_editor.py and editorErrorCodes
 # in src/shared/clip-editor.ts. Only these codes cross the bridge.
 ERROR_CODES = frozenset({'duration', 'geometry', 'audio', 'invalid', 'project_changed', 'invalid_edit', 'not_ready',
@@ -54,7 +54,10 @@ def main():
     try:
         from clip_engine.logging_safety import install_safe_logging
         install_safe_logging()
-        raw = sys.stdin.read(16385)
+        # Electron sends UTF-8; read bytes and decode explicitly so the Windows
+        # text layer (ANSI code page) cannot mangle diacritics.
+        stream = getattr(sys.stdin, 'buffer', None)
+        raw = stream.read(16385).decode('utf-8') if stream is not None else sys.stdin.read(16385)
         if len(raw) > 16384:
             raise ValueError('Request too large')
         config = json.loads(raw)
@@ -69,9 +72,11 @@ def main():
             task = asyncio.current_task()
             if os.name != 'nt':
                 asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)
-            await run_editor(config, progress=lambda value: emit({'type': 'progress', **value}))
-        asyncio.run(work())
-        emit({'ok': True})
+            # import-audio returns the new asset's reference and metadata; every
+            # other action commits its results to disk and returns nothing.
+            return await run_editor(config, progress=lambda value: emit({'type': 'progress', **value}))
+        payload = asyncio.run(work()) or {}
+        emit({'ok': True, **payload})
         return 0
     except (Exception, asyncio.CancelledError) as error:
         code = failure_code(error)

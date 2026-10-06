@@ -99,9 +99,69 @@ class BridgeTests(unittest.TestCase):
                 bridge.validate_config(self.config(video_speed=speed))
 
     def test_rejects_invalid_config_without_importing_bridgeclip(self):
-        for value in ([], None, "config", self.config(contract_version=None), self.config(contract_version=1), self.config(layout_vision_enabled=None), self.config(job_id="../escape"), self.config(video_url="file:///etc/passwd"), self.config(max_clips=True), self.config(include_title="false"), self.config(aspect_ratio="1:1"), self.config(layout_style="unknown"), self.config(pacing="unknown"), self.config(clipping_mode="unknown"), self.config(duration_ranges=["unknown"])):
+        for value in ([], None, "config", self.config(contract_version=None), self.config(contract_version=1), self.config(layout_vision_enabled=None), self.config(job_id="../escape"), self.config(video_url="file:///etc/passwd"), self.config(max_clips=True), self.config(include_title="false"), self.config(aspect_ratio="4:3"), self.config(layout_style="unknown"), self.config(pacing="unknown"), self.config(clipping_mode="unknown"), self.config(duration_ranges=["unknown"])):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 bridge.validate_config(value)
+
+    def test_brand_template_overlays_validate_and_forward(self):
+        logo = {"path": os.path.abspath("logo.png"), "position": "bottom-right", "scale": .15, "opacity": .9}
+        badges = [{"kind": "subscribe", "position": "top-right", "margin": .12}]
+        kept = bridge.validate_config(self.config(logo=logo, cta_badges=badges))
+        self.assertEqual(kept["logo"], logo)
+        self.assertEqual(kept["cta_badges"], badges)
+        # 1:1 joined the accepted formats (square output), so only unknown ratios fail.
+        self.assertEqual(bridge.validate_config(self.config(aspect_ratio="1:1"))["aspect_ratio"], "1:1")
+        for value in ("x", {}, {"path": "logo.png", "position": "center", "scale": .15, "opacity": .9},
+                      {"path": os.path.abspath("logo.png"), "position": "middle", "scale": .15, "opacity": .9},
+                      {"path": os.path.abspath("logo.png"), "position": "center", "scale": .01, "opacity": .9},
+                      {"path": os.path.abspath("logo.png"), "position": "center", "scale": .15, "opacity": 0},
+                      {"path": os.path.abspath("logo.png"), "position": "center", "scale": .15, "opacity": .9, "margin": .9}):
+            with self.subTest(logo=value), self.assertRaises(ValueError):                bridge.validate_config(self.config(logo=value))
+        for value in ("x", [{"kind": "like", "position": "top-right"}], [{"kind": "follow", "position": "nowhere"}],
+                      [{"kind": "follow", "position": "top-right"}] * 5, [{"kind": "follow", "position": "top-right", "margin": 2}]):
+            with self.subTest(cta_badges=value), self.assertRaises(ValueError):
+                bridge.validate_config(self.config(cta_badges=value))
+
+    def test_brand_intro_and_outro_validate_and_forward(self):
+        intro = {"path": os.path.abspath("intro.mp4")}
+        outro = {"path": os.path.abspath("outro.webm")}
+        kept = bridge.validate_config(self.config(intro=intro, outro=outro))
+        self.assertEqual(kept["intro"], intro)
+        self.assertEqual(kept["outro"], outro)
+        for value in ("x", 7, {}, {"path": "intro.mp4"}, {"path": ""}, {"path": os.path.abspath("a\0.mp4")}):
+            with self.subTest(intro=value), self.assertRaises(ValueError):
+                bridge.validate_config(self.config(intro=value))
+            with self.subTest(outro=value), self.assertRaises(ValueError):
+                bridge.validate_config(self.config(outro=value))
+
+    def test_brand_overlays_reach_the_clipping_request(self):
+        from dataclasses import make_dataclass
+        Output = make_dataclass("Output", [("clips", list)])
+        requests = []
+        class Pipeline:
+            def __init__(self, **kwargs): pass
+            async def process_video(self, request):
+                requests.append(request)
+                return types.SimpleNamespace(status="completed", output=Output([]), job_id="job-123")
+        modules = {
+            "clip_engine.config": types.SimpleNamespace(
+                get_settings=lambda: types.SimpleNamespace(openrouter_api_key="test-openrouter"),
+                get_caption_preset=lambda name: None),
+            "clip_engine.bridge_contract": types.SimpleNamespace(BRIDGE_CONTRACT_VERSION=3),
+            "clip_engine.logging_safety": types.SimpleNamespace(install_safe_logging=lambda: None),
+            "clip_engine.services.ai_clipping_pipeline": types.SimpleNamespace(
+                AIClippingPipeline=Pipeline, ClippingJobRequest=lambda **kwargs: kwargs,
+                JobStatus=types.SimpleNamespace(COMPLETED="completed")),
+        }
+        logo = {"path": os.path.abspath("logo.png"), "position": "bottom-right", "scale": .15, "opacity": .9}
+        intro = {"path": os.path.abspath("intro.mp4")}
+        outro = {"path": os.path.abspath("outro.webm")}
+        with patch.dict(sys.modules, modules), redirect_stdout(io.StringIO()):
+            self.assertTrue(asyncio.run(bridge.run(self.config(logo=logo, intro=intro, outro=outro))))
+        self.assertEqual(requests[-1]["logo"], logo)
+        self.assertEqual(requests[-1]["intro"], intro)
+        self.assertEqual(requests[-1]["outro"], outro)
+        self.assertEqual(requests[-1]["cta_badges"], [])
 
     def test_output_and_local_mode_are_set_before_settings_load(self):
         observed = []
@@ -349,6 +409,24 @@ class BridgeTests(unittest.TestCase):
         with patch.object(sys, "argv", ["bridge_runner.py"]), patch.object(sys, "stdin", io.StringIO(" " * 65537)), redirect_stdout(io.StringIO()):
             self.assertEqual(bridge.main(), 1)
 
+    def test_stdin_decodes_utf8_regardless_of_console_codepage(self):
+        # Electron writes UTF-8 bytes; a cp1252 text layer used to mangle the
+        # diacritics before json.loads ever saw them.
+        captured = {}
+        async def success(config):
+            captured.update(config)
+            return True
+        stdin = types.SimpleNamespace(buffer=io.BytesIO(json.dumps(self.config(
+            video_url="https://example.com/„Grijuliu”-episodul-1"), ensure_ascii=False).encode("utf-8")))
+        with patch.object(sys, "argv", ["bridge_runner.py"]), patch.object(sys, "stdin", stdin), patch.object(bridge, "run", success), redirect_stdout(io.StringIO()):
+            self.assertEqual(bridge.main(), 0)
+        self.assertEqual(captured["video_url"], "https://example.com/„Grijuliu”-episodul-1")
+
+    def test_undecodable_stdin_fails_with_the_structured_error(self):
+        stdin = types.SimpleNamespace(buffer=io.BytesIO(b"\x81\x8d\xff"))
+        with patch.object(sys, "argv", ["bridge_runner.py"]), patch.object(sys, "stdin", stdin), redirect_stdout(io.StringIO()):
+            self.assertEqual(bridge.main(), 1)
+
     def test_provider_errors_do_not_disclose_exception_text(self):
         output = io.StringIO()
         async def fail(config):
@@ -423,7 +501,7 @@ class BridgeTests(unittest.TestCase):
         cases = {
             "Unsupported Twitch source": "Choose a public, completed Twitch VOD.",
             "Twitch VOD is not completed": "This Twitch video is still live or processing.",
-            "Twitch VOD duration is invalid or too long": "This Twitch video has no usable duration or exceeds the six hour limit.",
+            "Twitch VOD duration is invalid or too long": "This Twitch video has no usable duration or exceeds the allowed length.",
             "Twitch VOD unavailable": "The Twitch VOD could not be downloaded.",
         }
         for error, message in cases.items():

@@ -1,13 +1,14 @@
 import { SavedStageTimings } from './StageBreakdown'
 import { parseJobOutput } from '../../shared/job-output'
-import { editorProgress } from '../../shared/clip-editor'
+import { editorImportStatus, editorProgress, EDITOR_NEEDS_SOURCE, type EditorOperation, type EditorProgress } from '../../shared/clip-editor'
 import { ClipEditor } from './ClipEditor'
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
-import { ArrowLeft, Check, ChevronDown, Clapperboard, Download, FolderOpen, ListPlus, Plus, Scissors, Search, Send, Trash2, Youtube } from 'lucide-react'
+import { CalendarClock,  ArrowLeft, Check, ChevronDown, Clapperboard, Download, FileCode, FolderOpen, ListPlus, Plus, Scissors, Search, Send, Trash2, Youtube } from 'lucide-react'
 import { basename, cn, errorMessage } from '../lib/utils'
 import { getApi } from '../lib/ipc'
 import { clipFilePath } from '../lib/thumbnails'
 import type { ApiCosts, ClipArtifact, JobOutput } from '../store/use-job-store'
+import type { EditorCandidate } from '../../shared/clip-editor'
 import { ClipCard } from './ClipCard'
 import { EditInspector } from './EditInspector'
 import { EditorialWeights } from './EditorialWeights'
@@ -15,13 +16,16 @@ import { defaultWeights, editorialScore } from '../../shared/editorial'
 import { youtubeSourceUrl } from '../../shared/video-source'
 import { RunStats } from './RunStats'
 import { AddToAutomationDialog } from './AddToAutomationDialog'
-import { PostDialog, type PostableClip } from './PostDialog'
+import { PostDialog, formatScheduled, type PostableClip } from './PostDialog'
+import { BulkScheduleDialog } from './BulkScheduleDialog'
 import { Page } from './ui/Page'
 import { PageHeader } from './ui/PageHeader'
 import { Button } from './ui/Button'
+import { ProgressBar } from './ui/ProgressBar'
 import { ConfirmDialog, type ConfirmRequest } from './ui/ConfirmDialog'
 import { TextInput } from './ui/Field'
 import { Checkbox } from './ui/Checkbox'
+import { BulkDownloadDialog } from './BulkDownloadDialog'
 import { EmptyState } from './ui/EmptyState'
 import { Callout } from './ui/Callout'
 import { Segmented } from './ui/Segmented'
@@ -58,43 +62,128 @@ export function ClipList(props: ClipListProps): React.JSX.Element {
 }
 
 function ClipRun(props: ClipListProps): React.JSX.Element {
-  const hasEditor = props.output.editor_project === true && !!props.outputDir
+  const [imported, setImported] = useState(false)
+  const hasEditor = (props.output.editor_project === true || imported) && !!props.outputDir
+  // An automatic run has finished clips but no editor project yet; it can be imported by re-attaching its source.
+  const importable = !!props.outputDir && !hasEditor && props.output.clips.length > 0
   const [editing, setEditing] = useState(false)
   const [opening, setOpening] = useState(hasEditor)
+  const [importing, setImporting] = useState(false)
+  /** Live download/preview progress for the import waiting screen. */
+  const [importProgress, setImportProgress] = useState<EditorProgress | null>(null)
+  /** An editor operation main is running on this run (scan, preview rebuild, import from elsewhere). */
+  const [operation, setOperation] = useState<EditorOperation | null>(null)
   const [remaining, setRemaining] = useState<number | null>(null)
   const [editorError, setEditorError] = useState<string | null>(null)
+  /** clip index → editor candidate that baked it, so each reel can open its own edit. */
+  const [clipCandidates, setClipCandidates] = useState<Map<number, string>>(new Map())
+  const [focusCandidate, setFocusCandidate] = useState<string | null>(null)
   const [output, setOutput] = useState(props.output)
   useEffect(() => {
-    if (!hasEditor) return
+    // Review runs land here on mount; freshly imported runs are populated by runImport instead.
+    if (!hasEditor || imported || !props.outputDir) return
     let active = true
-    void getApi().editor.open(props.outputDir!).then((session) => {
+    void getApi().editor.open(props.outputDir).then((session) => {
       if (!active) return
       const { remaining } = editorProgress(session.project.candidates)
       setRemaining(remaining)
+      setOperation(session.operation ?? null)
+      setClipCandidates(candidateIdsByClip(session.project.candidates))
       setEditing(props.initialClipIndex === undefined && props.output.clips.length === 0 && remaining > 0)
     }).catch((cause) => {
       if (active) setEditorError(errorMessage(cause, 'Could not read editor progress. Open the editor to retry.'))
     }).finally(() => { if (active) setOpening(false) })
     return () => { active = false }
   // Choose the landing view once per run, without interrupting active edits.
-  }, [hasEditor, props.outputDir])
-  if (opening) return <Page width="wide">{props.leading}<p className="mt-4 text-sm text-ink-muted" role="status">Opening clips…</p></Page>
-  if (editing && props.outputDir) return <ClipEditor outputDir={props.outputDir} leading={props.leading} onExports={async () => {
+  }, [hasEditor, imported, props.outputDir])
+  // The import's worker state lives in main before editor-project.json exists.
+  useEffect(() => {
+    if (!importing || !props.outputDir) return
+    let pending = false
+    const timer = window.setInterval(() => {
+      if (pending) return
+      pending = true
+      void getApi().editor.operationProgress(props.outputDir!).then((state) => {
+        if (state.progress) setImportProgress(state.progress)
+      }).catch(() => {}).finally(() => { pending = false })
+    }, 1000)
+    return () => { window.clearInterval(timer) }
+  }, [importing, props.outputDir])
+  // Re-attach the run's source, then open the editor focused on the clicked clip.
+  const runImport = async (clipIndex: number): Promise<void> => {
+    if (!props.outputDir || importing) return
+    setImporting(true)
+    setImportProgress(null)
+    setEditorError(null)
+    try {
+      let session
+      try {
+        // The focused clip index makes the engine preview only that reel's window first.
+        session = await getApi().editor.createProject(props.outputDir, undefined, clipIndex)
+      } catch (cause) {
+        // Main asks for the original file when there is no downloadable URL, or a re-download failed.
+        if (errorMessage(cause, '') !== EDITOR_NEEDS_SOURCE) throw cause
+        const picked = await getApi().dialog.selectVideo()
+        if (!picked) return
+        session = await getApi().editor.createProject(props.outputDir, picked, clipIndex)
+      }
+      setClipCandidates(candidateIdsByClip(session.project.candidates))
+      setRemaining(editorProgress(session.project.candidates).remaining)
+      setOperation(session.operation ?? null)
+      setImported(true)
+      setFocusCandidate(`candidate-${clipIndex + 1}`)
+      setEditing(true)
+    } catch (cause) {
+      setEditorError(errorMessage(cause, 'Could not prepare the editable copy. Try again.'))
+    } finally {
+      setImporting(false)
+    }
+  }
+  if (opening || importing) {
+    const status = importing ? editorImportStatus(importProgress) : null
+    return <Page width="wide">{props.leading}
+      <div className="mt-4 max-w-md space-y-3">
+        <p className="text-sm text-ink-muted" role="status">{status ? status.label : 'Opening clips…'}</p>
+        {status && status.percent !== null && <ProgressBar value={status.percent} />}
+        {importing && props.outputDir && <div>
+          <Button size="sm" variant="ghost" onClick={() => { void getApi().editor.cancel(props.outputDir!) }}>Cancel</Button>
+        </div>}
+      </div>
+    </Page>
+  }
+  if (editing && props.outputDir) return <ClipEditor outputDir={props.outputDir} focusCandidateId={focusCandidate} leading={props.leading} onExports={async () => {
     const [raw, session] = await Promise.all([getApi().history.getJob(props.outputDir!), getApi().editor.open(props.outputDir!)])
     const fresh = parseJobOutput(raw)
     if (!fresh) throw new Error('Could not load the exported clips. Reopen this Library item to retry.')
     setOutput(fresh); setRemaining(editorProgress(session.project.candidates).remaining)
-    setEditorError(null); setEditing(false)
+    setClipCandidates(candidateIdsByClip(session.project.candidates))
+    setOperation(session.operation ?? null)
+    setEditorError(null); setFocusCandidate(null); setEditing(false)
   }} />
+  const editable = hasEditor ? clipCandidates : new Map(output.clips.map((clip) => [clip.clip_index, `candidate-${clip.clip_index + 1}`]))
+  const firstClip = output.clips[0]?.clip_index ?? 0
   return <GeneratedClipList {...props} output={output} onOutputChanged={(fresh) => {
     setOutput(fresh)
-    if (hasEditor) void getApi().editor.open(props.outputDir!).then((session) => setRemaining(editorProgress(session.project.candidates).remaining))
-      .catch((cause) => setEditorError(errorMessage(cause)))
-  }} editor={hasEditor ? { remaining, error: editorError, onOpen: () => setEditing(true) } : undefined} />
+    if (hasEditor) void getApi().editor.open(props.outputDir!).then((session) => {
+      setRemaining(editorProgress(session.project.candidates).remaining)
+      setClipCandidates(candidateIdsByClip(session.project.candidates))
+    }).catch((cause) => setEditorError(errorMessage(cause)))
+  }} editor={hasEditor || importable ? { remaining: hasEditor ? remaining : null, error: editorError, editable,
+    busy: importing || operation !== null,
+    onOpen: () => { if (hasEditor) { setFocusCandidate(null); setEditing(true) } else void runImport(firstClip) },
+    // Every reel is editable: a fresh import focuses it positionally when no candidate exported it (yet).
+    onEditClip: (clipIndex) => { if (hasEditor) { setFocusCandidate(clipCandidates.get(clipIndex) ?? `candidate-${clipIndex + 1}`); setEditing(true) } else void runImport(clipIndex) } } : undefined} />
+}
+
+/** Map each baked clip index to the candidate that produced it (first wins). */
+export function candidateIdsByClip(candidates: EditorCandidate[]): Map<number, string> {
+  const map = new Map<number, string>()
+  for (const candidate of candidates) for (const index of candidate.exports) if (!map.has(index)) map.set(index, candidate.id)
+  return map
 }
 
 function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip, onNavigate, initialClipIndex, editor, onOutputChanged }: ClipListProps & {
-  editor?: { remaining: number | null; error: string | null; onOpen: () => void }
+  editor?: { remaining: number | null; error: string | null; editable: Map<number, string>; busy: boolean; onOpen: () => void; onEditClip: (clipIndex: number) => void }
   onOutputChanged: (output: JobOutput) => void
 }): React.JSX.Element {
   const [query, setQuery] = useState('')
@@ -115,12 +204,16 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
   const hasEditorial = output.clips.some((c) => c.editorial?.status === 'success')
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [exporting, setExporting] = useState(false)
+  const [downloadTargets, setDownloadTargets] = useState<ClipArtifact[] | null>(null)
+  const [xmlExporting, setXmlExporting] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState<string | null>(null)
   const deletingRef = useRef(false)
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null)
   const closeConfirm = useCallback(() => setConfirm(null), [])
   const [posting, setPosting] = useState<PostableClip[] | null>(null)
+  const [bulkSchedule, setBulkSchedule] = useState<PostableClip[] | null>(null)
+  const [bulkStarts, setBulkStarts] = useState<string[] | null>(null)
   const [bankClips, setBankClips] = useState<number[] | null>(null)
   const [addedToBank, setAddedToBank] = useState(false)
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -232,6 +325,18 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
       setDeleteError(errorMessage(cause, 'Could not delete the selected clips. Please try again.'))
     } finally { deletingRef.current = false; setDeleting(false) }
   }
+  const duplicateSelected = async (indices: number[]): Promise<void> => {
+    if (deletingRef.current || exportingRef.current) return
+    try {
+      if (typeof getApi().history.duplicateClips !== 'function') throw new Error('Restart BridgeClip to enable duplicating clips.')
+      const fresh = await getApi().history.duplicateClips(outputDir, indices)
+      onOutputChanged(fresh)
+      setStatusRetry((value) => value + 1)
+      setNotice(`Clip duplicated — a safe, independent copy is ready at the end of the run.`)
+    } catch (cause) {
+      setDeleteError(errorMessage(cause, 'Could not duplicate the clip. Please try again.'))
+    }
+  }
   const confirmDelete = (indices: number[]): void => {
     const targets = output.clips.filter((clip) => indices.includes(clip.clip_index))
     const picked = targets.map((clip) => clip.clip_index)
@@ -244,29 +349,31 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
     })
   }
 
-  const exportSelected = async (): Promise<void> => {
-    const picked = clips.filter((c) => selected.has(c.clip_index))
-    if (picked.length === 0 || exportingRef.current || deletingRef.current) return
-    exportingRef.current = true
-    setExporting(true)
+  const showNotice = (text: string): void => {
+    setNotice(text)
+    if (noticeTimer.current) clearTimeout(noticeTimer.current)
+    noticeTimer.current = setTimeout(() => setNotice(null), 3500)
+  }
+
+  const exportXml = async (): Promise<void> => {
+    if (!outputDir || xmlExporting || exportingRef.current || deletingRef.current) return
+    setXmlExporting(true)
     setExportError(null)
     try {
-      const result = await getApi().clips.bulkExport(
-        picked.map((c) => ({ path: clipFilePath(c.s3_url), name: c.summary || `Clip ${c.clip_index + 1}` }))
-      )
+      const picked = clips.filter((c) => selected.has(c.clip_index)).map((c) => c.clip_index)
+      const result = await getApi().clips.exportFcpXml(outputDir, picked.length ? picked : null)
+      if (result.canceled) return
       if (result.success) {
-        setAddedToBank(false)
-        setNotice(`Exported ${result.count} clip${result.count === 1 ? '' : 's'}${result.destDir ? ` to ${basename(result.destDir)}` : ''}${result.failedCount ? `; ${result.failedCount} could not be copied` : ''}`)
-        if (noticeTimer.current) clearTimeout(noticeTimer.current)
-        noticeTimer.current = setTimeout(() => setNotice(null), 3500)
+        showNotice(`Exported ${result.clipCount} clip${result.clipCount === 1 ? '' : 's'} as ${result.fileName}` +
+          `${result.srtCount ? ` with ${result.srtCount} caption file${result.srtCount === 1 ? '' : 's'}` : ''}` +
+          `${result.failedCount ? `; ${result.failedCount} could not be read` : ''}`)
       } else if (result.failedCount) {
-        setExportError('No clips could be copied to that folder.')
+        setExportError('No clips could be exported to XML.')
       }
     } catch (err) {
-      setExportError(errorMessage(err, 'Could not export clips. Please try again.'))
+      setExportError(errorMessage(err, 'Could not export XML. Please try again.'))
     } finally {
-      exportingRef.current = false
-      setExporting(false)
+      setXmlExporting(false)
     }
   }
 
@@ -295,8 +402,11 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
               onToggleSelect={() => toggle(clip.clip_index)}
               onAspect={aspect == null ? setAspect : undefined}
               onPost={() => setPosting([asPostable(clip)])}
+              onEdit={editor ? () => editor.onEditClip(clip.clip_index) : undefined}
+              editDisabled={editor?.busy}
               onAddToAutomation={outputDir ? () => setBankClips([clip.clip_index]) : undefined}
               onDelete={outputDir ? () => confirmDelete([clip.clip_index]) : undefined}
+              onDuplicate={outputDir ? () => { void duplicateSelected([clip.clip_index]) } : undefined}
               actionsDisabled={deleting || exporting}
               onSetPosted={outputDir ? async (posted) => {
                 if (!getApi().history.setPosted) throw new Error('Restart BridgeClip to enable manual posted marks.')
@@ -328,6 +438,12 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
             {outputDir && (
               <Button icon={<FolderOpen className="h-3.5 w-3.5" />} onClick={() => getApi().shell.openPath(outputDir)}>
                 Open folder
+              </Button>
+            )}
+            {outputDir && output.clips.length > 0 && (
+              <Button icon={<FileCode className="h-3.5 w-3.5" />} loading={xmlExporting} disabled={deleting || exporting}
+                title="Export an FCPXML timeline for Premiere Pro or DaVinci Resolve" onClick={() => { void exportXml() }}>
+                Export XML
               </Button>
             )}
             {onNewClip && (
@@ -418,6 +534,15 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
               >
                 Post {selected.size}
               </Button>
+              <Button
+                size="sm"
+                icon={<CalendarClock className="h-3.5 w-3.5" />}
+                disabled={deleting || selected.size < 2 || selected.size > MAX_POST_BATCH}
+                title={selected.size < 2 ? 'Select at least 2 clips for batch scheduling' : selected.size > MAX_POST_BATCH ? `Schedule up to ${MAX_POST_BATCH} clips at a time` : 'Schedule the selected clips with a start time and spacing'}
+                onClick={() => setBulkSchedule(clips.filter((c) => selected.has(c.clip_index)).map(asPostable))}
+              >
+                Schedule batch
+              </Button>
               {outputDir && <Button
                 size="sm"
                 icon={<ListPlus className="h-3.5 w-3.5" />}
@@ -433,9 +558,9 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
                 loading={exporting}
                 disabled={deleting}
                 icon={<Download className="h-3.5 w-3.5" />}
-                onClick={exportSelected}
+                onClick={() => setDownloadTargets(clips.filter((clip) => selected.has(clip.clip_index)))}
               >
-                Export {selected.size}
+                Download {selected.size}
               </Button>
               {outputDir && <Button variant="danger" size="sm" iconOnly aria-label="Delete selected clips" title="Delete selected clips"
                 icon={<Trash2 className="h-3.5 w-3.5" />} loading={deleting} disabled={exporting} onClick={() => confirmDelete(clips.filter((clip) => selected.has(clip.clip_index)).map((clip) => clip.clip_index))} />}
@@ -486,7 +611,21 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
       )}
 
       {confirm && <ConfirmDialog request={confirm} onClose={closeConfirm} />}
-      {posting && <PostDialog clips={posting} onClose={() => setPosting(null)} onNavigate={onNavigate} />}
+      {downloadTargets && <BulkDownloadDialog clips={downloadTargets} onClose={() => setDownloadTargets(null)} />}
+      {bulkSchedule && <BulkScheduleDialog
+        clips={bulkSchedule}
+        timeZone={localTimeZone()}
+        onCancel={() => setBulkSchedule(null)}
+        onStart={(startISO: string, intervalMinutes: number, order: PostableClip[]) => {
+          const start = Date.parse(startISO)
+          const starts = order.map((_, i) => new Date(start + i * intervalMinutes * 60_000).toISOString())
+          setBulkSchedule(null)
+          setPosting(order)
+          setBulkStarts(starts)
+        }}
+      />}
+      {posting && <PostDialog clips={posting} onClose={() => { setPosting(null); setBulkStarts(null) }} onNavigate={onNavigate}
+        initial={bulkStarts ? { bulkStarts } : undefined} />}
       {inspectEdits && <EditInspector outputDir={outputDir} onClose={() => setInspectEdits(false)} />}
       {bankClips && outputDir && <AddToAutomationDialog
         outputDir={outputDir}
@@ -612,4 +751,8 @@ export function sourceAnalysisNotice(output: JobOutput): string | null {
     return 'Transcription failed. Clips were selected from sampled video frames, and spoken-word captions are unavailable for this run.'
   }
   return null
+}
+
+function localTimeZone(): string {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC' } catch { return 'UTC' }
 }

@@ -6,6 +6,7 @@ import { Readable } from 'stream'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { createMenu } from './menu'
 import { registerIpcHandlers } from './ipc-handlers'
+import { initAutoImport } from './auto-import'
 import { initAutoUpdater } from './auto-updater'
 import { logger, getLogFilePath, errorSummary } from './logger'
 import { authorizeMedia, isTrustedExternalUrl, openAuthorizedMedia } from './security'
@@ -272,6 +273,7 @@ app.whenReady().then(() => {
   })
 
   registerIpcHandlers(() => mainWindow)
+  initAutoImport()
   const stopAutomations = startAutomationScheduler()
   void sweepDeletingRuns()
   app.on('before-quit', stopAutomations)

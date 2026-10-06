@@ -443,7 +443,11 @@ function useRunPreview(entry: HistoryEntry | null, revision: number): { thumb: s
             const progress = await getApi().editor.progress(outputDir)
             if (cancelled) return null
             setRemaining(progress.remaining)
-            if (!best && progress.previewPath) return loadThumbnail(progress.previewPath, progress.thumbnailMs / 1000)
+            if (!best && progress.previewPath) {
+              // A fast per-reel import previews only a window of the source; seek inside it.
+              const at = Math.max(progress.previewStartMs, Math.min(progress.previewEndMs - 1000, progress.thumbnailMs))
+              return loadThumbnail(progress.previewPath, (at - progress.previewStartMs) / 1000)
+            }
           } catch { /* Existing exports remain usable if the editor project is unavailable. */ }
         }
         if (cancelled) return null

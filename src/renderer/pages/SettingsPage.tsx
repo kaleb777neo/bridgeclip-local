@@ -1,7 +1,7 @@
 import { JevSettings } from '../components/JevSettings'
 import { LocalAiSection } from '../components/LocalAiSection'
-import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { ArrowUpRight, BookA, Check, ChevronDown, CloudOff, Cpu, FolderOpen, Github, History, Info, KeyRound, Loader2, RefreshCw, ScrollText, SlidersHorizontal } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { UploadCloud,  ArrowUpRight, BookA, Check, ChevronDown, CloudOff, Cpu, FolderOpen, Github, History, Info, KeyRound, Loader2, RefreshCw, ScrollText, SlidersHorizontal } from 'lucide-react'
 import { useSettingsStore } from '../store/use-settings-store'
 import { useChangelogStore } from '../store/use-changelog-store'
 import { useApiKeyDrafts } from '../hooks/use-api-key-drafts'
@@ -22,7 +22,7 @@ import { Callout } from '../components/ui/Callout'
 import { UpdatesRow } from '../components/Updates'
 import { OutputStorage } from '../components/OutputStorage'
 
-type SectionId = 'localai' | 'keys' | 'jev' | 'vocabulary' | 'output' | 'system' | 'about'
+type SectionId = 'localai' | 'keys' | 'jev' | 'vocabulary' | 'autoimport' | 'output' | 'system' | 'about'
 type SectionTone = 'success' | 'warning' | 'danger' | 'idle'
 
 /** `showUpdates` changes each time Help → Check for Updates… asks the Updates row. */
@@ -212,6 +212,15 @@ export function SettingsPage({ showUpdates = 0 }: { showUpdates?: number }): Rea
               action={vocabularyTerms > 0 && <Badge className="font-mono tabular">{vocabularyTerms} term{vocabularyTerms === 1 ? '' : 's'}</Badge>}
             />
             <VocabularyField value={customVocabulary} onCommit={(value) => commit({ customVocabulary: value })} />
+          </Section>
+
+          <Section id="autoimport">
+            <PanelHeader
+              icon={<IconTile><UploadCloud /></IconTile>}
+              title="Auto Import"
+              description="Watch YouTube playlists and clip new uploads automatically. Manage the queued results on the Calendar page."
+            />
+            <AutoImportCard />
           </Section>
 
           <Section id="output">
@@ -446,19 +455,41 @@ function OutputFolder({ value, onCommit }: { value: string; onCommit: (dir: stri
 }
 
 function VocabularyField({ value, onCommit }: { value: string; onCommit: (value: string) => void }): React.JSX.Element {
-  const [draft, setDraft] = useState(value)
-  useEffect(() => setDraft(value), [value])
+  const terms = value.split('\n').map((term) => term.trim()).filter(Boolean)
+  const [draft, setDraft] = useState('')
+  const add = (): void => {
+    const term = draft.replace(/\s+/g, ' ').trim().slice(0, 49)
+    if (!term) return
+    setDraft('')
+    if (terms.some((kept) => kept.toLocaleLowerCase() === term.toLocaleLowerCase())) return
+    onCommit([...terms, term].join('\n'))
+  }
+  const remove = (index: number): void => onCommit(terms.filter((_, i) => i !== index).join('\n'))
   return (
     <div className="mt-4">
-      <TextArea
-        rows={4}
-        value={draft}
-        placeholder={'GPT 6 Sol\nOpus 5.5\nBridgeMind'}
-        aria-label="Custom vocabulary"
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={() => draft !== value && onCommit(draft)}
-      />
-      <p className="mt-2 px-1 text-xs text-ink-subtle">Up to five words per term. Applies to new transcriptions; generated metadata uses it right away.</p>
+      {terms.length > 0 && (
+        <div className="mb-2 flex flex-wrap gap-2" aria-label="Brand vocabulary terms">
+          {terms.map((term, index) => (
+            <span key={`${term}-${index}`} className="inline-flex items-center gap-1 rounded-full border border-white/15 bg-white/5 px-3 py-1 text-xs">
+              {term}
+              <button type="button" aria-label={`Remove ${term}`} className="text-ink-subtle hover:text-ink" onClick={() => remove(index)}>×</button>
+            </span>
+          ))}
+        </div>
+      )}
+      <div className="flex gap-2">
+        <input
+          className="flex-1 rounded-md border border-white/15 bg-black/30 px-3 py-2 text-sm"
+          placeholder="Add a brand name, person, product…"
+          aria-label="Add proper noun to the Brand Vocabulary"
+          value={draft}
+          maxLength={49}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add() } }}
+        />
+        <button type="button" className="rounded-md border border-white/15 px-3 py-2 text-sm hover:bg-white/10" onClick={add}>Add to Brand Vocabulary</button>
+      </div>
+      <p className="mt-2 px-1 text-xs text-ink-subtle">{terms.length} term{terms.length === 1 ? '' : 's'} · up to five words each. Applies to new transcriptions; generated metadata uses it right away.</p>
     </div>
   )
 }
@@ -575,6 +606,65 @@ function ToolList({ rows, checking }: { rows: ToolRow[]; checking: boolean }): R
           )
         })}
       </div>}
+    </div>
+  )
+}
+
+function AutoImportCard(): React.JSX.Element {
+  const [status, setStatus] = useState<{ config: { enabled: boolean; playlists: string[]; intervalMinutes: number; maxPerPoll: number }; lastPollAt: string | null; importedCount: number; polling: boolean } | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const load = useCallback(async (): Promise<void> => {
+    try { setStatus(await getApi().autoImport.status()) } catch (e) { setError(errorMessage(e)) }
+  }, [])
+  useEffect(() => { void load() }, [load])
+  if (!status) return <p className="text-xs text-ink-subtle" role="status">Loading Auto Import…</p>
+  const { config } = status
+  const commit = async (patch: { playlists?: string; enabled?: boolean; intervalMinutes?: number }): Promise<void> => {
+    try { await getApi().autoImport.set(patch); await load() } catch (e) { setError(errorMessage(e)) }
+  }
+  const pollNow = async (): Promise<void> => {
+    setNotice(null); setError(null)
+    try {
+      const result = await getApi().autoImport.pollNow()
+      await load()
+      if (result.queued.length) setNotice(`${result.queued.length} new video${result.queued.length === 1 ? '' : 's'} queued for clipping.`)
+      else if (result.errors.length) setError(result.errors[0])
+      else setNotice('No new uploads found.')
+    } catch (e) { setError(errorMessage(e)) }
+  }
+  return (
+    <div className="space-y-3">
+      <label className="flex items-center gap-2.5 text-sm text-ink">
+        <input type="checkbox" aria-label="Auto Import" checked={config.enabled} onChange={(e) => { void commit({ enabled: e.target.checked }) }} />
+        Watch my playlists for new uploads
+      </label>
+      {config.enabled && <>
+        <textarea
+          rows={3}
+          className="w-full rounded-md border border-white/15 bg-black/30 px-3 py-2 text-sm"
+          placeholder={'https://www.youtube.com/playlist?list=…\nhttps://www.youtube.com/playlist?list=…'}
+          aria-label="Auto Import playlists"
+          defaultValue={config.playlists.join('\n')}
+          onBlur={(e: React.ChangeEvent<HTMLTextAreaElement>) => { const value = e.target.value; if (value !== config.playlists.join('\n')) void commit({ playlists: value }) }}
+        />
+        <label className="flex items-center gap-2 text-xs text-ink">
+          Check every
+          <select aria-label="Poll interval" className="rounded-md border border-white/15 bg-black/30 px-2 py-1.5 text-sm" value={config.intervalMinutes}
+            onChange={(e: React.ChangeEvent<HTMLSelectElement>) => { void commit({ intervalMinutes: Number(e.target.value) }) }}>
+            {[15, 30, 60, 180, 360, 720, 1440].map((minutes) => <option key={minutes} value={minutes}>{minutes < 60 ? `${minutes} min` : `${minutes / 60} h`}</option>)}
+          </select>
+          · max 3 videos per playlist, per check
+        </label>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <Button size="sm" variant="ghost" onClick={() => { void pollNow() }}>Check now</Button>
+          <span className="text-2xs text-ink-subtle">
+            {status.importedCount} imported so far{status.lastPollAt ? ` · last checked ${new Date(status.lastPollAt).toLocaleString()}` : ''}
+          </span>
+        </div>
+      </>}
+      {notice && <p className="text-xs text-brand-gold" role="status">{notice}</p>}
+      {error && <p className="text-xs text-danger" role="alert">{error}</p>}
     </div>
   )
 }

@@ -19,6 +19,7 @@ import pytest
 from clip_engine.config import CaptionStyle
 from clip_engine.services import rendering_service as module
 from clip_engine.services.caption_generator import CaptionGeneratorService
+from clip_engine.services.clip_editor import TimeMap
 from clip_engine.services.intelligence_planner import IntelligencePlannerService
 from clip_engine.services.layout_analyzer import ClipLayoutPlan, LayoutType, ShotLayout
 from clip_engine.services.rendering_service import MAX_TITLE_CHARS, RenderingService, RenderRequest
@@ -302,7 +303,8 @@ def test_title_card_can_be_turned_off(tmp_path, is_landscape):
     def overlay_paths(**options):
         request = RenderRequest(str(tmp_path / "source.mp4"), str(tmp_path / "clip.mp4"), 0, 4000, 640, 360,
                                 title_text="Why Most Developers Get This Wrong", **options)
-        return [overlay[0] for overlay in service._overlays(request, plan, width, height, is_landscape)]
+        return [overlay[0] for overlay in service._overlays(request, plan, width, height, is_landscape,
+                                                             TimeMap([(0, 4000)]), 0)]
 
     assert overlay_paths() == [str(tmp_path / "title-0-4000.png")]
     assert overlay_paths(include_title=False) == []

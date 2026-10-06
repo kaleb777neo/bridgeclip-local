@@ -8,7 +8,9 @@ import { JobsPage } from './pages/JobsPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { AccountsPage } from './pages/AccountsPage'
 import { PostsPage } from './pages/PostsPage'
+import { AnalyticsPage } from './pages/AnalyticsPage'
 import { AutomationsPage } from './pages/AutomationsPage'
+import { TemplatesPage } from './pages/TemplatesPage'
 import { BridgeClipLogo } from './components/brand/BridgeClipLogo'
 import { useSettingsStore } from './store/use-settings-store'
 import { useJobStore } from './store/use-job-store'
@@ -94,7 +96,7 @@ export default function App(): React.JSX.Element {
     useChangelogStore.getState().setOpen(true)
   }), [])
 
-  // ⌘1 Create, ⌘2 Library, ⌘3 Jobs, ⌘4 Accounts, ⌘5 Posts, ⌘6 Automations, ⌘, Settings,
+  // ⌘1 Create, ⌘2 Library, ⌘3 Jobs, ⌘4 Accounts, ⌘5 Posts, ⌘6 Analytics, ⌘7 Automations, ⌘8 Templates, ⌘, Settings,
   // ⌘\ collapse or expand the sidebar (Ctrl on Windows/Linux).
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent): void => {
@@ -126,8 +128,10 @@ export default function App(): React.JSX.Element {
             {page === 'clip' && <ClipPage onNavigate={setPage} />}
             {page === 'library' && <LibraryPage onNavigate={setPage} initialRun={libraryRun?.outputDir} initialClipIndex={libraryRun?.clipIndex} />}
             {page === 'jobs' && <JobsPage onNavigate={setPage} onViewLibrary={viewLibraryRun} />}
+            {page === 'templates' && <TemplatesPage />}
             {page === 'accounts' && <AccountsPage onNavigate={setPage} />}
             {page === 'posts' && <PostsPage onNavigate={setPage} />}
+            {page === 'analytics' && <AnalyticsPage onNavigate={setPage} />}
             {page === 'automations' && <AutomationsPage onNavigate={setPage} onViewLibrary={viewLibraryRun} />}
             {page === 'settings' && <SettingsPage showUpdates={showUpdates} />}
           </Fragment>

@@ -35,7 +35,11 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   transcriptionLanguage: '',
   outputDirectory: '',
   pythonPath: 'python3',
+  autoImportPlaylists: '',
+  autoImportEnabled: false,
+  autoImportIntervalMinutes: 60,
   customVocabulary: '',
+  defaultTemplateId: '',
   loaded: false,
   saving: false,
   toolStatus: null,
@@ -116,7 +120,11 @@ function pickSettings(s: ClipSettings): ClipSettings {
     zernioConfigured: s.zernioConfigured,
     outputDirectory: s.outputDirectory,
     pythonPath: s.pythonPath,
-    customVocabulary: s.customVocabulary
+    customVocabulary: s.customVocabulary,
+    defaultTemplateId: s.defaultTemplateId ?? '',
+    autoImportPlaylists: s.autoImportPlaylists ?? '',
+    autoImportEnabled: s.autoImportEnabled === true,
+    autoImportIntervalMinutes: s.autoImportIntervalMinutes ?? 60
   }
 }
 

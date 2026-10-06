@@ -3,10 +3,10 @@ import { execFile } from 'child_process'
 import { createHash, randomUUID } from 'crypto'
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'fs'
 import { stat } from 'fs/promises'
-import { basename, join } from 'path'
+import { basename, dirname, join } from 'path'
 import { promisify } from 'util'
 import { loadSettings } from '../settings-store'
-import { assertMediaPath, openAuthorizedMedia } from '../security'
+import { assertMediaPath, isWebUrl, openAuthorizedMedia } from '../security'
 import { resolveBinary } from '../tools'
 import { logger } from '../logger'
 import { getClient, onZernioReset, readCachedOverview } from './service'
@@ -100,6 +100,36 @@ async function probe(filePath: string, fallbackDurationMs: number | null): Promi
     // Without ffprobe the checks fall back to the length the clipping engine recorded.
     return { durationMs: fallbackDurationMs, width: null, height: null, sizeBytes: size }
   }
+}
+
+/** The source video's full link (the run's original URL), or null when there isn't one. */
+export function sourceVideoLinkFor(clipPath: unknown): string | null {
+  if (typeof clipPath !== 'string') return null
+  try { assertMediaPath(clipPath, loadSettings().outputDirectory) } catch { return null }
+  try {
+    const raw = readFileSync(join(dirname(clipPath), 'job_output.json'))
+    if (raw.length > 2 * 1024 * 1024) return null
+    const output = JSON.parse(raw.toString('utf8'))
+    const url = typeof output.source_video_url === 'string' ? output.source_video_url.trim() : ''
+    return isWebUrl(url) ? url : null
+  } catch { return null }
+}
+
+/** The full video link lands between the caption text and its trailing hashtags. */
+export function withSourceLink(caption: string, link: string): string {
+  const body = caption.replace(/\s+$/, '')
+  const hashtags = body.match(/(?:^|\s)(#[^\s#]+(?:\s+#[^\s#]+)*)\s*$/)
+  if (!hashtags || hashtags.index === undefined) return `${body}
+
+${link}`
+  const text = body.slice(0, hashtags.index).trimEnd()
+  return text ? `${text}
+
+${link}
+
+${hashtags[1]}` : `${link}
+
+${hashtags[1]}`
 }
 
 export async function probeClipForPosting(clipPath: unknown, fallbackDurationMs: unknown): Promise<ClipMediaInfo> {
@@ -375,6 +405,14 @@ async function publish(request: PostClipRequest, signal: AbortSignal, notify: (p
   const client = getClient()
   const [media, targets] = await Promise.all([probe(request.clipPath, request.durationMs), resolveTargets(client, request.targets)])
   assertWorkspace(generation)
+  // "Add the full video link": injected into every YouTube caption between the
+  // text and its hashtags, before validation, so length checks see final text.
+  const sourceLink = request.options.youtube?.sourceLink ? sourceVideoLinkFor(request.clipPath) : null
+  const effectiveTargets = sourceLink
+    ? request.targets.map((target) => target.platform === 'youtube'
+        ? { ...target, customContent: withSourceLink(target.customContent ?? request.caption, sourceLink) }
+        : target)
+    : request.targets
   const label = (accountId: string): string => {
     const target = targets.find((t) => t.accountId === accountId)
     return target?.handle ? `${platformLabel(target.platform)} ${target.handle}` : platformLabel(target?.platform ?? '')
@@ -400,7 +438,7 @@ async function publish(request: PostClipRequest, signal: AbortSignal, notify: (p
   }
 
   const problems: string[] = []
-  for (const target of request.targets) {
+  for (const target of effectiveTargets) {
     const platform = target.platform
     const caption = checkCaption(platform, target.customContent ?? request.caption)
     const clips = platform === 'tiktok'
@@ -447,7 +485,7 @@ async function publish(request: PostClipRequest, signal: AbortSignal, notify: (p
     throw new Error('The scheduled time passed while the clip uploaded. Pick a later time and post again; the upload is kept.')
   }
 
-  const body = buildCreatePostBody(request, {
+  const body = buildCreatePostBody({ ...request, targets: effectiveTargets }, {
     publicUrl: attempt.publicUrl,
     tiktokInteractions: Object.fromEntries(tiktokInfos.map((info) => [info.accountId, info.interactions])),
     facebookFormat: request.options.facebook?.format

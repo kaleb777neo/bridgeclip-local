@@ -20,11 +20,11 @@ import shutil
 import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Optional
 
-from clip_engine.config import CaptionStyle, LayoutStyle, get_settings, is_longform, resolve_clip_duration_bounds
+from clip_engine.config import AspectRatioType, CaptionStyle, LayoutStyle, get_settings, is_longform, resolve_clip_duration_bounds
 from clip_engine.services.video_speed import validate_video_speed
 from clip_engine.error_policy import NoClipCandidatesError, NoRequestedMomentsError, safe_failure_code, safe_processing_error
 from clip_engine.services.source_context import SourceContextService, context_for_prompt, transcription_terms
@@ -72,6 +72,14 @@ from clip_engine.services.webhook_service import (
 
 logger = logging.getLogger(__name__)
 
+VALID_ASPECT_RATIOS = (AspectRatioType.VERTICAL, AspectRatioType.HORIZONTAL, AspectRatioType.SQUARE)
+
+
+def variant_suffix(aspect_ratio: str) -> str:
+    """File-name part for a clip's format variant. ':' is illegal in Windows
+    file names, so '16:9' becomes '16x9'."""
+    return aspect_ratio.replace(":", "x")
+
 
 class JobStatus(str, Enum):
     """Status of an AI clipping job."""
@@ -85,6 +93,45 @@ class JobStatus(str, Enum):
     UPLOADING = "uploading"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+SRT_TIME = re.compile(r'(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*--> \s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})')
+SRT_TAGS = re.compile(r'</?[^>]+>')
+
+
+def _srt_ms(h: str, m: str, s: str, ms: str) -> int:
+    return ((int(h) * 60 + int(m)) * 60 + int(s)) * 1000 + int(ms.ljust(3, '0'))
+
+
+def _parse_srt(text: str) -> list['TranscriptSegment']:
+    """Parse SubRip cues into transcript segments. Malformed cues are skipped;
+    HTML tags are stripped from the spoken text."""
+    from clip_engine.services.transcription_service import TranscriptSegment
+    segments: list[TranscriptSegment] = []
+    clean = text.replace('\r\n', '\n').lstrip('\ufeff').strip()
+    for block in re.split('\\n\\s*\\n', clean):
+        lines = [line for line in block.split('\n') if line.strip()]
+        if len(lines) < 2:
+            continue
+        timing = next((line for line in lines if '-->' in line), None)
+        if timing is None:
+            continue
+        match = SRT_TIME.search(timing)
+        if not match:
+            continue
+        g = match.groups()
+        start, end = _srt_ms(*g[:4]), _srt_ms(*g[4:8])
+        body = lines[lines.index(timing) + 1:]
+        spoken = ' '.join(SRT_TAGS.sub('', line).strip() for line in body)
+        spoken = ' '.join(spoken.split())
+        if not spoken or end <= start:
+            continue
+        if segments and start < segments[-1].end_time_ms:
+            start = segments[-1].end_time_ms
+            if end <= start:
+                continue
+        segments.append(TranscriptSegment(start_time_ms=start, end_time_ms=end, text=spoken))
+    return segments
 
 
 @dataclass
@@ -113,7 +160,12 @@ class ClippingJobRequest:
     banner_platform: Optional[str] = None
     banner_channel_url: Optional[str] = None
     aspect_ratio: str = "9:16"
+    # Extra output formats rendered per clip (variant pass reusing the
+    # primary's plan and edits). The primary is aspect_ratio = [0].
+    aspect_ratios: Optional[list[str]] = None
     keyterms: Optional[list[str]] = None
+    # User-uploaded .srt replacing AI transcription; validated by main.
+    srt_path: Optional[str] = None
     # The user's description of the moments to clip; None picks the best moments.
     clip_request: Optional[str] = None
     layout_style: str = LayoutStyle.AUTO
@@ -123,15 +175,49 @@ class ClippingJobRequest:
     video_speed: float = 1.0
     workflow: str = 'automatic'
     caption_preset: str = 'pop'
+    # Brand-template overlays snapshotted at job creation (main owns the logo
+    # file). Rendered on every clip through the manual editor's brand layers.
+    logo: Optional[dict] = None
+    # Brand-template intro/outro videos, same snapshot model as the logo.
+    intro: Optional[dict] = None
+    outro: Optional[dict] = None
+    cta_badges: Optional[list] = None
 
     def __post_init__(self):
         validate_video_speed(self.video_speed)
+        if self.logo is not None and not (
+            isinstance(self.logo, dict) and isinstance(self.logo.get('path'), str) and self.logo['path']
+        ):
+            raise ValueError("Invalid brand logo")
+        for slot in ('intro', 'outro'):
+            value = getattr(self, slot)
+            if value is not None and not (
+                isinstance(value, dict) and isinstance(value.get('path'), str) and value['path']
+            ):
+                raise ValueError(f"Invalid brand {slot}")
+        if self.cta_badges and not all(
+            isinstance(b, dict) and b.get('kind') in ('subscribe', 'follow') for b in self.cta_badges
+        ):
+            raise ValueError("Invalid CTA badges")
         # Blank means no request, so the run and its no-match error agree with the planner.
         self.clip_request = (self.clip_request or '').strip()[:MAX_CLIP_REQUEST_CHARS] or None
         if self.job_id is None:
             self.job_id = str(uuid.uuid4())
         if not isinstance(self.job_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", self.job_id):
             raise ValueError("Invalid job ID")
+        self.aspect_ratios = self._normalize_aspect_ratios()
+
+    def _normalize_aspect_ratios(self) -> list[str]:
+        """Validate the format list and keep aspect_ratio = primary."""
+        primary = self.aspect_ratio
+        ratios = list(dict.fromkeys(self.aspect_ratios or [primary]))
+        if primary != ratios[0]:
+            raise ValueError("aspect_ratio must be the first of aspect_ratios")
+        if len(ratios) > 3 or any(r not in VALID_ASPECT_RATIOS for r in ratios):
+            raise ValueError("Invalid aspect ratios")
+        if self.workflow == 'review' and (len(ratios) > 1 or (AspectRatioType.SQUARE in ratios and self.aspect_ratio != AspectRatioType.SQUARE)):
+            raise ValueError("Review & edit renders a single 9:16, 16:9 or 1:1 video")
+        return ratios
 
 
 @dataclass
@@ -208,7 +294,7 @@ class AIClippingPipeline:
         loop = asyncio.get_running_loop()
         start_time = time.time()
         job_id = request.job_id
-        jev_enabled = request.workflow == 'review' or getattr(self.settings, 'jev_enabled', False)
+        jev_enabled = (request.workflow == 'review' or getattr(self.settings, 'jev_enabled', False)) and request.workflow != 'captions-only'
         editorial_service = JevService.from_settings(self.settings, required=request.workflow == 'review')
         coherence_service = JevService(self.settings.openrouter_api_key if jev_enabled else '', max_requests=256, token_budget=1536000)
         work_dir = os.path.join(self.settings.temp_directory, job_id)
@@ -319,24 +405,43 @@ class AIClippingPipeline:
             self.transcription_service.detail_callback = lambda done, total: self._update_progress(
                 job_id, JobStatus.TRANSCRIBING, 15 + 10 * done / total, f'Transcribing audio, part {done + 1} of {total}…',
                 stage_id='transcription', stage_percent=100 * done / total, completed=done, total=total, unit='chunks')
-            try:
-                transcription_result = await self.transcription_service.transcribe(
+            if request.srt_path:
+                # An uploaded .srt replaces AI transcription entirely: parse it
+                # into segments and skip the model. Planning, Jev, captions and
+                # the editor all consume the same TranscriptSegment shape.
+                self._update_progress(job_id, JobStatus.TRANSCRIBING, 15, "Using the uploaded .srt captions...")
+                try:
+                    srt_text = Path(request.srt_path).read_text(encoding='utf-8-sig', errors='replace')
+                except OSError as error:
+                    raise ValueError("The uploaded .srt file could not be read.") from error
+                segments = _parse_srt(srt_text)
+                if not segments:
+                    raise ValueError("The uploaded .srt file has no readable subtitle cues.")
+                transcription_result = TranscriptionResult(
+                    segments=segments,
+                    full_text=" ".join(segment.text for segment in segments),
+                    provider="srt",
+                )
+                logger.info("Using uploaded .srt transcript: %d cues", len(segments))
+            else:
+                try:
+                    transcription_result = await self.transcription_service.transcribe(
                     video_path=download_result.video_path,
                     work_dir=work_dir,
                     keyterms=transcription_terms(request.keyterms, source_context) if source_context else request.keyterms,
                     start_seconds=None if jev_enabled else request.start_time_seconds,
                     end_seconds=None if jev_enabled else effective_end_time,
                 )
-            except NoAudioTrackError:
-                logger.info("Source has no audio track; trying visual-only planning")
-                transcription_result = TranscriptionResult(segments=[], full_text="", provider="no_audio")
-                transcription_status = "no_speech"
-            else:
-                if not transcription_result.segments:
+                except NoAudioTrackError:
+                    logger.info("Source has no audio track; trying visual-only planning")
+                    transcription_result = TranscriptionResult(segments=[], full_text="", provider="no_audio")
                     transcription_status = "no_speech"
-            finally:
-                self.transcription_service.progress_callback = previous_transcription_progress
-                self.transcription_service.detail_callback = None
+                else:
+                    if not transcription_result.segments:
+                        transcription_status = "no_speech"
+                finally:
+                    self.transcription_service.progress_callback = previous_transcription_progress
+                    self.transcription_service.detail_callback = None
             stage_timings["transcription"] = time.perf_counter() - stage_start
             logger.info(f"Transcription complete: {len(transcription_result.segments)} segments")
 
@@ -416,7 +521,19 @@ class AIClippingPipeline:
                 jev_enabled=jev_enabled,
                 clip_request=request.clip_request,
             )
-            clip_plan = await self.intelligence_planner.plan_clips(**planning_args)
+            clip_plan = await self.intelligence_planner.plan_clips(**planning_args) if request.workflow != 'captions-only' else None
+            if clip_plan is None:
+                # "Only add caption without clipping": the whole preferred range is
+                # the single output — no planner, no selection, no Jev.
+                start_ms = int((request.start_time_seconds or 0) * 1000)
+                end_ms = int((effective_end_time if effective_end_time is not None else video_duration) * 1000)
+                if end_ms - start_ms < 1000:
+                    raise ValueError('The video range is too short to caption')
+                from clip_engine.services.intelligence_planner import ClipPlanResponse
+                clip_plan = ClipPlanResponse(segments=[ClipPlanSegment(
+                    start_ms, end_ms, 1.0, summary='Captioned video')], total_clips=1)
+                stage_timings["planning"] = time.perf_counter() - stage_start
+                logger.info('Captions-only: one whole-range segment, planning skipped')
             edit_audit['planner'] = getattr(self.intelligence_planner, 'audit', {'requests': []})
             stage_timings["planning"] = time.perf_counter() - stage_start
             logger.info(f"Planned {len(clip_plan.segments)} clips")
@@ -458,7 +575,12 @@ class AIClippingPipeline:
             accepted = []
             limit = getattr(self.intelligence_planner, 'discovery_limit', None) or request.max_clips or self.settings.max_clips_absolute
             pending = clip_plan.segments
+            if request.workflow == 'captions-only':
+                # The single whole-range segment renders as planned.
+                accepted = list(pending)
             for discovery_pass in (1, 2):
+                if request.workflow == 'captions-only':
+                    break
                 for segment in pending:
                     i = len(edit_audit['candidates'])
                     self._update_progress(job_id, JobStatus.PLANNING, 35,
@@ -643,7 +765,7 @@ class AIClippingPipeline:
                         include_captions=request.include_captions and transcription_status == "available",
                         caption_style=request.caption_style,
                         title_text=segment.summary,
-                        include_title=request.include_title,
+                        include_title=request.include_title and request.workflow != 'captions-only',
                         emphasis_words=segment.emphasis_words,
                         banner_platform=request.banner_platform,
                         banner_channel_url=request.banner_channel_url,
@@ -660,7 +782,11 @@ class AIClippingPipeline:
                         coherence_reviewer=reviewer if jev_enabled else None,
                         # Jev reviews exact source intervals; otherwise keep the
                         # usual audio padding around each clip.
-                        apply_padding=not jev_enabled,
+                        apply_padding=not jev_enabled and request.workflow != 'captions-only',
+                        logo=request.logo,
+                        intro_path=(request.intro or {}).get('path'),
+                        outro_path=(request.outro or {}).get('path'),
+                        cta_badges=list(request.cta_badges or []),
                     )
 
                     render_result = await self.rendering_service.render_clip(render_request)
@@ -687,12 +813,39 @@ class AIClippingPipeline:
                         "shots": render_result.layout_shots,
                         "pacing_removed_ms": render_result.removed_ms,
                         "render_fallback": render_result.render_fallback,
+                        # Enough to rebuild this framing in the editor without
+                        # re-analyzing: shot times are relative to the window.
+                        "window_start_ms": render_result.window_start_ms,
+                        "source_width": render_result.used_plan.source_width if render_result.used_plan else 0,
+                        "source_height": render_result.used_plan.source_height if render_result.used_plan else 0,
                     })
                     logger.info(
                         f"Rendered clip {i + 1} ({render_result.layout_type}): "
                         f"{render_result.file_size_bytes / 1024 / 1024:.1f} MB"
                     )
                     clip_render_durations_seconds.append(time.perf_counter() - clip_start)
+
+                    # Extra formats for the same segment: reuse the primary's
+                    # analyzed plan and edit decisions, so no vision, pacing or
+                    # editorial call runs twice. A failed variant only loses
+                    # that variant, never the clip.
+                    for ratio in request.aspect_ratios[1:]:
+                        variant_path = os.path.join(clips_dir, f"clip_{i:02d}_{variant_suffix(ratio)}.mp4")
+                        try:
+                            variant_result = await self.rendering_service.render_clip(replace(
+                                render_request,
+                                output_path=variant_path,
+                                aspect_ratio=ratio,
+                                precomputed_plan=render_result.used_plan,
+                                precomputed_time_map=render_result.used_time_map,
+                                editorial_context=None,
+                                editorial_service=None,
+                                coherence_reviewer=None,
+                                debug_capture=False,
+                            ))
+                            segment.variants.append({"aspect_ratio": ratio, "path": variant_result.output_path})
+                        except Exception as error:
+                            logger.warning(f"Clip {i + 1}: {ratio} variant render failed, skipping it: {error}")
                     return (i, render_result.output_path, segment)
 
             render_tasks = [
@@ -848,6 +1001,21 @@ class AIClippingPipeline:
                         )
                         clip_upload_durations_seconds.append(time.perf_counter() - clip_start)
 
+                    variant_urls = []
+                    for variant in segment.variants:
+                        try:
+                            variant_upload = await self.s3_upload_service.upload_clip(
+                                local_path=variant["path"],
+                                job_id=job_id,
+                                clip_index=i,
+                                user_id=request.owner_user_id,
+                                metadata={"aspect_ratio": variant["aspect_ratio"], "start_time_ms": segment.start_time_ms,
+                                          "end_time_ms": segment.end_time_ms},
+                            )
+                            variant_urls.append({"aspect_ratio": variant["aspect_ratio"], "s3_url": variant_upload.s3_url})
+                        except Exception as error:
+                            logger.warning(f"Clip {i + 1}: {variant['aspect_ratio']} variant upload failed, skipping it: {error}")
+
                     return ClipArtifact(
                         clip_index=i,
                         s3_url=upload_result.s3_url,
@@ -862,6 +1030,7 @@ class AIClippingPipeline:
                         description=segment.description,
                         chapters=self._chapter_dicts(segment),
                         editorial=editorial_summary(segment.editorial),
+                        variants=variant_urls or None,
                     )
 
                 upload_tasks = [
@@ -959,6 +1128,7 @@ class AIClippingPipeline:
                     "planner_model": self.settings.planner_model,
                     "transcription_model": self.settings.transcription_model,
                     "aspect_ratio": request.aspect_ratio,
+                    "aspect_ratios": request.aspect_ratios,
                     "layout_style": request.layout_style,
                     "layout_vision_enabled": self.settings.layout_vision_enabled,
                     "pacing": request.pacing,
@@ -1170,21 +1340,19 @@ class AIClippingPipeline:
 
         for i, (clip_path, segment) in enumerate(rendered_clips):
             dest = os.path.join(output_dir, f"clip_{i:02d}.mp4")
-            # The work directory is removed after the job. Linking on the same
-            # filesystem keeps the saved clip without duplicating its bytes at
-            # the point when all rendered clips and the downloaded source are
-            # still present. Copy when the output folder is on another volume
-            # or its filesystem does not permit hard links.
-            try:
-                os.link(clip_path, dest)
-            except OSError as error:
-                if error.errno not in (errno.EXDEV, errno.EPERM, errno.EACCES,
-                                       getattr(errno, "ENOTSUP", errno.EPERM),
-                                       getattr(errno, "EOPNOTSUPP", errno.EPERM)):
-                    raise
-                shutil.copy2(clip_path, dest)
+            self._link_or_copy(clip_path, dest)
             file_size = os.path.getsize(dest)
             logger.info(f"Saved clip_{i:02d}.mp4 ({file_size / 1024 / 1024:.1f} MB): {dest}")
+
+            variant_urls = []
+            for variant in segment.variants:
+                variant_dest = os.path.join(output_dir, f"clip_{i:02d}_{variant_suffix(variant['aspect_ratio'])}.mp4")
+                try:
+                    self._link_or_copy(variant["path"], variant_dest)
+                except OSError as error:
+                    logger.warning(f"Clip {i + 1}: {variant['aspect_ratio']} variant could not be saved: {error}")
+                    continue
+                variant_urls.append({"aspect_ratio": variant["aspect_ratio"], "s3_url": f"file://{os.path.abspath(variant_dest)}"})
 
             subtitle_url = None
             if segment.subtitle_path and os.path.isfile(segment.subtitle_path):
@@ -1209,11 +1377,28 @@ class AIClippingPipeline:
                 chapters=self._chapter_dicts(segment),
                 subtitle_url=subtitle_url,
                 editorial=editorial_summary(segment.editorial),
+                variants=variant_urls or None,
             ))
 
             if progress: progress(i + 1, len(rendered_clips))
 
         return artifacts
+
+    @staticmethod
+    def _link_or_copy(src: str, dest: str) -> None:
+        """The work directory is removed after the job. Linking on the same
+        filesystem keeps the saved clip without duplicating its bytes at the
+        point when all rendered clips and the downloaded source are still
+        present. Copy when the output folder is on another volume or its
+        filesystem does not permit hard links."""
+        try:
+            os.link(src, dest)
+        except OSError as error:
+            if error.errno not in (errno.EXDEV, errno.EPERM, errno.EACCES,
+                                   getattr(errno, "ENOTSUP", errno.EPERM),
+                                   getattr(errno, "EOPNOTSUPP", errno.EPERM)):
+                raise
+            shutil.copy2(src, dest)
 
     @staticmethod
     def _chapter_dicts(segment: ClipPlanSegment) -> Optional[list[dict]]:

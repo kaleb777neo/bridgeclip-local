@@ -51,6 +51,8 @@ from clip_engine.services.layout_renderer import (
     banner_y,
     build_layout_graph,
     caption_anchor,
+    censor_intervals,
+    censor_transcript,
     face_zones,
     measured_loudness_filter,
     per_shot_expr,
@@ -102,6 +104,8 @@ class RenderRequest:
     caption_suppression_ranges_ms: list[tuple[int, int]] = field(default_factory=list)
     # Explicit editor placement overrides automatic per-layout caption anchors.
     caption_y: Optional[float] = None
+    # Horizontal caption center as a fraction of output width; None stays centered.
+    caption_x: Optional[float] = None
 
     title_text: Optional[str] = None
     # Off keeps title_text for editorial review but draws no title card.
@@ -115,7 +119,7 @@ class RenderRequest:
     include_audio: bool = True
     apply_padding: bool = True
     aspect_ratio: str = "9:16"
-    # Framing for 9:16 output: auto (smart per-shot), fill or fit.
+    # Framing for 9:16 / 1:1 output: auto (smart per-shot), fill or fit.
     layout_style: str = LayoutStyle.AUTO
     # tight: cut dead air and filler words; natural: original timing.
     pacing: str = Pacing.TIGHT
@@ -128,9 +132,46 @@ class RenderRequest:
     debug_capture: bool = False
     progress_callback: Optional[Callable[[str, Optional[float]], None]] = None
     manual_plan: Optional[ClipLayoutPlan] = None
+    # Multi-format variant renders: reuse the primary's analyzed plan and
+    # pacing time map (window-relative ms) so no vision or LLM call repeats.
+    precomputed_plan: Optional[ClipLayoutPlan] = None
+    precomputed_time_map: Optional[TimeMap] = field(default=None, repr=False)
     # Exact source-time selections from the manual editor; no automatic pacing,
     # sliver removal or protected-interval restoration may change these cuts.
     manual_ranges_ms: Optional[list[tuple[int, int]]] = None
+    # Manual editor bake layers. All optional; absent/empty leaves the render
+    # byte-identical to the graph these edits replace.
+    # {'path', 'position', 'scale' (of output width), 'opacity'} logo watermark,
+    # composited above the captions, title and banner.
+    logo: Optional[dict] = None
+    # Built-in CTA badges [{kind 'subscribe'|'follow', position, start_ms?, end_ms?}]
+    # in source time, drawn with Pillow and composited above the burned layers.
+    cta_badges: list[dict] = field(default_factory=list)
+    # Uploaded video prepended to the baked clip (re-encoded to match).
+    intro_path: Optional[str] = None
+    # User intro is prepended by _concat_intro; the outro is appended by _concat_outro.
+    outro_path: Optional[str] = None
+    # Background music {'path', 'gain' 0–1} mixed under the speech.
+    music: Optional[dict] = None
+    # Picture inserts [{path, start_ms, end_ms}] in source time.
+    brolls: list[dict] = field(default_factory=list)
+    # Timed text cards [{text, start_ms, end_ms, position}] in source time.
+    text_overlays: list[dict] = field(default_factory=list)
+    # Output level of the clip's own audio before any music mix.
+    audio_gain: float = 1.0
+    # Speech Enhancement (0 = off): FFT denoise amount and voice lift/clarity,
+    # applied to the speech before loudness normalization.
+    speech_denoise: float = 0.0
+    speech_enhance: float = 0.0
+    # Auto Censor: {'words': [...], 'captions': 'asterisk'|'first'|'off',
+    # 'audio': 'mute'|'bleep'|'off'} — masked captions, muted/bleeped speech.
+    censor: Optional[dict] = None
+    # AI voiceover bed: {'path', 'gain' 0–2, 'start_ms'} mixed under the
+    # speech, independent of audio_gain, on the pre-speed edited clock.
+    voiceover: Optional[dict] = None
+    # Range Effects [{id, kind, intensity, start_ms, end_ms, region?}] on the
+    # final-clock footage, before any overlay or caption.
+    range_edits: list[dict] = field(default_factory=list)
     editorial_context: Optional[dict] = None
     editorial_service: Optional[JevService] = field(default=None, repr=False)
     coherence_reviewer: Optional[CoherenceReviewer] = field(default=None, repr=False)
@@ -157,6 +198,96 @@ class RenderResult:
     output_width: int = 0
     output_height: int = 0
     framing_trace_path: Optional[str] = None
+    # Framing plan and time map actually used, so multi-format variant renders
+    # of the same segment can reuse them without new vision or LLM cost.
+    used_plan: Optional[ClipLayoutPlan] = field(default=None, repr=False)
+    used_time_map: Optional[TimeMap] = field(default=None, repr=False)
+    # Source time the layout shots' window-relative times start from, so an
+    # editor import can map them back onto the original video.
+    window_start_ms: int = 0
+
+
+PREVIEW_TOLERANCE_MS = 2000
+
+
+def preview_duration_ok(path, expected_ms, tolerance_ms=PREVIEW_TOLERANCE_MS) -> bool:
+    """True when ffprobe reads a duration within `tolerance_ms` of the intended transcode length.
+
+    A transcode interrupted mid-run leaves a truncated file; its probed duration falls
+    short (or the probe fails outright), so this gates the partial→final rename and the
+    reuse of any pre-existing preview.
+    """
+    try:
+        result = run_media(["ffprobe", "-v", "error", *MEDIA_INPUT_OPTIONS, "-show_entries", "format=duration",
+                            "-of", "csv=p=0", str(path)], timeout=PROBE_TIMEOUT_SECONDS)
+        duration_ms = float(result.stdout.decode(errors="replace").strip()) * 1000
+    except Exception as error:
+        logger.warning(f"Preview duration probe failed: {type(error).__name__}")
+        return False
+    return math.isfinite(duration_ms) and abs(duration_ms - float(expected_ms)) <= tolerance_ms
+
+
+# The 12 animated Lower Third presets (Name Tag / Location), mirrored by
+# lowerThirdPresets in src/shared/clip-editor.ts. Rendered as layered ASS
+# events: text-extent boxes (BorderStyle=3), full-width band drawings (\p1)
+# and accent strips, all sharing one entrance animation per preset.
+LOWER_THIRDS = {
+    #                  anim   box       band   edge     upper  size  bg        fg        accent    sub
+    'name-classic':  dict(anim='rise',  box='fill',    band=False, edge=None,    upper=False, size=.052, bg='#14161c', fg='#ffffff', accent='#1a5fdf', sub=True),
+    'name-accent':   dict(anim='fade',  box=None,      band=False, edge='under', upper=False, size=.056, bg='#1a5fdf', fg='#ffffff', accent='#1a5fdf', sub=False),
+    'name-side':     dict(anim='slide', box='fill',    band=False, edge='left',  upper=False, size=.052, bg='#14161c', fg='#ffffff', accent='#7c3aed', sub=True),
+    'name-two-line': dict(anim='rise',  box='fill',    band=False, edge=None,    upper=False, size=.050, bg='#14161c', fg='#ffffff', accent='#0e7a5f', sub=True),
+    'name-clean':    dict(anim='fade',  box=None,      band=False, edge=None,    upper=False, size=.058, bg='#14161c', fg='#ffffff', accent='#1a5fdf', sub=False),
+    'name-card':     dict(anim='pop',   box='fill',    band=False, edge='under', upper=False, size=.052, bg='#1c1e26', fg='#ffffff', accent='#1a5fdf', sub=True),
+    'loc-pill':      dict(anim='pop',   box='fill',    band=False, edge=None,    upper=True,  size=.046, bg='#b3261e', fg='#ffffff', accent='#b3261e', sub=False),
+    'loc-ticker':    dict(anim='slide', box=None,      band=True,  edge=None,    upper=True,  size=.044, bg='#111827', fg='#ffffff', accent='#1a5fdf', sub=False),
+    'loc-pin':       dict(anim='fade',  box='fill',    band=False, edge=None,    upper=True,  size=.048, bg='#c2410c', fg='#ffffff', accent='#c2410c', sub=False),
+    'loc-banner':    dict(anim='rise',  box=None,      band=True,  edge=None,    upper=True,  size=.052, bg='#0f172a', fg='#ffffff', accent='#f59e0b', sub=True),
+    'loc-frame':     dict(anim='fade',  box='fill',    band=False, edge=None,    upper=True,  size=.050, bg='#e5e7eb', fg='#111318', accent='#e5e7eb', sub=False),
+    'loc-spotlight': dict(anim='fade',  box=None,      band=True,  edge=None,    upper=True,  size=.048, bg='#050608', fg='#ffffff', accent='#1a5fdf', sub=False),
+}
+LOWER_THIRD_IDS = frozenset(LOWER_THIRDS)
+
+
+def ass_color(hex_color: str, alpha: int = 0) -> str:
+    """#rrggbb as an ASS style colour &HAABBGGRR (00 = opaque)."""
+    value = hex_color.lstrip('#')
+    red, green, blue = value[0:2], value[2:4], value[4:6]
+    return f'&H{alpha:02X}{blue}{green}{red}'.upper()
+
+
+TEXT_BOX_FONT_FILES = {
+    'montserrat': 'Montserrat-Black.ttf',
+    'poppins': 'Poppins-Black.ttf',
+    'archivo': 'ArchivoBlack-Regular.ttf',
+    'instrument': 'InstrumentSerif-Italic.ttf',
+    'jakarta': 'PlusJakartaSans.ttf'
+}
+
+
+def _resolve_box_font(font_family: str):
+    from PIL import ImageFont
+    name = TEXT_BOX_FONT_FILES.get(font_family, TEXT_BOX_FONT_FILES['montserrat'])
+    return os.path.join(os.path.dirname(__file__), '..', '..', 'assets', 'fonts', name)
+
+
+def _wrap_box_lines(draw, text, font, max_width):
+    words, lines, current = text.split(), [], ''
+    for word in words:
+        candidate = f'{current} {word}'.strip()
+        if draw.textlength(candidate, font=font) <= max_width or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines or ['']
+
+
+def _hex_rgba(color: str, alpha: int = 255):
+    value = color.lstrip('#')
+    return (int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16), alpha)
 
 
 class RenderingService:
@@ -242,8 +373,14 @@ class RenderingService:
         return ["-c:v", "libx264", "-preset", self.settings.ffmpeg_preset,
                 "-crf", str(self.settings.ffmpeg_crf), *gop]
 
-    async def capture_framing_source(self, video_path: str, output_path: str, *, progress=None, duration_ms=None) -> None:
-        """One uncropped preview per captured run, on the original source clock."""
+    async def capture_framing_source(self, video_path: str, output_path: str, *, progress=None, duration_ms=None,
+                                     start_ms=None, end_ms=None) -> None:
+        """One uncropped preview per captured run, on the original source clock.
+
+        A fast per-reel import passes `start_ms`/`end_ms` to transcode only that
+        window; the caller then records the offset (the output timeline restarts
+        at 0) so seeks stay on the source clock.
+        """
         width, height = await self._get_video_dimensions(video_path)
         scale = min(1, 1280 / width, 720 / height)
         out_w, out_h = max(2, int(width * scale / 2) * 2), max(2, int(height * scale / 2) * 2)
@@ -256,10 +393,27 @@ class RenderingService:
             codec[codec.index("-b:v") + 1] = f"{mbps:g}M"
         else:
             codec += ["-maxrate", f"{mbps:g}M", "-bufsize", f"{2 * mbps:g}M"]
+        window = []
+        if start_ms is not None or end_ms is not None:
+            if start_ms is None or end_ms is None:
+                raise ValueError('Preview window needs both start and end')
+            a, b = float(start_ms), float(end_ms)
+            if not (math.isfinite(a) and math.isfinite(b)) or a < 0 or b - a < 100:
+                raise ValueError('Invalid preview window')
+            # Input options, like the export path: seek before -i and bound the
+            # source read, instead of decoding and discarding the whole file.
+            window = ["-accurate_seek", "-ss", f"{a / 1000:.6f}", "-t", f"{(b - a) / 1000:.6f}"]
+            duration_ms = b - a  # Progress percent covers only the transcoded window.
         temporary = output_path + ".partial.mp4"
+        # The intended final length: the window for a fast per-reel preview, the
+        # caller's source duration otherwise, or the probed source when unknown.
+        expected_ms = duration_ms if duration_ms is not None else (await self._probe_duration_ms(video_path) or None)
         try:
+            if os.path.isfile(temporary):
+                # Left by an interrupted run: FFmpeg's -n would refuse to start over it.
+                os.remove(temporary)
             cmd = [
-                "ffmpeg", "-nostdin", "-v", "error", "-n", *MEDIA_INPUT_OPTIONS, "-i", video_path,
+                "ffmpeg", "-nostdin", "-v", "error", "-n", *window, *MEDIA_INPUT_OPTIONS, "-i", video_path,
                 "-map", "0:v:0", "-map", "0:a:0?", "-vf",
                 f"scale={out_w}:{out_h},setsar=1",
                 "-fps_mode", "passthrough", "-enc_time_base", "1:1000000",
@@ -270,6 +424,11 @@ class RenderingService:
                 await self._run_cmd(cmd)
             else:
                 await self._run_cmd(cmd, progress=progress, duration_ms=duration_ms)
+            # Complete only when FFmpeg exited 0 and the file probes to the intended length:
+            # a truncated transcode must never become the final preview.
+            if expected_ms is not None and not await asyncio.to_thread(
+                    preview_duration_ok, temporary, expected_ms):
+                raise RenderingError("Editor preview transcode is incomplete")
             os.chmod(temporary, 0o600)
             os.replace(temporary, output_path)
         finally:
@@ -309,6 +468,7 @@ class RenderingService:
 
         9:16 (vertical): Smart framing per shot (see LayoutAnalyzer), or the
             blurred-background letterbox for the "fit" style / as a fallback.
+        1:1 (square): The same smart-framing path on a square canvas.
         16:9 (landscape): Whole frame at the source's resolution (1080p-4K)
             and frame rate, over a blurred fill when the source isn't 16:9.
         """
@@ -352,6 +512,8 @@ class RenderingService:
         plan: Optional[ClipLayoutPlan] = None
         if request.manual_plan is not None:
             plan = request.manual_plan
+        elif request.precomputed_plan is not None:
+            plan = request.precomputed_plan
         elif not is_landscape:
             plan = await self._plan_layout(request, source_w, source_h, window_start_ms, window_ms)
         analyzed = plan is not None
@@ -378,6 +540,11 @@ class RenderingService:
                 raise RenderingError('Manual rendering requires valid selected intervals')
             time_map = TimeMap([(a - window_start_ms, b - window_start_ms) for a, b in ranges], window_ms)
             natural_map = time_map
+        elif request.precomputed_time_map is not None:
+            if request.precomputed_time_map.window_ms != window_ms:
+                raise RenderingError('Precomputed time map does not match the render window')
+            time_map = request.precomputed_time_map
+            natural_map = time_map
         else:
             skips = self._window_skips(request, window_start_ms, window_ms)
             keeps = self._keep_intervals(request, pacing_plan, window_start_ms, window_ms)
@@ -396,7 +563,9 @@ class RenderingService:
                     window_start_ms, window_ms, request.editorial_context, pacing_plan)
                 natural_map = TimeMap([(0, window_ms)], window_ms)
         smart = analyzed and not plan.is_letterbox_only
-        vision_cost = plan.vision_cost_usd if analyzed else 0.0
+        # Variant renders reuse the primary's plan; its vision cost was booked
+        # with the primary, so variants report zero.
+        vision_cost = 0.0 if request.precomputed_plan is not None else (plan.vision_cost_usd if analyzed else 0.0)
 
         # Longform audio gets two-pass (linear) loudness normalization.
         loudness_filter = None
@@ -449,6 +618,13 @@ class RenderingService:
 
         file_size = os.path.getsize(request.output_path)
         removed_ms = time_map.removed_ms
+        final_duration_ms = scaled_duration_ms(time_map.output_ms, request.video_speed)
+        if request.intro_path or request.outro_path:
+            # The intro/outro were concatenated onto the finished file inside
+            # _render_edit; report the real post-concat duration.
+            probed = await self._probe_duration_ms(request.output_path)
+            if probed:
+                final_duration_ms = probed
         chapters = self._output_chapters(request, window_start_ms, time_map)
         subtitle_path = await self._write_subtitles(request, window_start_ms, time_map)
         if request.editorial_context is not None:
@@ -476,7 +652,7 @@ class RenderingService:
         return RenderResult(
             output_path=request.output_path,
             file_size_bytes=file_size,
-            duration_ms=scaled_duration_ms(time_map.output_ms, request.video_speed),
+            duration_ms=final_duration_ms,
             removed_ms=removed_ms,
             layout_type=plan.dominant_layout if smart else "fit",
             layout_shots=[shot.summary() for shot in plan.shots] if analyzed else [],
@@ -488,6 +664,9 @@ class RenderingService:
             output_width=target_width,
             output_height=target_height,
             framing_trace_path=trace_path,
+            used_plan=plan,
+            used_time_map=time_map,
+            window_start_ms=window_start_ms,
         )
 
     @staticmethod
@@ -536,6 +715,12 @@ class RenderingService:
             logger.warning(f"Subtitle sidecar failed; the clip is unaffected: {e}")
             return None
 
+    # Input options for extra filter-graph inputs.
+    LOOP_IMAGE = ['-loop', '1', '-protocol_whitelist', 'file,pipe,fd']
+    PLAIN_FILE = ['-protocol_whitelist', 'file,pipe,fd']
+    LOOP_AUDIO = ['-stream_loop', '-1', '-protocol_whitelist', 'file,pipe,fd']
+    IMAGE_EXTENSIONS = frozenset({'png', 'jpg', 'jpeg', 'webp', 'bmp', 'tif', 'tiff', 'avif'})
+
     async def _render_edit(
         self,
         request: RenderRequest,
@@ -551,22 +736,65 @@ class RenderingService:
     ) -> None:
         """Build the graph, captions and overlays for one edit and run FFmpeg."""
         has_audio = request.include_audio and await self._has_audio(request.video_path)
+        out_plan = remap_plan(plan, time_map)
+        overlays = self._overlays(request, out_plan, target_width, target_height, is_landscape, time_map, window_start_ms)
+        # Extra input order: generated overlay PNGs (title, banner, brand), b-rolls, music, voiceover.
+        brolls = list(request.brolls or [])
+        music = request.music if has_audio and request.music and request.music.get('gain', 1) > 0 else None
+        voiceover = request.voiceover if has_audio and request.voiceover and request.voiceover.get('path') else None
+        music_index = 1 + len(overlays) + len(brolls) if music else None
+        voiceover_index = (music_index + 1 if music_index is not None else 1 + len(overlays) + len(brolls)) if voiceover else None
+        # Auto Censor audio: output-time word intervals on the same clock the
+        # captions use; the bleep needs actual spans, so silence stays silence.
+        censor_mutes, censor_bleep = None, False
+        censor = request.censor if has_audio else None
+        if censor and censor.get('audio', 'off') != 'off' and request.transcript_segments:
+            censor_mutes = censor_intervals(
+                remap_segments(request.transcript_segments, window_start_ms, time_map),
+                censor.get('words', []))
+            censor_bleep = censor.get('audio') == 'bleep' and bool(censor_mutes)
+            if not censor_mutes:
+                censor_mutes = None
         graph = build_layout_graph(
             plan, target_width, target_height, time_map.keeps, has_audio, landscape=is_landscape,
             fps=fps, loudness_filter=loudness_filter,
             video_speed=request.video_speed,
+            audio_gain=request.audio_gain, music_index=music_index,
+            speech_denoise=request.speech_denoise, speech_enhance=request.speech_enhance,
+            music_gain=music['gain'] if music else 1.0,
+            music_fade_in_ms=music.get('fade_in_ms', 0) if music else 0,
+            music_fade_out_ms=music.get('fade_out_ms', 0) if music else 0,
+            music_start_ms=music.get('start_ms', 0) if music else 0,
+            censor_mutes=censor_mutes, censor_bleep=censor_bleep,
+            voiceover_index=voiceover_index,
+            voiceover_gain=voiceover.get('gain', 1) if voiceover else 1.0,
+            voiceover_start_ms=voiceover.get('start_ms', 0) if voiceover else 0,
         )
-        out_plan = remap_plan(plan, time_map)
         caption_path = await self._generate_captions(
             request, target_width, target_height, window_start_ms, time_map, out_plan, is_landscape, plan,
         )
         graph += self._caption_graph(caption_path, request.caption_suppression_ranges_ms, window_start_ms, time_map)
-        overlays = self._overlays(request, out_plan, target_width, target_height, is_landscape)
         # Burn captions and animate framing/overlays on the edited source clock,
         # then speed up the entire composited picture to match the tempo audio.
-        filter_complex, extra_inputs = self._compose_overlays(
+        # Editor b-rolls and text cards land on the final (sped-up) clock so
+        # their timing is exact; they end at [out].
+        baking = bool(brolls or request.text_overlays)
+        filter_complex, png_paths = self._compose_overlays(
             graph, overlays, speed_video_filter(request.video_speed, fps),
+            output_label='pre_bake' if baking else 'out',
         )
+        extra_inputs: list = [(path, self.LOOP_IMAGE) for path in png_paths]
+        if baking:
+            stage, stage_inputs = self._bake_stage(
+                request, brolls, time_map, window_start_ms, target_width, target_height, fps,
+                first_index=1 + len(overlays),
+            )
+            filter_complex += stage
+            extra_inputs += stage_inputs
+        if music:
+            extra_inputs.append((music['path'], self.LOOP_AUDIO))
+        if voiceover:
+            extra_inputs.append((voiceover['path'], self.PLAIN_FILE))
 
         try:
             await self._run_ffmpeg_complex(
@@ -583,7 +811,9 @@ class RenderingService:
                 **({'progress': lambda percent: request.progress_callback('Rendering video', percent)} if request.progress_callback else {}),
             )
         finally:
-            for path in extra_inputs:
+            # Only generated rasters are disposable; logo/b-roll/music/intro
+            # files are user assets owned by main.
+            for path in png_paths:
                 try:
                     os.remove(path)
                 except OSError:
@@ -591,6 +821,628 @@ class RenderingService:
 
         if not os.path.isfile(request.output_path):
             raise RenderingError("Render failed: output file not created")
+        if request.intro_path:
+            await self._concat_intro(request, target_width, target_height, fps, has_audio)
+        if request.outro_path:
+            await self._concat_outro(request, target_width, target_height, fps, has_audio)
+
+    # Brand overlays sit this many output pixels from the frame edge.
+    BRAND_MARGIN_PX = 34
+    # Shared x/y expressions per corner; W/H resolve against the composited frame.
+    BRAND_POSITIONS = {
+        'top-left': (str(BRAND_MARGIN_PX), str(BRAND_MARGIN_PX)),
+        'top-right': (f'W-w-{BRAND_MARGIN_PX}', str(BRAND_MARGIN_PX)),
+        'bottom-left': (str(BRAND_MARGIN_PX), f'H-h-{BRAND_MARGIN_PX}'),
+        'bottom-right': (f'W-w-{BRAND_MARGIN_PX}', f'H-h-{BRAND_MARGIN_PX}'),
+        'center': ('(W-w)/2', '(H-h)/2'),
+    }
+
+    @classmethod
+    def _brand_positions(cls, margin_px: int) -> dict:
+        """Corner positions at a custom inset, for safe-zone brand placement."""
+        m = str(margin_px)
+        return {
+            'top-left': (m, m),
+            'top-right': (f'W-w-{m}', m),
+            'bottom-left': (m, f'H-h-{m}'),
+            'bottom-right': (f'W-w-{m}', f'H-h-{m}'),
+            'center': ('(W-w)/2', '(H-h)/2'),
+        }
+
+    @classmethod
+    def _brand_margin_px(cls, margin, target_width: int) -> int:
+        """An overlay's safe-zone inset (fraction of output width) in pixels."""
+        if isinstance(margin, (int, float)) and not isinstance(margin, bool) and 0 <= margin <= 0.5:
+            return max(8, round(target_width * margin))
+        return cls.BRAND_MARGIN_PX
+
+    def _brand_overlays(self, request: RenderRequest, target_width: int, target_height: int,
+                        time_map: TimeMap, window_start_ms: int, font_size: int) -> list[Overlay]:
+        """Logo watermark and CTA badges, appended after title/banner so they sit on top.
+
+        The enable expressions of timed badges run on the edited (pre-speed)
+        clock, the same one the overlay chain composites on.
+        """
+        overlays: list[Overlay] = []
+        logo = request.logo if request.logo and request.logo.get('path') else None
+        if logo:
+            path = self._logo_overlay_image(logo['path'], request, target_width)
+            positions = self._brand_positions(self._brand_margin_px(logo.get('margin'), target_width))
+            x, y = positions.get(logo.get('position'), positions['top-left'])
+            try:
+                width = max(2, round(target_width * float(logo['scale'])))
+            except (KeyError, TypeError, ValueError):
+                width = max(2, round(target_width * 0.1))
+            chain = f'scale=w={width}:h=-2:flags=lanczos'
+            opacity = logo.get('opacity', 1)
+            if isinstance(opacity, (int, float)) and opacity < 1:
+                chain += f',format=rgba,colorchannelmixer=aa={max(.1, float(opacity)):.3g}'
+            overlays.append((path, x, y, '1', chain))
+        for i, badge in enumerate(request.cta_badges or []):
+            kind = badge.get('kind')
+            if kind not in ('subscribe', 'follow'):
+                continue
+            spans = []
+            if badge.get('start_ms') is not None:
+                spans = self._mapped_spans(badge['start_ms'], badge['end_ms'], window_start_ms, time_map, 1.0)
+                if not spans:
+                    continue  # The whole interval was cut; draw nothing and consume no input.
+            path = self._badge_overlay_image(kind, font_size, os.path.join(
+                os.path.dirname(request.output_path),
+                f'badge-{kind}-{i}-{request.start_time_ms}-{request.end_time_ms}.png',
+            ))
+            x, y = self._brand_positions(self._brand_margin_px(badge.get('margin'), target_width)).get(
+                badge.get('position'), self.BRAND_POSITIONS['bottom-right'])
+            if spans:
+                enable = '+'.join(f'between(t,{s:.3f},{e:.3f})' for s, e in spans)
+                overlays.append((path, x, y, enable, 'null'))
+            else:
+                overlays.append((path, x, y))
+        return overlays
+
+    def _logo_overlay_image(self, source: str, request: RenderRequest, target_width: int) -> str:
+        """Normalize a user logo to a PNG we can blend.
+
+        Always regenerated: the overlay chain deletes its rasters after FFmpeg
+        runs, and a JPEG or palette PNG has no alpha to fade, which the opacity
+        slider needs. The user's asset in the run folder is never touched.
+        """
+        path = os.path.join(
+            os.path.dirname(request.output_path),
+            f"logo-{request.start_time_ms}-{request.end_time_ms}.png",
+        )
+        try:
+            with Image.open(source) as image:
+                image.convert('RGBA').save(path, 'PNG')
+        except Exception as error:
+            raise RenderingError('The logo image could not be read') from error
+        return path
+
+    CTA_BADGE_LABELS = {'subscribe': 'SUBSCRIBE', 'follow': 'FOLLOW'}
+    # YouTube red and the Instagram purple→orange gradient, as (from, to) corners.
+    CTA_BADGE_COLORS = {'subscribe': ((255, 0, 0, 255), (224, 0, 0, 255)),
+                        'follow': ((131, 58, 180, 255), (252, 170, 56, 255))}
+
+    def _badge_overlay_image(self, kind: str, font_size: int, path: str) -> str:
+        """Draw a SUBSCRIBE / FOLLOW badge as a transparent PNG.
+
+        Pillow like the channel banner: the bundled static FFmpeg has no
+        drawtext, so text filters fail there.
+        """
+        text = self.CTA_BADGE_LABELS[kind]
+        try:
+            font = ImageFont.truetype(self._font_path, font_size)
+        except Exception:
+            font = ImageFont.load_default()
+        bbox = ImageDraw.Draw(Image.new('RGBA', (1, 1))).textbbox((0, 0), text, font=font)
+        text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        pad_x, pad_y = round(font_size * .55), round(font_size * .35)
+        width, height = text_w + pad_x * 2, text_h + pad_y * 2
+        first, last = self.CTA_BADGE_COLORS[kind]
+        badge = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+        gradient = Image.new('RGB', (width, height))
+        gradient_draw = ImageDraw.Draw(gradient)
+        for x in range(width):
+            stop = x / max(1, width - 1)
+            gradient_draw.line((x, 0, x, height), fill=tuple(
+                round(a + (b - a) * stop) for a, b in zip(first[:3], last[:3])))
+        mask = Image.new('L', (width, height), 0)
+        ImageDraw.Draw(mask).rounded_rectangle([(0, 0), (width - 1, height - 1)], radius=height // 2, fill=255)
+        badge.paste(gradient, (0, 0), mask)
+        draw = ImageDraw.Draw(badge)
+        origin = ((width - text_w) // 2 - bbox[0], (height - text_h) // 2 - bbox[1])
+        draw.text((origin[0] + 2, origin[1] + 2), text, font=font, fill=(0, 0, 0, 96))
+        draw.text(origin, text, font=font, fill=(255, 255, 255, 255))
+        badge.save(path, 'PNG')
+        return path
+
+    def _mapped_spans(self, start_ms: int, end_ms: int, window_start_ms: int, time_map: TimeMap, speed: float):
+        """A source-time interval as final-clock second spans; [] if fully cut.
+
+        The same mapping caption suppression uses: source → kept-output time
+        (each user cut shifts and shortens the interval), then ÷ video_speed
+        because this stage runs after the speed filter.
+        """
+        a, b = start_ms - window_start_ms, end_ms - window_start_ms
+        spans = []
+        offset = 0
+        for ks, ke in time_map.keeps:
+            s, e = max(a, ks), min(b, ke)
+            if e > s:
+                spans.append(((offset + s - ks) / 1000 / speed, (offset + e - ks) / 1000 / speed))
+            offset += ke - ks
+        return spans
+
+    def _bake_stage(self, request: RenderRequest, brolls: list, time_map: TimeMap, window_start_ms: int,
+                    out_w: int, out_h: int, fps: str, first_index: int) -> tuple[str, list]:
+        """B-roll inserts and timed text cards over the sped-up picture.
+
+        Consumes [pre_bake] and emits [out]; enable expressions and ASS events
+        run on the final output clock. Returns the graph suffix and its extra
+        inputs (path, input options).
+        """
+        parts: list[str] = []
+        specs: list = []
+        cur = '[pre_bake]'
+        index = first_index
+        # Range Effects land on the footage before any overlay, on the final clock.
+        for effect in getattr(request, 'range_edits', None) or []:
+            spans = self._mapped_spans(effect['start_ms'], effect['end_ms'], window_start_ms, time_map,
+                                       request.video_speed)
+            if not spans:
+                continue
+            enable = '+'.join(f'between(t,{s:.3f},{e:.3f})' for s, e in spans)
+            cur = self._range_edit_chain(cur, effect, enable, index)
+            index += 1
+        for roll in brolls:
+            spans = self._mapped_spans(roll['start_ms'], roll['end_ms'], window_start_ms, time_map,
+                                       request.video_speed)
+            if not spans:
+                specs.append((roll['path'], self.LOOP_IMAGE if self._is_image_asset(roll['path']) else self.PLAIN_FILE))
+                index += 1
+                continue  # The interval was cut; the input keeps its index.
+            enable = '+'.join(f'gte(t,{s:.3f})*lt(t,{e:.3f})' for s, e in spans)
+            fit = f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h},setsar=1"
+            is_image = self._is_image_asset(roll['path'])
+            if is_image:
+                full, placement = fit, ""
+            else:
+                # A video insert plays from its own start inside the first
+                # span; its audio is simply not mapped (muted).
+                full = f"{fit},fps={fps},setpts=PTS-STARTPTS+{spans[0][0]:.3f}/TB"
+                placement = ":repeatlast=0"
+            specs.append((roll['path'], self.LOOP_IMAGE if is_image else self.PLAIN_FILE))
+            layout = roll.get('layout') if roll.get('layout') in ('pip', 'split') else 'fill'
+            if layout == 'split' and out_h <= out_w:
+                layout = 'fill'  # Split stacks vertically; landscape keeps fill.
+            if layout == 'pip':
+                # The B-roll plays behind while the speaker shrinks into a
+                # corner window: two overlays over a split of the footage.
+                win_w, win_h = round(out_w * .38 / 2) * 2, round(out_h * .30 / 2) * 2
+                margin = round(out_w * .04)
+                speaker = f"scale={win_w}:{win_h}:force_original_aspect_ratio=increase,crop={win_w}:{win_h},setsar=1"
+                parts.append(f";{cur}split=2[spkbase{index}][spksrc{index}]")
+                parts.append(f";[{index}:v]{full}[broll{index}]")
+                parts.append(f";[spkbase{index}][broll{index}]overlay=0:0{placement}:enable='{enable}'[pipbg{index}]")
+                parts.append(f";[spksrc{index}]{speaker}[spkwin{index}]")
+                parts.append(f";[pipbg{index}][spkwin{index}]overlay={out_w - win_w - margin}:{out_h - win_h - round(margin * 1.6)}:enable='{enable}'[baked{index}]")
+            elif layout == 'split':
+                # Speaker and B-roll stack top/bottom; swap flips the stack.
+                swap = bool(roll.get('swap'))
+                half_h = round(out_h / 4) * 2
+                half = f"scale={out_w}:{half_h}:force_original_aspect_ratio=increase,crop={out_w}:{half_h},setsar=1"
+                half_broll = half if is_image else f"{half},fps={fps},setpts=PTS-STARTPTS+{spans[0][0]:.3f}/TB"
+                parts.append(f";{cur}split=2[spkbase{index}][spksrc{index}]")
+                parts.append(f";[spksrc{index}]{half}[spkhalf{index}]")
+                parts.append(f";[{index}:v]{half_broll}[brollhalf{index}]")
+                top, bottom = (f"brollhalf{index}", f"spkhalf{index}") if swap else (f"spkhalf{index}", f"brollhalf{index}")
+                parts.append(f";[spkbase{index}][{top}]overlay=0:0:enable='{enable}'[splittop{index}]")
+                parts.append(f";[splittop{index}][{bottom}]overlay=0:{half_h}:enable='{enable}'[baked{index}]")
+            else:
+                parts.append(f";[{index}:v]{full}[broll{index}]")
+                parts.append(f";{cur}[broll{index}]overlay=0:0{placement}:enable='{enable}'[baked{index}]")
+            cur = f'[baked{index}]'
+            index += 1
+        styled_boxes: list[tuple[dict, list]] = []
+        for box in request.text_overlays or []:
+            if not box.get('style'):
+                continue
+            spans = self._mapped_spans(box['start_ms'], box['end_ms'], window_start_ms, time_map,
+                                       request.video_speed)
+            if not spans:
+                continue
+            card_path = os.path.join(os.path.dirname(request.output_path),
+                                     f"text-box-{len(styled_boxes)}-{box['start_ms']}.png")
+            card = self._build_text_box_card(box, out_w, out_h, card_path)
+            styled_boxes.append((box, [card, spans]))
+        if styled_boxes:
+            stacks: dict = {}
+            for box, (card, spans) in styled_boxes:
+                position = box.get('position') or 'bottom-left'
+                stack = stacks.get(position, 0)
+                stacks[position] = stack + 1
+                x, y = self._text_box_anchor(position, out_w, out_h, card['width'], card['height'], stack)
+                enable = '+'.join(f'between(t,{s:.3f},{e:.3f})' for s, e in spans)
+                specs.append((card['path'], self.LOOP_IMAGE))
+                parts.append(f";{cur}[{index}:v]overlay={x}:{y}:enable='{enable}'[baked{index}]")
+                cur = f'[baked{index}]'
+                index += 1
+        if request.text_overlays:
+            # 'image'-variant Lower Thirds: the user's picture becomes the band
+            # behind the text, drawn before the ASS text (which skips its rect).
+            for item in request.text_overlays:
+                if not (item.get('preset') and item.get('variant') == 'image' and item.get('image')):
+                    continue
+                band = self.lower_third_band(item['preset'], item.get('position', 'bottom-left'), out_w, out_h)
+                spans = self._mapped_spans(item['start_ms'], item['end_ms'], window_start_ms, time_map,
+                                           request.video_speed)
+                if not band or not spans:
+                    continue
+                enable = '+'.join(f'gte(t,{s:.3f})*lt(t,{e:.3f})' for s, e in spans)
+                specs.append((item['image'], self.LOOP_IMAGE))
+                strip = (f"scale={out_w}:{band[1]}:force_original_aspect_ratio=increase,"
+                         f"crop={out_w}:{band[1]},colorchannelmixer=aa=.88")
+                parts.append(f";[{index}:v]{strip}[ltband{index}]")
+                parts.append(f";{cur}[ltband{index}]overlay=0:{band[0]}:enable='{enable}'[baked{index}]")
+                cur = f'[baked{index}]'
+                index += 1
+            ass_path = self._text_overlay_ass(request, out_w, out_h, time_map, window_start_ms)
+            parts.append(f";{cur}{self._caption_filter(ass_path)}[baked_text]")
+            cur = '[baked_text]'
+        parts.append(f";{cur}null[out]")
+        return ''.join(parts), specs
+
+    @classmethod
+    @staticmethod
+    def _range_edit_chain(cur: str, effect: dict, enable: str, index: int) -> str:
+        """One Range Effect as graph parts; consumes `cur`, emits [rge{index}].
+
+        Color filters carry the timeline `enable` themselves; the region blur
+        crops the region, blurs it, and overlays it back while enabled.
+        """
+        kind, intensity = effect['kind'], effect['intensity']
+        out = f'rge{index}'
+        if kind == 'blur':
+            x, y, w, h = effect.get('region') or (0.0, 0.0, 1.0, 1.0)
+            return (''.join([
+                f';{cur}split=2[rgebase{index}][rgesrc{index}]',
+                f';[rgesrc{index}]crop=iw*{w:.4f}:ih*{h:.4f}:iw*{x:.4f}:ih*{y:.4f},gblur=sigma={6 + 18 * intensity:.1f}[rgeblur{index}]',
+                f";[rgebase{index}][rgeblur{index}]overlay=iw*{x:.4f}:ih*{y:.4f}:enable='{enable}'[{out}]"
+            ]))
+        if kind == 'warm':
+            filters = (f'colorbalance=rs={.28 * intensity:.3f}:bs={-.28 * intensity:.3f},'
+                       f'hue=s={1 + .25 * intensity:.3f}')
+        elif kind == 'cool':
+            filters = (f'colorbalance=rs={-.22 * intensity:.3f}:bs={.28 * intensity:.3f},'
+                       f'hue=s={1 + .15 * intensity:.3f}')
+        elif kind == 'cinematic':
+            # An S-curve for contrast (the LGPL way; `eq` is GPL-only), plus muted colors.
+            filters = (f"curves=all='0/0 {0.5 - .05 * intensity:.3f}/{0.5 - .08 * intensity:.3f} 1/1',"
+                       f'hue=s={1 - .18 * intensity:.3f}')
+        elif kind == 'bw':
+            filters = f'hue=s={max(0.0, 1 - intensity):.3f}'
+        elif kind == 'sharpen':
+            filters = f'unsharp=5:5:{.4 + 1.6 * intensity:.2f}:5:5:0'
+        else:  # soften
+            filters = f'gblur=sigma={1 + 5 * intensity:.2f}'
+        return f";{cur}{filters}:enable='{enable}'[{out}]"
+
+    @classmethod
+    def _is_image_asset(cls, path: str) -> bool:
+        return os.path.splitext(path)[1].lower().lstrip('.') in cls.IMAGE_EXTENSIONS
+
+    @staticmethod
+    def lower_third_band(preset: str, position: str, out_w: int, out_h: int):
+        """Full-width band rect (y, height) for band presets; None otherwise.
+
+        Shared by the ASS drawings and the 'image' variant's overlay input in
+        the bake graph, so the picture band and the text sit on one strip.
+        """
+        spec = LOWER_THIRDS.get(preset)
+        if not spec or not spec['band']:
+            return None
+        height = max(48, round(out_h * (.15 if spec['sub'] else .12)))
+        if position in ('top-left', 'top-right'):
+            y = round(out_h * .07)
+        elif position == 'center':
+            y = round(out_h * .60)
+        else:
+            y = out_h - height - round(out_h * .07)
+        return y, height
+
+    def _lower_third_events(self, item: dict, spans: list, out_w: int, out_h: int, positions: dict, styles: dict) -> list:
+        """One Lower Third overlay as layered ASS lines: band/edge drawings behind, text in front.
+
+        Every layer of an overlay shares the preset's entrance animation so the
+        whole card moves together. The 'image' variant skips the drawn band —
+        the bake graph overlays the user's picture on the same strip instead.
+        """
+        spec = LOWER_THIRDS[item['preset']]
+        variant = item.get('variant') or 'solid'
+        font = max(14, round(out_h * spec['size']))
+        line = round(font * 1.3)
+        margin = max(8, round(out_w * .04))
+        an, x, y = positions.get(item.get('position'), (5, out_w // 2, out_h // 2))
+        def clean(value):
+            text = ''.join(char for char in str(value) if char not in '{}\\').replace('\n', ' ').strip()
+            return text.upper() if spec['upper'] else text
+        main = clean(item['text'])
+        if not main:
+            return []
+        sub = clean(item.get('sub') or '') if spec['sub'] else ''
+        accent = item['color'] if variant == 'color' and item.get('color') else spec['accent']
+        background = item['color'] if variant == 'color' and item.get('color') else spec['bg']
+        band = self.lower_third_band(item['preset'], item.get('position', 'bottom-left'), out_w, out_h)
+        image_band = band and variant == 'image' and bool(item.get('image'))
+
+        def anim_tag(px, py):
+            if spec['anim'] == 'rise':
+                return f'\\move({px},{py},{px},{py - round(out_h * .035)},0,260)\\fad(220,180)'
+            if spec['anim'] == 'slide':
+                return f'\\move({px + round(out_w * .07)},{py},{px},{py},0,280)\\fad(240,180)'
+            if spec['anim'] == 'pop':
+                return f'\\pos({px},{py})\\fscx72\\fscy72\\t(0,200,\\fscx100\\fscy100)\\fad(130,150)'
+            return f'\\pos({px},{py})\\fad(220,180)'
+
+        def rect(start, end, px, py, width, height, color, alpha=0):
+            return (f"Dialogue: 0,{self._ass_time(start)},{self._ass_time(end)},Default,,0,0,0,,"
+                    f"{{\\p1\\pos({px},{py}){anim_tag(px, py)}\\1c{ass_color(color, alpha)}}}"
+                    f"m 0 0 l {width} 0 {width} {height} 0 {height}{{\\p0}}")
+
+        events = []
+        if band and not image_band:
+            y_band, h_band = band
+            alpha = 0x30 if item['preset'] == 'loc-spotlight' else 0
+            an, x, y = (4, margin, y_band + h_band // 2) if an in (1, 4, 7) \
+                else (6, out_w - margin, y_band + h_band // 2) if an in (3, 6, 9) \
+                else (5, out_w // 2, y_band + h_band // 2)
+            for s, e in spans:
+                events.append(rect(s, e, 0, y_band, out_w, h_band, background, alpha))
+        elif spec['edge'] == 'under':
+            for s, e in spans:
+                events.append(rect(s, e, x, y + round(font * .28), round(out_w * .16), max(4, round(out_h * .007)), accent))
+        elif spec['edge'] == 'left':
+            rows = 2 if sub else 1
+            tab_w, pad = max(6, round(out_w * .011)), max(3, round(font * .28))
+            for s, e in spans:
+                events.append(rect(s, e, x - tab_w - pad, y - rows * line - pad, tab_w, rows * line + 2 * pad, accent))
+        main_style = self._lower_third_style(styles, item['preset'], 'main' if not (band and image_band) else 'image', background)
+        sub_style = self._lower_third_style(styles, item['preset'], 'sub', background) if sub else None
+        for s, e in spans:
+            tag = anim_tag(x, y)
+            events.append(f"Dialogue: 1,{self._ass_time(s)},{self._ass_time(e)},{main_style},,0,0,0,,{{\\an{an}{tag}}}{main}")
+            if sub and sub_style:
+                # Bottom anchors grow upward: the secondary line stacks above the main one.
+                sub_y = y - line if an in (1, 4) else y + line
+                events.append(f"Dialogue: 1,{self._ass_time(s)},{self._ass_time(e)},{sub_style},,0,0,0,,"
+                              f"{{\\an{an}{anim_tag(x, sub_y)}}}{sub}")
+        return events
+
+    def _lower_third_style(self, styles: dict, preset: str, role: str, background: str) -> str:
+        """Register (once) and return the ASS style name for a preset/role/background."""
+        name = f'LT-{preset}-{role}-{background.lstrip("#")}'
+        if name not in styles:
+            styles[name] = (preset, role, background)
+        return name
+
+    def _lower_third_style_line(self, name: str, preset: str, role: str, background: str,
+                                out_w: int, out_h: int, margin: int) -> str:
+        spec = LOWER_THIRDS[preset]
+        font = max(12, round(out_h * spec['size'] * (.62 if role == 'sub' else 1)))
+        outline = max(2, round(font * .06))
+        if spec['box'] == 'fill':
+            # BorderStyle=3: an opaque text-extent box in the preset's background;
+            # Outline doubles as the box padding around the text.
+            pad = max(6, round(font * .22))
+            return (f"Style: {name},Arial,{font},{ass_color(spec['fg'])},&H000000FF,{ass_color(spec['fg'])},"
+                    f"{ass_color(background)},-1,0,0,0,100,100,0,0,3,{pad},0,5,{margin},{margin},{margin},1")
+        # Text carries a black outline for readability over footage and picture bands.
+        return (f"Style: {name},Arial,{font},{ass_color(spec['fg'])},&H000000FF,&H00000000,&H80000000,"
+                f"-1,0,0,0,100,100,0,0,1,{outline},0,5,{margin},{margin},{margin},1")
+
+    def _build_text_box_card(self, item: dict, out_w: int, out_h: int, path: str) -> dict:
+        """One styled text box as a rounded-card PNG (font/size/color/radius/padding/align)."""
+        from PIL import Image, ImageDraw, ImageFont
+        style = item['style']
+        text = ''.join(char for char in item['text'] if char not in '{}\\').strip()
+        if not text:
+            raise RenderingError('A styled text box has no text')
+        size_px = max(14, round(out_h * style['size']))
+        font = ImageFont.truetype(_resolve_box_font(style['font']), size_px)
+        measure = ImageDraw.Draw(Image.new('RGBA', (4, 4)))
+        pad = round(size_px * 0.45 * style['padding'])
+        max_width = round(out_w * .88) - pad * 2
+        lines = _wrap_box_lines(measure, text, font, max_width)
+        widths = [measure.textlength(line, font=font) for line in lines]
+        text_w, text_h = round(max(widths)), round(len(lines) * size_px * 1.28)
+        card_w, card_h = text_w + pad * 2, text_h + pad * 2
+        card = Image.new('RGBA', (card_w, card_h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(card)
+        draw.rounded_rectangle([(0, 0), (card_w - 1, card_h - 1)], radius=round(style['radius'] * (out_w / 1080)),
+                               fill=_hex_rgba(style['background'], 235))
+        y = pad
+        for line, width in zip(lines, widths):
+            x = pad if style['align'] == 'left' else card_w - pad - width if style['align'] == 'right' else (card_w - width) // 2
+            draw.text((x, y), line, font=font, fill=_hex_rgba(style['color']))
+            y += round(size_px * 1.28)
+        card.save(path, 'PNG')
+        # Anchor + stack offset resolve later; the card only carries its size.
+        return {'path': path, 'width': card_w, 'height': card_h}
+
+    def _text_box_anchor(self, position: str, out_w: int, out_h: int, card_w: int, card_h: int, stack: int):
+        margin = max(10, round(out_w * .04))
+        x = margin if 'left' in position else out_w - card_w - margin if 'right' in position else (out_w - card_w) // 2
+        y = margin if position.startswith('top') else out_h - card_h - margin if position.startswith('bottom') else (out_h - card_h) // 2
+        # Same-anchor boxes stack vertically so several can share the screen.
+        return x, y + stack * (card_h + round(out_h * .015))
+
+    def _text_overlay_ass(self, request: RenderRequest, out_w: int, out_h: int, time_map: TimeMap,
+                          window_start_ms: int) -> str:
+        """Editor text cards and Lower Thirds as one ASS file on the final clock.
+
+        Plain cards keep one clean style (bold white, black outline); Lower Third
+        presets add layered animated events. ASS keeps unicode safe where the
+        static FFmpeg builds have no drawtext.
+        """
+        font = max(16, round(out_h * .05))
+        margin = max(8, round(out_w * .04))
+        positions = {
+            'top-left': (7, margin, margin), 'top-right': (9, out_w - margin, margin),
+            'bottom-left': (1, margin, out_h - margin), 'bottom-right': (3, out_w - margin, out_h - margin),
+            'center': (5, out_w // 2, out_h // 2),
+        }
+        events, styles = [], {}
+        for item in request.text_overlays:
+            spans = self._mapped_spans(item['start_ms'], item['end_ms'], window_start_ms, time_map,
+                                       request.video_speed)
+            if not spans:
+                continue
+            if item.get('preset') in LOWER_THIRD_IDS:
+                events.extend(self._lower_third_events(item, spans, out_w, out_h, positions, styles))
+                continue
+            if item.get('style'):
+                continue  # Styled text boxes render as generated card overlays in the bake stage.
+            text = ''.join(char for char in item['text'] if char not in '{}\\')
+            text = text.replace('\n', '\\N').strip()
+            if not text:
+                continue
+            an, x, y = positions.get(item.get('position'), (5, out_w // 2, out_h // 2))
+            for s, e in spans:
+                events.append(f"Dialogue: 0,{self._ass_time(s)},{self._ass_time(e)},Default,,0,0,0,,{{\\an{an}"
+                              f"\\pos({x},{y})}}{text}")
+        path = os.path.join(
+            os.path.dirname(request.output_path),
+            f"text-overlays-{request.start_time_ms}-{request.end_time_ms}.ass",
+        )
+        outline = max(2, round(font * .06))
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write("[Script Info]\nScriptType: v4.00+\nPlayResX: {}\nPlayResY: {}\nWrapStyle: 0\n\n"
+                    .format(out_w, out_h))
+            f.write("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+                    "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, "
+                    "Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n")
+            f.write(f"Style: Default,Arial,{font},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,"
+                    f"0,0,1,{outline},0,5,{margin},{margin},{margin},1\n")
+            for name, (preset, role, background) in sorted(styles.items()):
+                f.write(self._lower_third_style_line(name, preset, role, background, out_w, out_h, margin) + '\n')
+            f.write("\n[Events]\n"
+                    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+            f.write('\n'.join(events) + '\n')
+        return path
+
+    @staticmethod
+    def _ass_time(seconds: float) -> str:
+        cs = max(0, round(seconds * 100))
+        return f"{cs // 360000}:{cs // 6000 % 60:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
+
+    async def _concat_intro(self, request: RenderRequest, out_w: int, out_h: int, fps: str, main_audio: bool) -> None:
+        """Prepend the intro video: re-encode it onto the clip's size/fps/SAR
+        and audio layout, then concat in one command (the baked part keeps its
+        already-normalized audio; no loudnorm is applied to the pair)."""
+        intro, main = request.intro_path, request.output_path
+        intro_ms = await self._probe_duration_ms(intro)
+        if not intro_ms:
+            raise RenderingError("Could not read the intro video")
+        intro_audio = await self._has_audio(intro)
+        main_ms = await self._probe_duration_ms(main)
+        graph = (
+            f"[0:v]fps={fps},scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
+            f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[intro_v];"
+            f"[1:v]fps={fps},setsar=1,format=yuv420p[main_v];"
+        )
+        if intro_audio:
+            graph += (f"[0:a]{AUDIO_FORMAT},{AUDIO_SYNC},apad,atrim=end={intro_ms / 1000:.3f},"
+                      f"asetpts=PTS-STARTPTS,asettb=1/48000[intro_a];")
+        else:
+            graph += f"anullsrc=r=48000:cl=stereo:d={intro_ms / 1000:.3f},asettb=1/48000[intro_a];"
+        if main_audio:
+            graph += f"[1:a]{AUDIO_FORMAT},asettb=1/48000,asetpts=N[main_a];"
+        else:
+            graph += f"anullsrc=r=48000:cl=stereo:d={main_ms / 1000:.3f},asettb=1/48000[main_a];"
+        graph += "[intro_v][intro_a][main_v][main_a]concat=n=2:v=1:a=1[vout][aout]"
+        with_audio = main_audio or intro_audio
+        temporary = main + ".intro.partial.mp4"
+        cmd = [
+            "ffmpeg", "-nostdin", "-v", "error", "-y",
+            *MEDIA_INPUT_OPTIONS, "-i", intro,
+            *MEDIA_INPUT_OPTIONS, "-i", main,
+            "-filter_complex", graph,
+            "-map", "[vout]",
+            *self._video_codec_args(out_w, out_h, fps),
+            "-pix_fmt", "yuv420p", "-r", fps, "-movflags", "+faststart",
+        ]
+        if with_audio:
+            cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"]
+        else:
+            cmd.append("-an")
+        cmd.append(temporary)
+        try:
+            await self._run_cmd(cmd)
+            if not os.path.isfile(temporary):
+                raise RenderingError("Intro concat produced no file")
+            os.replace(temporary, main)
+        finally:
+            if os.path.isfile(temporary):
+                os.remove(temporary)
+
+    async def _concat_outro(self, request: RenderRequest, out_w: int, out_h: int, fps: str, main_audio: bool) -> None:
+        """Append the outro video: re-encode it onto the clip's size/fps/SAR and
+        audio layout, then concat in one command (the main keeps its
+        already-normalized audio; no loudnorm on the pair)."""
+        outro, main = request.outro_path, request.output_path
+        outro_ms = await self._probe_duration_ms(outro)
+        if not outro_ms:
+            raise RenderingError("Could not read the outro video")
+        outro_audio = await self._has_audio(outro)
+        main_ms = await self._probe_duration_ms(main)
+        graph = (
+            f"[0:v]fps={fps},setsar=1,format=yuv420p[main_v];"
+            f"[1:v]fps={fps},scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
+            f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,format=yuv420p[outro_v];"
+        )
+        if main_audio:
+            graph += f"[0:a]{AUDIO_FORMAT},asettb=1/48000,asetpts=N[main_a];"
+        else:
+            graph += f"anullsrc=r=48000:cl=stereo:d={main_ms / 1000:.3f},asettb=1/48000[main_a];"
+        if outro_audio:
+            graph += f"[1:a]{AUDIO_FORMAT},apad,atrim=end={outro_ms / 1000:.3f},asetpts=PTS-STARTPTS,asettb=1/48000[outro_a];"
+        else:
+            graph += f"anullsrc=r=48000:cl=stereo:d={outro_ms / 1000:.3f},asettb=1/48000[outro_a];"
+        graph += "[main_v][main_a][outro_v][outro_a]concat=n=2:v=1:a=1[vout][aout]"
+        with_audio = main_audio or outro_audio
+        temporary = main + ".outro.partial.mp4"
+        cmd = [
+            "ffmpeg", "-nostdin", "-v", "error", "-y",
+            *MEDIA_INPUT_OPTIONS, "-i", main,
+            *MEDIA_INPUT_OPTIONS, "-i", outro,
+            "-filter_complex", graph,
+            "-map", "[vout]",
+            *self._video_codec_args(out_w, out_h, fps),
+            "-pix_fmt", "yuv420p", "-r", fps, "-movflags", "+faststart",
+        ]
+        if with_audio:
+            cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"]
+        else:
+            cmd.append("-an")
+        cmd.append(temporary)
+        try:
+            await self._run_cmd(cmd)
+            if not os.path.isfile(temporary):
+                raise RenderingError("Outro concat produced no file")
+            os.replace(temporary, main)
+        finally:
+            if os.path.isfile(temporary):
+                os.remove(temporary)
+
+    async def _probe_duration_ms(self, path: str) -> int:
+        cmd = ["ffprobe", "-v", "error", *MEDIA_INPUT_OPTIONS, "-show_entries", "format=duration",
+               "-of", "csv=p=0", path]
+        try:
+            result = await asyncio.to_thread(run_media, cmd, timeout=PROBE_TIMEOUT_SECONDS)
+            return max(0, int(round(float(result.stdout.decode().strip()) * 1000)))
+        except Exception as e:
+            logger.warning(f"Duration probe failed for {os.path.basename(path)}: {e}")
+            return 0
 
     async def _plan_layout(
         self,
@@ -663,8 +1515,14 @@ class RenderingService:
         target_width: int,
         target_height: int,
         is_landscape: bool,
+        time_map: TimeMap,
+        window_start_ms: int,
     ) -> list[Overlay]:
-        """Title card and channel banner, positioned per shot on the output timeline."""
+        """Title card and channel banner, positioned per shot on the output timeline.
+
+        Editor brand overlays (logo watermark, CTA badges) come last so they
+        composite above the burned captions, title and banner.
+        """
         src_w, src_h = out_plan.source_width, out_plan.source_height
         overlays: list[Overlay] = []
         # Landscape overlays were sized for 1080p; scale them with the output.
@@ -693,6 +1551,8 @@ class RenderingService:
                 overlays.append((banner[0], "(W-w)/2", per_shot_expr(out_plan, [
                     banner_y(s, src_w, src_h, target_width, target_height) for s in out_plan.shots
                 ])))
+        overlays += self._brand_overlays(request, target_width, target_height, time_map, window_start_ms,
+                                         round(28 * scale) if is_landscape else 34)
         return overlays
 
     def _caption_graph(
@@ -716,7 +1576,7 @@ class RenderingService:
                         intervals.append((a, b))
         caption_filter = self._caption_filter(caption_path)
         if not intervals:
-            return f";[base]{caption_filter}[captioned]"
+            return ";[base]" + caption_filter + "[captioned]"
         # FFmpeg's expression parser rejects long addition chains (100 terms
         # on supported builds). Bound each enable expression independently while
         # drawing ASS once, so animation and linger keep their original clock.
@@ -740,14 +1600,15 @@ class RenderingService:
         return "null"
 
     @staticmethod
-    def _compose_overlays(graph: str, overlays: list[Overlay], video_filter: str = "null") -> tuple[str, list[str]]:
+    def _compose_overlays(graph: str, overlays: list[Overlay], video_filter: str = "null",
+                          output_label: str = "out") -> tuple[str, list[str]]:
         """Append image overlays to a graph ending in [captioned]; output is [out].
 
         Returns the full filter_complex and the extra input paths, in input
         order (the video is input 0, overlays follow).
         """
         if not overlays:
-            return f"{graph};[captioned]{video_filter}[out]", []
+            return f"{graph};[captioned]{video_filter}[{output_label}]", []
         parts = [graph]
         current = "captioned"
         for index, overlay in enumerate(overlays, start=1):
@@ -762,7 +1623,7 @@ class RenderingService:
                 f"[{current}]{image}overlay=x='{x_expr}':y='{y_expr}':shortest=1{enable}[{label}]"
             )
             current = label
-        parts.append(f"[composited]{video_filter}[out]")
+        parts.append(f"[composited]{video_filter}[{output_label}]")
         return ";".join(parts), [overlay[0] for overlay in overlays]
 
     def _title_overlay_image(
@@ -801,6 +1662,9 @@ class RenderingService:
         segments = remap_segments(request.transcript_segments, window_start_ms, time_map)
         if not segments:
             return None
+        # Auto Censor masks the caption text on the output clock; the word
+        # timings stay intact, so the bleep intervals line up with the masks.
+        segments = censor_transcript(segments, request.censor)
 
         anchors = None
         if not is_landscape:
@@ -820,6 +1684,14 @@ class RenderingService:
             zones = face_zones(plan, time_map, target_width, target_height)
             if zones:
                 placer = CaptionPlacer(anchors, zones, target_width, target_height)
+        # A manual horizontal center rides either branch: anchors or the placer
+        # still choose the Y, the pin just moves off the center line. Absent
+        # caption_x keeps today's centered pin byte-identical.
+        anchor_x: Optional[int] = None
+        if request.caption_x is not None:
+            if type(request.caption_x) not in (int, float) or not .1 <= request.caption_x <= .9:
+                raise ValueError('Invalid caption position')
+            anchor_x = round(target_width * request.caption_x)
 
         caption_path = os.path.join(
             os.path.dirname(request.output_path),
@@ -837,6 +1709,7 @@ class RenderingService:
             output_width=target_width,
             output_height=target_height,
             anchors=anchors,
+            anchor_x=anchor_x,
             emphasis_words=request.emphasis_words,
             placer=placer,
         )
@@ -1111,7 +1984,13 @@ class RenderingService:
         ]
 
         for extra in (extra_inputs or []):
-            cmd.extend(["-loop", "1", "-protocol_whitelist", "file,pipe,fd", "-i", extra])
+            # Legacy plain paths loop images; (path, options) tuples carry
+            # per-input options (-loop for stills, -stream_loop for music...).
+            if isinstance(extra, tuple):
+                path, options = extra
+                cmd.extend([*options, '-i', path])
+            else:
+                cmd.extend(["-loop", "1", "-protocol_whitelist", "file,pipe,fd", "-i", extra])
 
         cmd.extend([
             "-filter_complex", filter_complex,

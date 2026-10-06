@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react'
-import { Check, FolderOpen, ImageOff, ListPlus, Play, Send, Trash2, TrendingUp, TriangleAlert, Undo2 } from 'lucide-react'
+import { Check, Copy, FolderOpen, ImageOff, ListPlus, Play, Scissors, Send, Trash2, TrendingUp, TriangleAlert, Undo2 } from 'lucide-react'
 import { cn, formatTimecode, isMac, localFileUrl } from '../lib/utils'
 import { getApi } from '../lib/ipc'
 import { clipFilePath, loadThumbnail } from '../lib/thumbnails'
+import { dirname, join } from 'path'
 import type { ClipArtifact } from '../store/use-job-store'
 import { Checkbox } from './ui/Checkbox'
 import { Badge } from './ui/Badge'
+import { Button } from './ui/Button'
 import { Skeleton } from './ui/Skeleton'
 import { ActionMenu } from './ui/ActionMenu'
 import { LIBRARY_POSTING_LABELS, type LibraryClipPostingStatus } from '../../shared/library-posting'
@@ -32,10 +34,15 @@ interface ClipCardProps {
   onAspect?: (ratio: number) => void
   /** Opens the post dialog for this clip. */
   onPost?: () => void
+  /** Opens the video editor focused on this clip's candidate. */
+  onEdit?: () => void
   onAddToAutomation?: () => void
   onSetPosted?: (posted: boolean) => Promise<void>
   onDelete?: () => void
+  onDuplicate?: () => void
   actionsDisabled?: boolean
+  /** An editor operation is already running on this run: "Edit this" waits, with the reason shown. */
+  editDisabled?: boolean
 }
 
 export function ClipCard({
@@ -48,10 +55,13 @@ export function ClipCard({
   onToggleSelect,
   onAspect,
   onPost,
+  onEdit,
   onAddToAutomation,
   onSetPosted,
   onDelete,
-  actionsDisabled
+  onDuplicate,
+  actionsDisabled,
+  editDisabled
 }: ClipCardProps): React.JSX.Element {
   const filePath = clipFilePath(clip.s3_url)
   const [thumb, setThumb] = useState<string | null | undefined>(undefined)
@@ -75,13 +85,24 @@ export function ClipCard({
     setPreviewFailed(false)
     setActionError(null)
     const seek = clip.duration_ms > 0 ? (clip.duration_ms / 1000) * 0.5 : undefined
-    loadThumbnail(filePath, seek).then((path) => {
-      if (!cancelled) setThumb(path)
+    const load = (atSeconds?: number): void => {
+      loadThumbnail(filePath, atSeconds ?? seek).then((path) => {
+        if (!cancelled) setThumb(path)
+      })
+    }
+    // A stored cover (picked frame or uploaded image) replaces the auto cover.
+    const stored = typeof getApi().history.thumbnail === 'function'
+      ? getApi().history.thumbnail(dirname(filePath), clip.clip_index).catch(() => null)
+      : Promise.resolve(null)
+    void stored.then((cover) => {
+      if (cancelled) return
+      if (cover?.kind === 'image' && cover.file) setThumb(join(dirname(filePath), cover.file))
+      else load(cover?.kind === 'frame' ? (cover.atMs ?? 0) / 1000 : undefined)
     })
     return () => {
       cancelled = true
     }
-  }, [filePath, clip.duration_ms])
+  }, [filePath, clip.duration_ms, clip.clip_index])
 
   const openClip = async (): Promise<void> => {
     setActionError(null)
@@ -199,22 +220,31 @@ export function ClipCard({
             {score}
           </span>
         </div>
-        <span className="glass-chip pointer-events-none absolute bottom-2 left-2 z-10 rounded-full px-1.5 py-px font-mono text-2xs tabular text-white/95">
+        <span
+          className="glass-chip pointer-events-none absolute bottom-2 left-2 z-10 rounded-full px-1.5 py-px font-mono text-2xs tabular text-white/95"
+          title={clip.start_time_ms > 0 ? `Appears at ${formatTimecode(clip.start_time_ms)} in the source video` : undefined}
+        >
           {formatTimecode(clip.duration_ms)}
+          {clip.start_time_ms > 0 && <> · @ {formatTimecode(clip.start_time_ms)}</>}
         </span>
       </div>
 
       <div className="px-2 pb-2 pt-3">
         <div className="mb-3 flex min-h-8 flex-wrap items-center justify-between gap-2">
           {postingBadge}
-          {!selecting && <div className="ml-auto">
+          {!selecting && <div className="ml-auto flex items-center gap-1">
+            {/* Opus Clip-style per-reel entry: opens (and if needed prepares) the editor on this clip. */}
+            {onEdit && <Button size="sm" variant="ghost" icon={<Scissors className="h-3.5 w-3.5" />} disabled={actionsDisabled || editDisabled}
+              tooltip={editDisabled ? 'Another editor operation is running for this video. Wait for it to finish.' : undefined} onClick={onEdit}>Edit this</Button>}
             <ActionMenu label={`Actions for “${title}”`} disabled={markingPosted || actionsDisabled} actions={[
               ...(onPost ? [{ label: 'Post or schedule', icon: <Send className="h-3.5 w-3.5" />, onSelect: onPost }] : []),
+              ...(onEdit ? [{ label: 'Edit in editor', icon: <Scissors className="h-3.5 w-3.5" />, onSelect: onEdit }] : []),
               ...(onAddToAutomation ? [{ label: 'Add to automation', icon: <ListPlus className="h-3.5 w-3.5" />, onSelect: onAddToAutomation }] : []),
               ...(onSetPosted && postingStatus && (postingStatus.state !== 'posted' || postingStatus.manuallyPosted) ? [postingStatus.manuallyPosted
                 ? { label: 'Undo manual posted mark', icon: <Undo2 className="h-3.5 w-3.5" />, onSelect: () => { void setPosted(false) } }
                 : { label: 'Mark as posted', icon: <Check className="h-3.5 w-3.5" />, onSelect: () => { void setPosted(true) } }] : []),
               { label: isMac ? 'Show in Finder' : 'Show in folder', icon: <FolderOpen className="h-3.5 w-3.5" />, onSelect: () => { void showInFolder() } },
+              ...(onDuplicate ? [{ label: 'Duplicate', icon: <Copy className="h-3.5 w-3.5" />, onSelect: onDuplicate }] : []),
               ...(onDelete ? [{ label: 'Delete clip', icon: <Trash2 className="h-3.5 w-3.5" />, danger: true, onSelect: onDelete }] : [])
             ]} />
           </div>}

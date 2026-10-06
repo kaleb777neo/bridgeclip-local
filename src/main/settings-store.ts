@@ -21,6 +21,12 @@ export interface AppSettings extends JevThresholdSettings {
   jevVisualContext: string
   /** Opt-in beta: web research of public sources before transcription. */
   sourceContextWebResearch: string
+  /** Auto Import: YouTube playlist URLs or bare playlist IDs, one per line. */
+  autoImportPlaylists: string
+  /** Auto Import: poll the playlists for new uploads. */
+  autoImportEnabled: boolean
+  /** Auto Import: minutes between polls (15–1440). */
+  autoImportIntervalMinutes: number
   /**
    * 'cloud' routes all AI through OpenRouter with the user's key. 'nvidia'
    * plans and repairs clips with NVIDIA's free NIM API and transcribes with
@@ -42,10 +48,12 @@ export interface AppSettings extends JevThresholdSettings {
   pythonPath: string
   /** Names and jargon the speech-to-text should spell correctly, one per line. */
   customVocabulary: string
+  /** Brand pack auto-applied to new projects; '' = none. */
+  defaultTemplateId: string
 }
 
 export type ApiKeyName = 'openrouterApiKey' | 'nvidiaApiKey' | 'zernioApiKey'
-export type PublicSettings = Pick<AppSettings, 'outputDirectory' | 'pythonPath' | 'customVocabulary' | 'jevEnabled' | 'jevVisualContext' | 'sourceContextWebResearch' | 'aiProvider' | 'nvidiaPlannerModel' | 'localLlmBaseUrl' | 'localPlannerModel' | 'localWhisperModel' | 'transcriptionLanguage' | keyof JevThresholdSettings> & {
+export type PublicSettings = Pick<AppSettings, 'outputDirectory' | 'pythonPath' | 'customVocabulary' | 'defaultTemplateId' | 'autoImportPlaylists' | 'autoImportEnabled' | 'autoImportIntervalMinutes' | 'jevEnabled' | 'jevVisualContext' | 'sourceContextWebResearch' | 'aiProvider' | 'nvidiaPlannerModel' | 'localLlmBaseUrl' | 'localPlannerModel' | 'localWhisperModel' | 'transcriptionLanguage' | keyof JevThresholdSettings> & {
   openrouterConfigured: boolean
   nvidiaConfigured: boolean
   zernioConfigured: boolean
@@ -79,7 +87,11 @@ const DEFAULT_SETTINGS: AppSettings = {
   transcriptionLanguage: '',
   outputDirectory: join(app.getPath('home'), 'BridgeClip'),
   pythonPath: process.platform === 'win32' ? 'python' : 'python3',
-  customVocabulary: ''
+  customVocabulary: '',
+  defaultTemplateId: '',
+  autoImportPlaylists: '',
+  autoImportEnabled: false,
+  autoImportIntervalMinutes: 60
 }
 
 const SETTINGS_VERSION = 14
@@ -110,6 +122,10 @@ interface PersistedSettings extends JevThresholdSettings {
   outputDirectory: string
   pythonPath: string
   customVocabulary?: string
+  defaultTemplateId?: string
+  autoImportPlaylists?: string
+  autoImportEnabled?: boolean
+  autoImportIntervalMinutes?: number
 }
 
 function ensureDir(dir: string): string {
@@ -126,6 +142,7 @@ function getSettingsPath(): string {
 function normalizeSettings(settings: Partial<AppSettings>): AppSettings {
   if (!settings || typeof settings !== 'object') throw new Error('Invalid settings')
   for (const key of Object.keys(DEFAULT_SETTINGS) as (keyof AppSettings)[]) {
+    if (key === 'autoImportEnabled' || key === 'autoImportIntervalMinutes') continue // booleans/numbers, validated below.
     if (settings[key] !== undefined && (typeof settings[key] !== 'string' || settings[key]!.length > 8192 || settings[key]!.includes('\0'))) throw new Error(`Invalid ${key}`)
   }
   const normalized: AppSettings = {
@@ -153,7 +170,13 @@ function normalizeSettings(settings: Partial<AppSettings>): AppSettings {
     transcriptionLanguage: normalizeLanguage(settings.transcriptionLanguage),
     outputDirectory: (settings.outputDirectory || DEFAULT_SETTINGS.outputDirectory).trim(),
     pythonPath: (settings.pythonPath || DEFAULT_SETTINGS.pythonPath).trim(),
-    customVocabulary: vocabularyTerms(settings.customVocabulary ?? DEFAULT_SETTINGS.customVocabulary).join('\n')
+    customVocabulary: vocabularyTerms(settings.customVocabulary ?? DEFAULT_SETTINGS.customVocabulary).join('\n'),
+    defaultTemplateId: typeof settings.defaultTemplateId === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(settings.defaultTemplateId)
+      ? settings.defaultTemplateId : '',
+    autoImportPlaylists: (settings.autoImportPlaylists ?? DEFAULT_SETTINGS.autoImportPlaylists).split('\n').map((line) => line.trim()).filter(Boolean).join('\n'),
+    autoImportEnabled: settings.autoImportEnabled === true,
+    autoImportIntervalMinutes: Number.isFinite(settings.autoImportIntervalMinutes) && (settings.autoImportIntervalMinutes as number) >= 15
+      ? Math.min(settings.autoImportIntervalMinutes as number, 1440) : 60
   }
   for (const key of Object.keys(JEV_DEFAULTS) as (keyof JevThresholdSettings)[]) {
     const value = probability(normalized[key])
@@ -299,7 +322,12 @@ export function loadSettings(): AppSettings {
       transcriptionLanguage: typeof raw.transcriptionLanguage === 'string' ? raw.transcriptionLanguage : DEFAULT_SETTINGS.transcriptionLanguage,
       outputDirectory: typeof raw.outputDirectory === 'string' ? raw.outputDirectory : DEFAULT_SETTINGS.outputDirectory,
       pythonPath: typeof raw.pythonPath === 'string' ? raw.pythonPath : DEFAULT_SETTINGS.pythonPath,
-      customVocabulary: typeof raw.customVocabulary === 'string' ? raw.customVocabulary : DEFAULT_SETTINGS.customVocabulary
+      customVocabulary: typeof raw.customVocabulary === 'string' ? raw.customVocabulary : DEFAULT_SETTINGS.customVocabulary,
+      defaultTemplateId: typeof raw.defaultTemplateId === 'string' ? raw.defaultTemplateId : DEFAULT_SETTINGS.defaultTemplateId,
+      autoImportPlaylists: typeof raw.autoImportPlaylists === 'string' ? raw.autoImportPlaylists : DEFAULT_SETTINGS.autoImportPlaylists,
+      autoImportEnabled: raw.autoImportEnabled === true,
+      autoImportIntervalMinutes: Number.isFinite(raw.autoImportIntervalMinutes) && (raw.autoImportIntervalMinutes as number) >= 15
+        ? Math.min(raw.autoImportIntervalMinutes as number, 1440) : 60
     })
 
     if (needsMigration && canEncrypt()) writeSettings(settings)
@@ -337,7 +365,11 @@ function writeSettings(settings: AppSettings): void {
     transcriptionLanguage: settings.transcriptionLanguage,
     outputDirectory: settings.outputDirectory,
     pythonPath: settings.pythonPath,
-    customVocabulary: settings.customVocabulary
+    customVocabulary: settings.customVocabulary,
+    defaultTemplateId: settings.defaultTemplateId,
+    autoImportPlaylists: settings.autoImportPlaylists,
+    autoImportEnabled: settings.autoImportEnabled,
+    autoImportIntervalMinutes: settings.autoImportIntervalMinutes
   }
 
   let fd: number | undefined
@@ -373,6 +405,10 @@ export function publicSettings(settings: AppSettings): PublicSettings {
     outputDirectory: settings.outputDirectory,
     pythonPath: settings.pythonPath,
     customVocabulary: settings.customVocabulary,
+    defaultTemplateId: settings.defaultTemplateId,
+    autoImportPlaylists: settings.autoImportPlaylists,
+    autoImportEnabled: settings.autoImportEnabled,
+    autoImportIntervalMinutes: settings.autoImportIntervalMinutes,
     openrouterConfigured: Boolean(settings.openrouterApiKey),
     nvidiaConfigured: Boolean(settings.nvidiaApiKey),
     zernioConfigured: Boolean(settings.zernioApiKey),
@@ -388,7 +424,7 @@ export function publicSettings(settings: AppSettings): PublicSettings {
   }
 }
 
-export function savePublicSettings(update: Pick<PublicSettings, 'outputDirectory' | 'pythonPath' | 'customVocabulary' | 'jevEnabled' | 'jevVisualContext' | 'sourceContextWebResearch' | 'aiProvider' | 'nvidiaPlannerModel' | 'localLlmBaseUrl' | 'localPlannerModel' | 'localWhisperModel' | 'transcriptionLanguage' | keyof JevThresholdSettings>): PublicSettings {
+export function savePublicSettings(update: Pick<PublicSettings, 'outputDirectory' | 'pythonPath' | 'customVocabulary' | 'defaultTemplateId' | 'autoImportPlaylists' | 'autoImportEnabled' | 'autoImportIntervalMinutes' | 'jevEnabled' | 'jevVisualContext' | 'sourceContextWebResearch' | 'aiProvider' | 'nvidiaPlannerModel' | 'localLlmBaseUrl' | 'localPlannerModel' | 'localWhisperModel' | 'transcriptionLanguage' | keyof JevThresholdSettings>): PublicSettings {
   const current = loadSettings()
   return publicSettings(saveSettings({
     ...current,
@@ -402,6 +438,10 @@ export function savePublicSettings(update: Pick<PublicSettings, 'outputDirectory
     outputDirectory: update.outputDirectory,
     pythonPath: update.pythonPath,
     customVocabulary: update.customVocabulary,
+    defaultTemplateId: update.defaultTemplateId ?? current.defaultTemplateId,
+    autoImportPlaylists: update.autoImportPlaylists ?? current.autoImportPlaylists,
+    autoImportEnabled: update.autoImportEnabled ?? current.autoImportEnabled,
+    autoImportIntervalMinutes: update.autoImportIntervalMinutes ?? current.autoImportIntervalMinutes,
     jevEnabled: update.jevEnabled ?? current.jevEnabled,
     jevVisualContext: update.jevVisualContext ?? current.jevVisualContext,
     sourceContextWebResearch: update.sourceContextWebResearch ?? current.sourceContextWebResearch,
@@ -463,4 +503,19 @@ export function getSettingsForBridge(settings: AppSettings): Record<string, stri
     LOCAL_MODE: 'true',
     LOCAL_OUTPUT_DIR: settings.outputDirectory
   }
+}
+
+/** One proper noun into the Brand Vocabulary (deduped, capped); returns the kept terms. */
+export function addVocabularyTerm(raw: unknown): { terms: string[] } {
+  if (typeof raw !== 'string') throw new Error('Choose the word to add.')
+  const term = raw.replace(/\s+/g, ' ').trim().slice(0, 49)
+  if (!term || term.split(' ').length > 5 || /[<>{}[\]\\]/.test(term)) {
+    throw new Error('Use a word or a short name, up to five words.')
+  }
+  const settings = loadSettings()
+  const existing = vocabularyTerms(settings.customVocabulary)
+  if (existing.some((kept) => kept.toLocaleLowerCase() === term.toLocaleLowerCase())) return { terms: existing }
+  const terms = [...existing, term].slice(0, 200)
+  savePublicSettings({ ...settings, customVocabulary: terms.join('\n') })
+  return { terms }
 }

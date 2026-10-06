@@ -564,6 +564,7 @@ async function withPosting(fn, { clip = {}, mockOptions = {} } = {}) {
       export * as posts from './src/main/zernio/posts'
       export * as settings from './src/main/settings-store'
       export * as service from './src/main/zernio/service'
+      export * as security from './src/main/security'
     `, { electron })
     main.settings.replaceApiKey('zernioApiKey', KEY)
     main.settings.savePublicSettings({ outputDirectory: library, pythonPath: 'python3',  })
@@ -623,6 +624,7 @@ test('publish now: presign, a streamed PUT to storage, then POST /v1/posts with 
   assert.equal(progress.at(-1).phase, 'publishing')
 
   assert.equal(posting.state.creates.length, 1)
+  console.log('DEBUG creates:', posting.state.creates.length, 'uploads:', posting.state.uploads.length)
   const create = posting.state.creates[0]
   assert.match(create.requestId, /^[0-9a-f-]{36}$/)
   assert.equal(create.body.publishNow, true)
@@ -643,6 +645,55 @@ test('publish now: presign, a streamed PUT to storage, then POST /v1/posts with 
   assert.equal(history.posts.length, 1)
   assert.equal(history.posts[0].id, result.post.id)
   assert.equal(history.posts[0].clipPath, clipPath)
+}))
+
+test('YouTube scheduler: a scheduled YouTube-only post carries title, visibility and no publishNow', async () => withPosting(async ({ mock, posting, clipPath, accounts, publish }) => {
+  const scheduledFor = new Date(Date.now() + 12 * 60 * 60 * 1000).toISOString()
+  const result = await publish({
+    clipTitle: 'The scheduler test',
+    targets: [{ platform: 'youtube', accountId: accounts.youtube._id }],
+    timing: { mode: 'schedule', scheduledFor, timezone: 'Europe/Bucharest' },
+    options: { youtube: { title: 'Scheduled title', visibility: 'unlisted', madeForKids: false, tags: ['a', 'b'] } },
+  })
+  assert.equal(result.outcome, 'scheduled')
+  assert.equal(result.post.status, 'scheduled')
+  const create = posting.state.creates[0]
+  assert.equal(create.body.publishNow, undefined, 'scheduled posts never publish now')
+  assert.equal(create.body.scheduledFor, scheduledFor)
+  assert.equal(create.body.timezone, 'Europe/Bucharest')
+  const yt = create.body.platforms.find((p) => p.platform === 'youtube')
+  assert.equal(yt.platformSpecificData.title, 'Scheduled title')
+  assert.equal(yt.platformSpecificData.visibility, 'unlisted')
+  assert.deepEqual(create.body.tags, ['a', 'b'])
+}))
+
+test('standalone uploads: a picked video outside the library probes and schedules', async () => withPosting(async ({ mock, posting, main, accounts, userData }) => {
+  // Any video the user picked — outside the library entirely.
+  const standalone = makeClip(path.join(userData, 'my-own-edit.mp4'), { seconds: 3 })
+  // The picker/drop handler registers the chosen file; without that step the
+  // probe and publish must refuse it.
+  await assert.rejects(main.posts.probeClipForPosting(standalone, null))
+  main.security.authorizeMedia(standalone)
+  const media = await main.posts.probeClipForPosting(standalone, null)
+  assert.ok(media.durationMs > 2000 && media.durationMs < 5000, 'probed duration: ' + JSON.stringify(media))
+  const scheduledFor = new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString()
+  const result = await main.posts.publishClip({
+    attemptId: 'attempt-standalone-1',
+    clipPath: standalone,
+    clipTitle: 'My own edit',
+    durationMs: media.durationMs,
+    caption: 'Scheduled straight from a local file',
+    targets: [{ platform: 'tiktok', accountId: accounts.tiktok._id }],
+    timing: { mode: 'schedule', scheduledFor, timezone: 'Europe/Bucharest' },
+    options: { tiktok: { consent: true, accounts: { [accounts.tiktok._id]: { privacyLevel: 'PUBLIC_TO_EVERYONE', allowComment: true, allowDuet: true, allowStitch: true } } } }
+  }, () => {})
+  assert.equal(result.outcome, 'scheduled')
+  assert.equal(result.post.status, 'scheduled')
+  assert.equal(result.post.clipPath, standalone)
+  const create = posting.state.creates[0]
+  assert.equal(create.body.scheduledFor, scheduledFor)
+  assert.equal(create.body.mediaItems[0].type, 'video')
+  assert.match(String(create.body.mediaItems[0].url), /^https?:\/\//, 'the uploaded public URL')
 }))
 
 test('changing the Zernio key isolates history and reuses uploads when the original key returns', () => withPosting(async ({ mock, posting, main, publish }) => {
@@ -1206,4 +1257,26 @@ test('calendar rows parse targets, platform links and sources; unusable rows dro
   assert.equal(parse({ _id: 'cal00000000000000000003', status: 'weird', scheduledFor: '2026-10-03', platforms: [{ platform: 'tiktok', accountId: 'a' }] }), null, 'unknown status')
   assert.equal(parse({ _id: 'cal00000000000000000004', status: 'published', createdAt: null, platforms: [{ platform: 'tiktok', accountId: 'a' }] }), null, 'no timestamp')
   assert.equal(parse({ _id: 'cal00000000000000000005', status: 'published', createdAt: '2026-10-01' }), null, 'no targets')
+})
+
+test('the YouTube full-video-link option lands between caption and hashtags, sourced from the run', (t) => {
+  const { dir, cleanup } = tempDir()
+  t.after(cleanup)
+  const library = path.join(dir, 'library'), run = path.join(library, 'review-run')
+  fs.mkdirSync(run, { recursive: true })
+  fs.mkdirSync(path.join(dir, 'userData'), { recursive: true })
+  fs.writeFileSync(path.join(dir, 'userData', 'settings.json'), JSON.stringify({ version: 3, outputDirectory: library }))
+  const posts = loadMain("export { withSourceLink, sourceVideoLinkFor } from './src/main/zernio/posts'", { electron: fakeElectron(dir).electron })
+  const link = 'https://youtube.com/watch?v=fullvid'
+  assert.equal(posts.withSourceLink('Big idea\n\n#shorts #budget', link), 'Big idea\n\n' + link + '\n\n#shorts #budget', 'the link sits between the text and the hashtags')
+  assert.equal(posts.withSourceLink('Big idea', link), 'Big idea\n\n' + link, 'a caption without hashtags just gains the link')
+  assert.equal(posts.withSourceLink('#onlytags', link), link + '\n\n#onlytags')
+  fs.writeFileSync(path.join(run, 'clip_00.mp4'), 'clip bytes')
+  fs.writeFileSync(path.join(run, 'job_output.json'), JSON.stringify({ source_video_url: link }))
+  assert.equal(posts.sourceVideoLinkFor(path.join(run, 'clip_00.mp4')), link)
+  fs.writeFileSync(path.join(run, 'job_output.json'), JSON.stringify({ source_video_url: 'not a url' }))
+  assert.equal(posts.sourceVideoLinkFor(path.join(run, 'clip_00.mp4')), null, 'non-URL values never reach a caption')
+  fs.writeFileSync(path.join(run, 'job_output.json'), JSON.stringify({}))
+  assert.equal(posts.sourceVideoLinkFor(path.join(run, 'clip_00.mp4')), null)
+  assert.equal(posts.sourceVideoLinkFor(path.join(dir, 'elsewhere.mp4')), null, 'files outside the library are refused')
 })

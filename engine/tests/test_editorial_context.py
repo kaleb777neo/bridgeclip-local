@@ -233,7 +233,7 @@ def test_visual_escalation_is_bounded_and_only_sends_text_to_jev(monkeypatch, tm
     def sample(_video, output, timestamp):
         output.write_bytes(b'fixture-jpeg')
         return True
-    async def completion(client, payload):
+    async def completion(client, payload, provider="openrouter"):
         calls.append(payload)
         timestamps = [int(item['text'].split()[2]) for item in payload['messages'][0]['content'] if item.get('type') == 'text' and item['text'].startswith('Source timestamp')]
         result = {'observations': [{'timestamp_ms': t, 'description': 'A person beside a shared video.'} for t in timestamps], 'needs_more_evidence': True}
@@ -358,7 +358,7 @@ def test_time_between_candidates_does_not_exhaust_visual_review_budget(monkeypat
     def sample(_video, output, timestamp):
         output.write_bytes(b'fixture')
         return True
-    async def completion(client, payload):
+    async def completion(client, payload, provider="openrouter"):
         now[0] += 1
         return {'choices': [{'message': {'content': json.dumps({'observations': [], 'needs_more_evidence': False})}}]}, {'cost': .001}
     monkeypatch.setattr(module, '_sample_one', sample)

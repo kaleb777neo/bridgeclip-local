@@ -28,7 +28,8 @@ def test_youtube_detection_uses_hostname_not_text_in_path():
     with patch("clip_engine.services.video_downloader.get_settings", return_value=settings):
         downloader = VideoDownloaderService()
         assert downloader.detect_source_type("https://www.youtube.com/watch?v=test") == "youtube"
-        assert downloader.detect_source_type("https://evil.example/youtube.com/watch") == "direct_url"
+        # Not youtube — the look-alike path goes through the generic yt-dlp route.
+        assert downloader.detect_source_type("https://evil.example/youtube.com/watch") == "generic"
 
 
 def test_desktop_bucket_urls_are_not_signed_with_ambient_aws_credentials():

@@ -28,11 +28,14 @@ def test_other_twitch_pages_never_download_as_html(service, url):
         service.detect_source_type(url)
     assert safe_failure_code(error.value) == 'download.twitch_unsupported'
 
-@pytest.mark.parametrize('url', ['https://twitch.tv.evil.test/videos/12345', 'https://eviltwitch.tv/videos/12345', 'https://example.com/video.mp4'])
-def test_exact_host_matching(service, url):
-    assert service.detect_source_type(url) == 'direct_url'
+@pytest.mark.parametrize('url, expected', [('https://twitch.tv.evil.test/videos/12345', 'generic'), ('https://eviltwitch.tv/videos/12345', 'generic'), ('https://example.com/video.mp4', 'direct_url')])
+def test_exact_host_matching(service, url, expected):
+    # Look-alike hosts must never reach the Twitch extractor; page links go
+    # through the generic yt-dlp route instead.
+    assert service.detect_source_type(url) != 'twitch'
+    assert service.detect_source_type(url) == expected
 
-@pytest.mark.parametrize('info, reason', [({'is_live': True, 'duration': 10}, 'twitch_not_completed'), ({'live_status': 'is_upcoming', 'duration': 10}, 'twitch_not_completed'), ({'live_status': 'post_live', 'duration': 10}, 'twitch_not_completed'), *[({'duration': value}, 'twitch_duration') for value in [None, 0, -1, float('nan'), float('inf'), 21601]]])
+@pytest.mark.parametrize('info, reason', [({'is_live': True, 'duration': 10}, 'twitch_not_completed'), ({'live_status': 'is_upcoming', 'duration': 10}, 'twitch_not_completed'), ({'live_status': 'post_live', 'duration': 10}, 'twitch_not_completed'), *[({'duration': value}, 'twitch_duration') for value in [None, 0, -1, float('nan'), float('inf'), 36001]]])
 def test_metadata_rejection(service, info, reason):
     with pytest.raises(module.VideoDownloadError) as error:
         service._validate_twitch_info(info, 21600)

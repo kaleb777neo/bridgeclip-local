@@ -170,6 +170,7 @@ class CaptionGeneratorService:
         anchors: Optional[list[tuple[int, int, int]]] = None,
         emphasis_words: Optional[list[str]] = None,
         placer: Optional[Placer] = None,
+        anchor_x: Optional[int] = None,
     ) -> Optional[str]:
         """Generate ASS captions for a clip.
 
@@ -220,7 +221,8 @@ class CaptionGeneratorService:
                 end = max(self._parse_ass_time(t[1]) for t in times)
                 width, height = self._block_size(words, style, output_width)
                 alignment, y = placer(start, end, width, height)
-                return [self._pin(line, alignment, output_width // 2, y) for line in events]
+                slide = self.slide_for(style)
+                return [self._pin(line, alignment, anchor_x if anchor_x is not None else output_width // 2, y, slide) for line in events]
 
         if has_word_timing and style.word_by_word_highlight:
             events = self._word_by_word_events(relevant_segments, clip_start_ms, clip_end_ms, style, place)
@@ -229,7 +231,7 @@ class CaptionGeneratorService:
         ass_content = header + self._events_header() + "\n".join(events)
 
         if anchors and placer is None:
-            ass_content = self._apply_anchors(ass_content, anchors, output_width)
+            ass_content = self._apply_anchors(ass_content, anchors, output_width, anchor_x, self.slide_for(style))
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
@@ -386,6 +388,8 @@ class CaptionGeneratorService:
         ass_content: str,
         anchors: list[tuple[int, int, int]],
         output_width: int,
+        anchor_x: Optional[int] = None,
+        slide: Optional[tuple[int, int, int]] = None,
     ) -> str:
         r"""Prefix each Dialogue with the \an/\pos of the layout active at its start."""
         lines = []
@@ -398,16 +402,31 @@ class CaptionGeneratorService:
                     if start_ms < until_ms:
                         alignment, y = a, ay
                         break
-                line = self._pin(line, alignment, output_width // 2, y)
+                line = self._pin(line, alignment, anchor_x if anchor_x is not None else output_width // 2, y, slide)
             lines.append(line)
         return "\n".join(lines)
 
     @staticmethod
-    def _pin(line: str, alignment: int, x: int, y: int) -> str:
-        r"""A Dialogue line with an \an/\pos override in front of its text."""
+    def slide_for(style) -> Optional[tuple[int, int, int]]:
+        """(dx, dy, ms) for slide-in entrance styles; None = static pin."""
+        entrance = getattr(style, "entrance", "pop")
+        if entrance == "slide-left":
+            return (160, 0, 220)
+        if entrance == "slide-up":
+            return (0, 120, 220)
+        return None
+
+    @staticmethod
+    def _pin(line: str, alignment: int, x: int, y: int, slide: Optional[tuple[int, int, int]] = None) -> str:
+        r"""A Dialogue line with an \an/\pos override in front of its text; a
+        slide tuple (dx, dy, ms) flies the line in from an offset via \move."""
         prefix = "Dialogue: "
         fields = line[len(prefix):].split(",", 9)
-        fields[9] = f"{{\\an{alignment}\\pos({x},{y})}}" + fields[9]
+        if slide:
+            dx, dy, ms = slide
+            fields[9] = f"{{\\an{alignment}\\move({x + dx},{y + dy},{x},{y},0,{ms})}}" + fields[9]
+        else:
+            fields[9] = f"{{\\an{alignment}\\pos({x},{y})}}" + fields[9]
         return prefix + ",".join(fields)
 
     def _block_size(self, words: list[str], style: CaptionStyle, output_width: int) -> tuple[int, int]:

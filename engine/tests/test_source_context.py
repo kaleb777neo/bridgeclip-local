@@ -161,7 +161,7 @@ def test_source_context_reaches_planning_and_repairs_but_never_jev(monkeypatch):
     assert not any(brief()['summary'] in json.dumps(c) or 'careful review' in json.dumps(c) for c in calls)
     cut = next(a for a in audit['coherence']['attempts'] if a['stage'] == 'cut')
     assert 'source_context' not in cut['evidence']
-    async def completion(client, payload):
+    async def completion(client, payload, provider="openrouter"):
         assert json.loads(payload['messages'][1]['content'])['source_context'] == context
         raise RuntimeError('offline fixture')
     monkeypatch.setattr('clip_engine.services.coherence_review.chat_completion', completion)

@@ -963,7 +963,8 @@
           "people": [],
           "content_box": null,
           "crop_bounds": null,
-          "cam_box_refined": false
+          "cam_box_refined": false,
+          "focus_path": []
         }
       },
       "heuristic": {
@@ -987,7 +988,8 @@
         "people": [],
         "content_box": null,
         "crop_bounds": null,
-        "cam_box_refined": false
+        "cam_box_refined": false,
+        "focus_path": []
       }
     },
     {
@@ -1083,7 +1085,19 @@
           ],
           "content_box": null,
           "crop_bounds": null,
-          "cam_box_refined": false
+          "cam_box_refined": false,
+          "focus_path": [
+            [
+              0,
+              0.5,
+              0.35
+            ],
+            [
+              3750,
+              0.5,
+              0.35
+            ]
+          ]
         }
       },
       "heuristic": {
@@ -1104,7 +1118,19 @@
         ],
         "content_box": null,
         "crop_bounds": null,
-        "cam_box_refined": false
+        "cam_box_refined": false,
+        "focus_path": [
+          [
+            0,
+            0.5,
+            0.35
+          ],
+          [
+            3750,
+            0.5,
+            0.35
+          ]
+        ]
       }
     },
     {
@@ -1211,7 +1237,8 @@
           "people": [],
           "content_box": null,
           "crop_bounds": null,
-          "cam_box_refined": false
+          "cam_box_refined": false,
+          "focus_path": []
         }
       },
       "heuristic": {
@@ -1235,7 +1262,8 @@
         "people": [],
         "content_box": null,
         "crop_bounds": null,
-        "cam_box_refined": false
+        "cam_box_refined": false,
+        "focus_path": []
       }
     }
   ],
@@ -1262,6 +1290,7 @@
       "content_box": null,
       "crop_bounds": null,
       "cam_box_refined": false,
+      "focus_path": [],
       "detected_layout": "screen_cam",
       "cam_face": [
         0.08,
@@ -1269,7 +1298,6 @@
         0.05,
         0.09
       ],
-      "focus_path": [],
       "crop_path": [],
       "views": [
         {
@@ -1321,8 +1349,6 @@
       "content_box": null,
       "crop_bounds": null,
       "cam_box_refined": false,
-      "detected_layout": "talking_head",
-      "cam_face": null,
       "focus_path": [
         [
           0,
@@ -1335,6 +1361,8 @@
           0.35
         ]
       ],
+      "detected_layout": "talking_head",
+      "cam_face": null,
       "crop_path": [
         [
           4000,
@@ -1386,6 +1414,7 @@
       "content_box": null,
       "crop_bounds": null,
       "cam_box_refined": false,
+      "focus_path": [],
       "detected_layout": "screen_cam",
       "cam_face": [
         0.08,
@@ -1393,7 +1422,6 @@
         0.05,
         0.09
       ],
-      "focus_path": [],
       "crop_path": [],
       "views": [
         {
@@ -1450,6 +1478,7 @@
       "content_box": null,
       "crop_bounds": null,
       "cam_box_refined": false,
+      "focus_path": [],
       "detected_layout": "screen_cam",
       "cam_face": [
         0.08,
@@ -1457,7 +1486,6 @@
         0.05,
         0.09
       ],
-      "focus_path": [],
       "crop_path": [],
       "views": [
         {
@@ -1509,8 +1537,6 @@
       "content_box": null,
       "crop_bounds": null,
       "cam_box_refined": false,
-      "detected_layout": "talking_head",
-      "cam_face": null,
       "focus_path": [
         [
           0,
@@ -1523,6 +1549,8 @@
           0.35
         ]
       ],
+      "detected_layout": "talking_head",
+      "cam_face": null,
       "crop_path": [
         [
           4000,
@@ -1574,6 +1602,7 @@
       "content_box": null,
       "crop_bounds": null,
       "cam_box_refined": false,
+      "focus_path": [],
       "detected_layout": "screen_cam",
       "cam_face": [
         0.08,
@@ -1581,7 +1610,6 @@
         0.05,
         0.09
       ],
-      "focus_path": [],
       "crop_path": [],
       "views": [
         {

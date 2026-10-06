@@ -20,6 +20,8 @@ import {
   defaultCaption,
   defaultFacebookFormat,
   formatClipDuration,
+  pickVariant,
+  recommendedAspect,
   scheduleError,
   scheduleWindow,
   sharedCommercialTypes,
@@ -57,6 +59,8 @@ export interface PostableClip {
   title: string
   tags: string[]
   durationMs: number
+  /** Extra rendered formats of this clip; the primary file stays in `path`. */
+  variants?: { aspect_ratio: string; path: string }[]
 }
 
 interface PostDialogProps {
@@ -72,6 +76,8 @@ interface PostDialogProps {
     accountIds?: string[]
     /** A `YYYY-MM-DDTHH:mm` local value; the dialog opens in schedule mode with it. */
     scheduleValue?: string | null
+    /** Bulk Scheduling: one local slot per clip, in posting order. Schedule mode is forced. */
+    bulkStarts?: string[]
   }
 }
 
@@ -152,6 +158,8 @@ export function PostDialog({ clips, onClose, onPosted, onNavigate, initial }: Po
   const [platformCaptions, setPlatformCaptions] = useState<Partial<Record<ZernioPlatform, string>>>({})
   const [facebookTitle, setFacebookTitle] = useState('')
   const [threadsTopicTag, setThreadsTopicTag] = useState('')
+  /** account id → 'auto' or a chosen variant aspect, for multi-format clips. */
+  const [variantChoice, setVariantChoice] = useState<Record<string, string>>({})
   const { accounts, profiles, loaded: accountsLoaded, loading: accountsLoading, error: accountsError, load: loadAccounts } = useAccountsStore()
 
   const [index, setIndex] = useState(0)
@@ -165,6 +173,57 @@ export function PostDialog({ clips, onClose, onPosted, onNavigate, initial }: Po
   const [thumb, setThumb] = useState<string | null>(null)
   const [caption, setCaption] = useState(() => initial?.caption?.trim() || defaultCaption(clip.title, clip.tags))
   const [youtube, setYoutube] = useState<YouTubePostOptions>(() => ({ title: youtubeTitleFor(clip.title) || 'Untitled clip', visibility: 'public', madeForKids: false }))
+  // "Add the full video link": offered only when the clip's run has a source URL.
+  const [sourceLink, setSourceLink] = useState(false)
+  const [sourceLinkAvailable, setSourceLinkAvailable] = useState(false)
+  const [regenerateKey, setRegenerateKey] = useState(0)
+  // Custom cover: a frame from the clip or an uploaded image, applied to every post of the clip.
+  const [cover, setCover] = useState<{ kind: 'frame'; atMs: number } | { kind: 'image'; path: string } | null>(null)
+  const [coverPreview, setCoverPreview] = useState<string | null>(null)
+  const [coverBusy, setCoverBusy] = useState(false)
+  useEffect(() => {
+    let active = true
+    const clipPath = clips[0]?.path
+    if (!clipPath) return
+    void getApi().zernio.posts.sourceVideoLink(clipPath)
+      .then((link) => { if (active) setSourceLinkAvailable(link !== null) })
+      .catch(() => { /* No link is simply no checkbox. */ })
+    return () => { active = false }
+  }, [clips])
+  // Load the clip's stored cover once; regenerate the frame preview when the pick moves.
+  const libraryClip = clips[0]?.library
+  useEffect(() => {
+    let active = true
+    if (!libraryClip) return
+    void getApi().history.thumbnail(libraryClip.outputDir, libraryClip.clipIndex)
+      .then((stored) => {
+        if (!active || !stored) return
+        if (stored.kind === 'frame') setCover({ kind: 'frame', atMs: stored.atMs ?? 0 })
+        else if (stored.file) setCover({ kind: 'image', path: stored.file })
+      })
+      .catch(() => { /* No stored cover means the auto cover stays. */ })
+    return () => { active = false }
+  }, [libraryClip])
+  useEffect(() => {
+    if (!cover) { setCoverPreview(null); return }
+    let active = true
+    setCoverBusy(true)
+    const task = cover.kind === 'frame'
+      ? getApi().thumbnails.generate(clip.path, Math.min(clip.durationMs / 1000 - 0.1, cover.atMs / 1000))
+      : Promise.resolve(cover.path)
+    void task.then((path) => { if (active) setCoverPreview(path) })
+      .catch(() => { if (active) setCoverPreview(null) })
+      .finally(() => { if (active) setCoverBusy(false) })
+    return () => { active = false }
+  }, [cover, clip.path, clip.durationMs])
+  const persistCover = (next: { kind: 'frame'; atMs: number } | { kind: 'image'; path: string } | null): void => {
+    setCover(next)
+    if (!libraryClip) return
+    const stored = next === null ? null
+      : next.kind === 'frame' ? { kind: 'frame' as const, atMs: next.atMs }
+      : { kind: 'image' as const, path: next.path }
+    void getApi().history.setThumbnail(libraryClip.outputDir, libraryClip.clipIndex, stored).catch(() => { /* The auto cover stays. */ })
+  }
   const [phase, setPhase] = useState<Phase>('editing')
   const [progress, setProgress] = useState<PostProgress | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -176,8 +235,9 @@ export function PostDialog({ clips, onClose, onPosted, onNavigate, initial }: Po
   const [creatorInfo, setCreatorInfo] = useState<Record<string, CreatorInfoState>>({})
   const [shareToFeed, setShareToFeed] = useState(true)
   const [facebookFormat, setFacebookFormat] = useState<FacebookFormat | null>(null)
-  const [mode, setMode] = useState<'now' | 'schedule'>(() => (initial?.scheduleValue ? 'schedule' : 'now'))
-  const [scheduleValue, setScheduleValue] = useState(() => initial?.scheduleValue || defaultScheduleValue())
+  const bulkStarts = initial?.bulkStarts?.length === clips.length ? initial.bulkStarts : null
+  const [mode, setMode] = useState<'now' | 'schedule'>(() => (bulkStarts || initial?.scheduleValue ? 'schedule' : 'now'))
+  const [scheduleValue, setScheduleValue] = useState(() => bulkStarts ? bulkStarts[0] : initial?.scheduleValue || defaultScheduleValue())
   const [now, setNow] = useState(() => Date.now())
 
   const dialogRef = useRef<HTMLDivElement>(null)
@@ -237,6 +297,16 @@ export function PostDialog({ clips, onClose, onPosted, onNavigate, initial }: Po
     const account = postable.find((a) => a.id === id)
     return account ? `${platformName(account.platform)} ${accountHandle(account)}` : 'Account'
   }
+
+  // Multi-format clips: each account gets a rendered variant, by default the
+  // format its platform recommends; the main file when that variant is absent.
+  const aspectFor = (account: ZernioAccount): string => {
+    const choice = variantChoice[account.id] ?? 'auto'
+    return choice === 'auto' ? recommendedAspect(account.platform as ZernioPlatform) : choice
+  }
+  const variantFor = (account: ZernioAccount): { aspect_ratio: string; path: string } | null =>
+    clip.variants?.length ? pickVariant(clip.variants, aspectFor(account)) : null
+  const clipPathFor = (account: ZernioAccount): string => variantFor(account)?.path ?? clip.path
 
   // Facebook defaults to a Reel when the clip qualifies.
   const fbFormat: FacebookFormat = facebookFormat ?? (media ? defaultFacebookFormat(media) : 'feed')
@@ -381,7 +451,7 @@ export function PostDialog({ clips, onClose, onPosted, onNavigate, initial }: Po
         timing: mode === 'now' ? { mode: 'now' } : { mode: 'schedule', scheduledFor: new Date(scheduledAt).toISOString(), timezone: localTimeZone() },
         options: {
           ...(has('tiktok') ? { tiktok } : {}),
-          ...(has('youtube') ? { youtube: { ...youtube, title: youtube.title.trim() } } : {}),
+          ...(has('youtube') ? { youtube: { ...youtube, title: youtube.title.trim(), ...(sourceLink ? { sourceLink: true } : {}) } } : {}),
           ...(has('instagram') ? { instagram: { shareToFeed } } : {}),
           ...(has('facebook') ? { facebook: { format: fbFormat, ...(fbFormat === 'reel' && facebookTitle.trim() ? { title: facebookTitle.trim() } : {}) } } : {}),
           ...(has('threads') && threadsTopicTag.trim() ? { threads: { topicTag: threadsTopicTag.trim() } } : {})
@@ -413,6 +483,7 @@ export function PostDialog({ clips, onClose, onPosted, onNavigate, initial }: Po
     setCaption(defaultCaption(next.title, next.tags))
     setYoutube((y) => ({ ...y, title: youtubeTitleFor(next.title) || 'Untitled clip', tags: undefined, categoryId: undefined }))
     setPlatformCaptions({}); setFacebookTitle(''); setThreadsTopicTag(''); setEnhanced(false); setEnhancementOpen(false)
+    if (bulkStarts) setScheduleValue(bulkStarts[index + 1] ?? scheduleValue)
     // TikTok's consent covers one piece of content.
     setTiktok((t) => ({ ...t, consent: false }))
     setFacebookFormat(null)
@@ -511,9 +582,13 @@ export function PostDialog({ clips, onClose, onPosted, onNavigate, initial }: Po
         {clip.library && (enhancementOpen ? <LibraryMetadataEditor
           library={clip.library} options={{ platforms, notes: caption, facebookFormat: fbFormat }}
           onApply={applyMetadata} onClose={() => setEnhancementOpen(false)} onBusy={setMetadataBusy}
+          regenerateKey={regenerateKey}
         /> : <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="text-xs text-ink-muted">{enhanced ? 'Enhanced metadata applied. Review and edit below.' : 'Write platform-specific titles, captions and tags.'}</span>
           <Button size="sm" icon={<Sparkles className="h-3.5 w-3.5" />} disabled={!writingConfigured || !platforms.length || sending} onClick={() => setEnhancementOpen(true)}>Enhance metadata</Button>
+          {enhanced && <Button size="sm" variant="ghost" icon={<Sparkles className="h-3.5 w-3.5" />} disabled={!writingConfigured || !platforms.length || sending}
+            title="Discard the current draft and generate fresh platform-tailored copy for every selected account."
+            onClick={() => { setEnhanced(false); setPlatformCaptions({}); setRegenerateKey((key) => key + 1); setEnhancementOpen(true) }}>Regenerate All</Button>}
           {!writingConfigured && <p className="w-full text-xs text-ink-subtle">Add an OpenRouter key in Settings to enhance metadata.</p>}
         </div>)}
         <fieldset disabled={metadataBusy || sending} className="space-y-5">
@@ -546,9 +621,47 @@ export function PostDialog({ clips, onClose, onPosted, onNavigate, initial }: Po
 
         {has('youtube') && (
           <PlatformSection platform="youtube" notes={clipCheck('youtube')?.notes}>
-            <YouTubeFields value={youtube} onChange={setYoutube} problem={youtubeProblem} />
+            <YouTubeFields value={youtube} onChange={setYoutube} problem={youtubeProblem} sourceLinkAvailable={sourceLinkAvailable} />
           </PlatformSection>
         )}
+
+        {has('tiktok') || has('instagram') || has('facebook') || has('linkedin') || has('youtube') ? (
+          <Section title="Cover" aside={coverBusy ? <span className="text-2xs text-ink-subtle">Rendering…</span> : undefined}>
+            {coverPreview && <img src={localFileUrl(coverPreview)} alt="Cover preview" className="h-28 rounded-lg border border-white/10 object-cover" />}
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                aria-label="Cover frame position"
+                min={0}
+                max={Math.max(100, clip.durationMs)}
+                step={100}
+                value={cover?.kind === 'frame' ? cover.atMs : 0}
+                disabled={coverBusy || !libraryClip}
+                title={libraryClip ? 'Pick any frame as the cover' : 'Covers apply to clips from the Library'}
+                className="min-w-0 flex-1 accent-accent"
+                onChange={(event) => setCover({ kind: 'frame', atMs: Number(event.target.value) })}
+              />
+              <span className="w-12 text-right font-mono text-2xs tabular-nums text-ink-subtle">
+                {((cover?.kind === 'frame' ? cover.atMs : 0) / 1000).toFixed(1)}s
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex gap-2">
+                <Button size="sm" variant="ghost" disabled={coverBusy || !libraryClip}
+                  title={libraryClip ? 'Use the first frame as the cover' : 'Covers apply to clips from the Library'}
+                  onClick={() => persistCover({ kind: 'frame', atMs: 0 })}>First frame</Button>
+                <Button size="sm" variant="ghost" disabled={coverBusy || !libraryClip}
+                  title={libraryClip ? 'Upload your own cover image' : 'Covers apply to clips from the Library'}
+                  onClick={async () => {
+                    const path = await getApi().dialog.selectImage()
+                    if (path) persistCover({ kind: 'image', path })
+                  }}>Upload image</Button>
+                {cover && <Button size="sm" variant="ghost" disabled={coverBusy} onClick={() => persistCover(null)}>Use auto cover</Button>}
+              </div>
+              <span className="text-2xs text-ink-subtle">{libraryClip ? 'Applies to every post of this clip.' : 'Covers apply to Library clips.'}</span>
+            </div>
+          </Section>
+        ) : null}
 
         {has('tiktok') && (
           <PlatformSection
@@ -594,15 +707,21 @@ export function PostDialog({ clips, onClose, onPosted, onNavigate, initial }: Po
         )}
 
         {has('threads') && <Field label="Threads topic tag"><TextInput aria-label="Threads topic tag" value={threadsTopicTag} maxLength={50} onChange={(event) => setThreadsTopicTag(event.target.value)} /></Field>}
-        <WhenField
-          mode={mode}
-          onModeChange={setMode}
-          value={scheduleValue}
-          onValueChange={setScheduleValue}
-          min={toLocalInput(bounds.min)}
-          max={toLocalInput(bounds.max)}
-          problem={scheduleProblem}
-        />
+        {bulkStarts ? (
+          <p className="text-xs text-ink-subtle">
+            Bulk schedule: this clip posts {formatScheduled(new Date(scheduleValue).toISOString(), localTimeZone())}. Slots were set in the batch dialog.
+          </p>
+        ) : (
+          <WhenField
+            mode={mode}
+            onModeChange={setMode}
+            value={scheduleValue}
+            onValueChange={setScheduleValue}
+            min={toLocalInput(bounds.min)}
+            max={toLocalInput(bounds.max)}
+            problem={scheduleProblem}
+          />
+        )}
         </fieldset>
       </div>
     )
@@ -851,7 +970,7 @@ function SwitchRow({ checked, onChange, label, description, disabled }: { checke
   )
 }
 
-function YouTubeFields({ value, onChange, problem }: { value: YouTubePostOptions; onChange: (value: YouTubePostOptions) => void; problem: string | null }): React.JSX.Element {
+function YouTubeFields({ value, onChange, problem, sourceLinkAvailable }: { value: YouTubePostOptions; onChange: (value: YouTubePostOptions) => void; problem: string | null; sourceLinkAvailable: boolean }): React.JSX.Element {
   const id = useId()
   const [tagsText, setTagsText] = useState(() => value.tags?.join(', ') ?? '')
   const serializedTags = JSON.stringify(value.tags ?? [])
@@ -872,6 +991,13 @@ function YouTubeFields({ value, onChange, problem }: { value: YouTubePostOptions
       </div>
       <Field label="YouTube tags (comma separated)" htmlFor={`${id}-tags`}><TextInput id={`${id}-tags`} value={tagsText} onChange={(event) => { setTagsText(event.target.value); onChange({ ...value, tags: event.target.value.split(',').map((tag) => tag.trim()).filter(Boolean) }) }} /></Field>
       <Field label="YouTube category ID" htmlFor={`${id}-category`}><TextInput id={`${id}-category`} value={value.categoryId ?? ''} placeholder="Optional" maxLength={3} onChange={(event) => onChange({ ...value, categoryId: event.target.value || undefined })} /></Field>
+      <CheckRow
+        checked={Boolean(value.sourceLink)}
+        onChange={(checked) => onChange({ ...value, sourceLink: checked || undefined })}
+        disabled={!sourceLinkAvailable}
+        label="Add the full video link to your YouTube post"
+        description={sourceLinkAvailable ? 'The link lands between your caption and the hashtags, so viewers can find and watch the full video.' : 'This clip has no source video link.'}
+      />
       <div className="flex items-center justify-between gap-3">
         <span className="text-sm font-medium text-ink">Visibility</span>
         <Segmented<YouTubeVisibility>

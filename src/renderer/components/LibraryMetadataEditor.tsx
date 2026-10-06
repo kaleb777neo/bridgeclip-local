@@ -9,7 +9,11 @@ import { Callout } from './ui/Callout'
 import { Field, TextArea, TextInput } from './ui/Field'
 import { Switch } from './ui/Switch'
 
-export function LibraryMetadataEditor({ library, options, onApply, onClose, onBusy }: {
+type TitleStyle = 'interesting' | 'catchy' | 'serious' | 'question'
+
+export function LibraryMetadataEditor({ library, options, onApply, onClose, onBusy, regenerateKey }: {
+  /** Bump to discard the current draft and regenerate everything. */
+  regenerateKey?: number
   library: { outputDir: string; clipIndex: number }
   options: Omit<LibraryEnhancementOptions, 'source' | 'research'>
   onApply: (draft: MetadataEnhancement) => void
@@ -22,12 +26,17 @@ export function LibraryMetadataEditor({ library, options, onApply, onClose, onBu
   const [draft, setDraft] = useState<MetadataEnhancement | null>(null)
   const [busy, setBusy] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [styleBusy, setStyleBusy] = useState<TitleStyle | null>(null)
   const [error, setError] = useState<string | null>(null)
   const inFlight = useRef(false)
   const currentScope = [...options.platforms].sort().join(',') + ':' + options.facebookFormat
   const scope = useRef(currentScope)
   scope.current = currentScope
   useEffect(() => { setDraft(null) }, [currentScope])
+  useEffect(() => {
+    if (regenerateKey) { setDraft(null); void generate() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [regenerateKey])
   useEffect(() => {
     let active = true
     void getApi().history.metadataSource(library.outputDir, library.clipIndex)
@@ -36,6 +45,16 @@ export function LibraryMetadataEditor({ library, options, onApply, onClose, onBu
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
   }, [library.outputDir, library.clipIndex])
+  const regenerateTitle = async (style: TitleStyle): Promise<void> => {
+    const primary = draft?.posts.find((post) => post.title)
+    if (!primary?.title || styleBusy) return
+    setStyleBusy(style); setError(null)
+    try {
+      const result = await getApi().editor.titleStyle({ title: primary.title, caption: primary.caption, style })
+      setDraft((current) => current ? { ...current, posts: current.posts.map((post) => post === primary ? { ...post, title: result.title } : post) } : current)
+    } catch (cause) { setError(errorMessage(cause, 'Could not regenerate the title. Try again.')) }
+    finally { setStyleBusy(null) }
+  }
   const generate = async (): Promise<void> => {
     if (inFlight.current || !options.platforms.length) return
     inFlight.current = true
@@ -51,7 +70,18 @@ export function LibraryMetadataEditor({ library, options, onApply, onClose, onBu
   return <section className="glass-well space-y-3 rounded-xl p-4" aria-label="Enhance post metadata">
     <h3 className="text-sm font-semibold text-ink">{draft ? 'Review enhanced metadata' : 'Enhance title, caption & tags'}</h3>
     {error && <Callout tone="danger">{error}</Callout>}
-    {draft ? <MetadataDraftPreview draft={draft} /> : <>
+    {draft ? <>
+      <MetadataDraftPreview draft={draft} />
+      {draft.posts.some((post) => post.title) && <div className="space-y-1.5">
+        <p className="text-2xs text-ink-subtle">Regenerate the title in a different style:</p>
+        <div className="flex flex-wrap gap-1.5">
+          {([['interesting', 'Interesting'], ['catchy', 'Catchy'], ['serious', 'Serious'], ['question', 'Question']] as const).map(([style, label]) => (
+            <Button key={style} size="sm" variant="ghost" loading={styleBusy === style} disabled={Boolean(styleBusy) || busy}
+              onClick={() => { void regenerateTitle(style) }}>{label}</Button>
+          ))}
+        </div>
+      </div>}
+    </> : <>
       <p className="text-xs text-ink-muted">Uses the same transcript, source context and optional web research as automation enhancement. Uses your OpenRouter credits. Review the draft before applying it.</p>
       {loading ? <p role="status" className="text-xs text-ink-muted">Loading original video context…</p> : <fieldset disabled={busy} className="space-y-3">
         <Field label="Original video title" htmlFor={`${id}-title`}><TextInput id={`${id}-title`} value={source.title} maxLength={1024} onChange={(event) => setSource({ ...source, title: event.target.value })} /></Field>

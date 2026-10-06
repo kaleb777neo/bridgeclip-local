@@ -25,9 +25,11 @@ class AspectRatioType:
 
     VERTICAL (9:16): Standard for TikTok, Reels, Shorts - uses face tracking and smart cropping.
     HORIZONTAL (16:9): For YouTube and LinkedIn - simpler center-crop with captions.
+    SQUARE (1:1): Feed posts (Facebook, X, LinkedIn) - smart framing on a square canvas.
     """
     VERTICAL = "9:16"    # 1080x1920 - TikTok, Reels, Shorts (default)
     HORIZONTAL = "16:9"  # 1920x1080 - YouTube, LinkedIn
+    SQUARE = "1:1"       # 1080x1080 - feed posts
 
 
 def get_output_dimensions(aspect_ratio: str) -> tuple[int, int]:
@@ -35,13 +37,15 @@ def get_output_dimensions(aspect_ratio: str) -> tuple[int, int]:
     Get output dimensions for a given aspect ratio.
 
     Args:
-        aspect_ratio: One of AspectRatioType constants ('9:16' or '16:9')
+        aspect_ratio: One of AspectRatioType constants ('9:16', '16:9' or '1:1')
 
     Returns:
         Tuple of (width, height) in pixels
     """
     if aspect_ratio == AspectRatioType.HORIZONTAL:
         return (1920, 1080)
+    if aspect_ratio == AspectRatioType.SQUARE:
+        return (1080, 1080)
     # Default to vertical
     return (1080, 1920)
 
@@ -194,6 +198,10 @@ class CaptionStyle:
     # Pop the group in (scale overshoot) when it first appears
     entrance_pop: bool = True
 
+    # Entrance style for presets: pop = scale overshoot; slide variants fly the
+    # line in from a side; none keeps the line static.
+    entrance: str = "pop"  # pop | slide-left | slide-up | none
+
     # Karaoke: color sweeps across each word as it's spoken (\kf)
     karaoke_fill: bool = False
 
@@ -241,6 +249,23 @@ class CaptionPreset:
     HEADLINE = "headline"
     PAPER = "paper"
     SUBTLE = "subtle"
+    GLITCH = "glitch"
+    BOUNCE = "bounce"
+    QUAKE = "quake"
+    BLURSWITCH = "blurswitch"
+    HIGHLIGHTER = "highlighter"
+    SIMPLE = "simple"
+    TICKER = "ticker"
+    RETRO = "retro"
+    MONO = "mono"
+    DUO = "duo"
+    POPLINE = "popline"
+    SCALE = "scale"
+    SLIDE_LEFT = "slideleft"
+    SLIDE_UP = "slideup"
+    KARAOKE = "karaoke"
+    BEASTY = "beasty"
+    DEEPDIVER = "deepdiver"
 
 
 DEFAULT_CAPTION_PRESET = CaptionPreset.POP
@@ -262,6 +287,23 @@ def get_caption_preset(preset_id: str) -> CaptionStyle:
         CaptionPreset.HEADLINE: _create_headline_style,
         CaptionPreset.PAPER: _create_paper_style,
         CaptionPreset.SUBTLE: _create_subtle_style,
+        CaptionPreset.GLITCH: _create_glitch_style,
+        CaptionPreset.BOUNCE: _create_bounce_style,
+        CaptionPreset.QUAKE: _create_quake_style,
+        CaptionPreset.BLURSWITCH: _create_blurswitch_style,
+        CaptionPreset.HIGHLIGHTER: _create_highlighter_style,
+        CaptionPreset.SIMPLE: _create_simple_style,
+        CaptionPreset.TICKER: _create_ticker_style,
+        CaptionPreset.RETRO: _create_retro_style,
+        CaptionPreset.MONO: _create_mono_style,
+        CaptionPreset.DUO: _create_duo_style,
+        CaptionPreset.KARAOKE: _create_karaoke_style,
+        CaptionPreset.POPLINE: _create_popline_style,
+        CaptionPreset.SCALE: _create_scale_style,
+        CaptionPreset.SLIDE_LEFT: _create_slide_left_style,
+        CaptionPreset.SLIDE_UP: _create_slide_up_style,
+        CaptionPreset.BEASTY: _create_beasty_style,
+        CaptionPreset.DEEPDIVER: _create_deep_diver_style,
     }
 
     builder = builders.get(preset_id)
@@ -353,6 +395,108 @@ def get_available_presets() -> list[dict]:
             "description": "Light sentence case, no stroke, upcoming words dimmed - interviews & vlogs",
             "preview_colors": {"primary": "#FFFFFF", "highlight": "#C4F1FF"},
         },
+        {
+            "id": CaptionPreset.GLITCH,
+            "name": "Glitch",
+            "description": "Dense cyan pops, heavy black weight and tight tracking",
+            "preview_colors": {"primary": "#FFFFFF", "highlight": "#00E5FF"},
+        },
+        {
+            "id": CaptionPreset.BOUNCE,
+            "name": "Bounce",
+            "description": "Sunny pill under dark Poppins type - the springy one",
+            "preview_colors": {"primary": "#111111", "highlight": "#FFD60A"},
+        },
+        {
+            "id": CaptionPreset.QUAKE,
+            "name": "Quake",
+            "description": "One huge word at a time with a red-hot highlight",
+            "preview_colors": {"primary": "#FFFFFF", "highlight": "#FF4D4D"},
+        },
+        {
+            "id": CaptionPreset.BLURSWITCH,
+            "name": "Blur Switch",
+            "description": "Airy cyan highlights over a soft shadow - focus that switches",
+            "preview_colors": {"primary": "#FFFFFF", "highlight": "#9BE7FF"},
+        },
+        {
+            "id": CaptionPreset.HIGHLIGHTER,
+            "name": "Highlighter",
+            "description": "Dark type on a marker-yellow box, like highlighted notes",
+            "preview_colors": {"primary": "#111111", "highlight": "#FFE011"},
+        },
+        {
+            "id": CaptionPreset.SIMPLE,
+            "name": "Simple",
+            "description": "Clean lowercase Plus Jakarta with a whisper of shadow",
+            "preview_colors": {"primary": "#FFFFFF", "highlight": "#C4F1FF"},
+        },
+        {
+            "id": CaptionPreset.TICKER,
+            "name": "Ticker",
+            "description": "White type on a dark news band, five words wide",
+            "preview_colors": {"primary": "#FFFFFF", "highlight": "#0F172A"},
+        },
+        {
+            "id": CaptionPreset.RETRO,
+            "name": "Retro",
+            "description": "Italic serif with warm highlights and a gentle glow",
+            "preview_colors": {"primary": "#FFFFFF", "highlight": "#FFB347"},
+        },
+        {
+            "id": CaptionPreset.MONO,
+            "name": "Mono",
+            "description": "Spaced capitals with no outline - minimal and modern",
+            "preview_colors": {"primary": "#FFFFFF", "highlight": "#C4F1FF"},
+        },
+        {
+            "id": CaptionPreset.DUO,
+            "name": "Duo",
+            "description": "White type whose active word flips to green",
+            "preview_colors": {"primary": "#FFFFFF", "highlight": "#39FF6A"},
+        },
+        {
+            "id": CaptionPreset.KARAOKE,
+            "name": "Karaoke",
+            "description": "Karaoke sweep that colors each word as it is spoken",
+            "preview_colors": {"primary": "#FFFFFF", "highlight": "#FF3D6E"},
+        },
+        {
+            "id": CaptionPreset.POPLINE,
+            "name": "Pop Line",
+            "description": "The whole line pops in with a playful overshoot",
+            "preview_colors": {"primary": "#FFFFFF", "highlight": "#FF8A3D"},
+        },
+        {
+            "id": CaptionPreset.SCALE,
+            "name": "Scale",
+            "description": "Active words scale up as they are spoken",
+            "preview_colors": {"primary": "#FFFFFF", "highlight": "#7C5CFF"},
+        },
+        {
+            "id": CaptionPreset.SLIDE_LEFT,
+            "name": "Slide Left",
+            "description": "The line flies in from the right edge",
+            "preview_colors": {"primary": "#FFFFFF", "highlight": "#3DFF8B"},
+        },
+        {
+            "id": CaptionPreset.SLIDE_UP,
+            "name": "Slide Up",
+            "description": "The line rises into place from below",
+            "preview_colors": {"primary": "#FFFFFF", "highlight": "#4AC7FF"},
+        },
+        {
+            "id": CaptionPreset.BEASTY,
+            "name": "Beasty",
+            "description": "Huge uppercase beast-mode type on a black slab",
+            "preview_colors": {"primary": "#FFFFFF", "highlight": "#FFE01B"},
+        },
+        {
+            "id": CaptionPreset.DEEPDIVER,
+            "name": "Deep Diver",
+            "description": "Clean minimal white type with a whisper-thin outline",
+            "preview_colors": {"primary": "#FFFFFF", "highlight": "#9AE6FF"},
+        }
     ]
 
 
@@ -439,6 +583,118 @@ def _create_sweep_style() -> CaptionStyle:
     s.entrance_pop = False
     s.dim_opacity = 1.0
     s.emphasis_color = "#FFE234"
+    return s
+
+
+def _create_karaoke_style() -> CaptionStyle:
+    """Karaoke: creator-style word sweep, thick stroke, strong color pop."""
+    s = CaptionStyle()
+    s.font_name = "Poppins ExtraBold"
+    s.font_size = 84
+    s.uppercase = True
+    s.max_words_per_line = 3
+    s.highlight_color = "#FF3D6E"
+    s.outline_width = 6
+    s.karaoke_fill = True
+    s.entrance_pop = True
+    s.dim_opacity = 0.55
+    s.emphasis_color = "#FFE234"
+    return s
+
+
+def _create_popline_style() -> CaptionStyle:
+    """Pop Line: the line lands with a strong scale overshoot, warm highlight."""
+    s = CaptionStyle()
+    s.font_name = "Poppins ExtraBold"
+    s.font_size = 80
+    s.uppercase = True
+    s.max_words_per_line = 4
+    s.highlight_color = "#FF8A3D"
+    s.outline_width = 5
+    s.entrance = "pop"
+    s.entrance_pop = True
+    s.emphasis_color = "#FFD60A"
+    return s
+
+
+def _create_scale_style() -> CaptionStyle:
+    """Scale: the active word grows into place, purple pop on white."""
+    s = CaptionStyle()
+    s.font_name = "Montserrat Black"
+    s.font_size = 76
+    s.uppercase = True
+    s.max_words_per_line = 3
+    s.highlight_color = "#7C5CFF"
+    s.outline_width = 5
+    s.entrance = "pop"
+    s.entrance_pop = True
+    s.emphasis_color = "#7C5CFF"
+    return s
+
+
+def _create_slide_left_style() -> CaptionStyle:
+    """Slide Left: the line flies in from the right, green sweep highlight."""
+    s = CaptionStyle()
+    s.font_name = "Poppins ExtraBold"
+    s.font_size = 76
+    s.uppercase = True
+    s.max_words_per_line = 4
+    s.highlight_color = "#3DFF8B"
+    s.outline_width = 5
+    s.entrance = "slide-left"
+    s.entrance_pop = False
+    s.emphasis_color = "#3DFF8B"
+    return s
+
+
+def _create_slide_up_style() -> CaptionStyle:
+    """Slide Up: the line rises into place, sky-blue sweep highlight."""
+    s = CaptionStyle()
+    s.font_name = "Poppins ExtraBold"
+    s.font_size = 76
+    s.uppercase = True
+    s.max_words_per_line = 4
+    s.highlight_color = "#4AC7FF"
+    s.outline_width = 5
+    s.entrance = "slide-up"
+    s.entrance_pop = False
+    s.emphasis_color = "#4AC7FF"
+    return s
+
+
+def _create_beasty_style() -> CaptionStyle:
+    """Beasty: huge uppercase beast-mode type on a black slab, yellow highlight."""
+    s = CaptionStyle()
+    s.font_name = "Anton"
+    s.font_size = 132
+    s.uppercase = True
+    s.max_words_per_line = 2
+    s.highlight_color = "#FFE01B"
+    s.highlight_box_color = "#0B0B0D"
+    s.outline_width = 0
+    s.shadow_opacity = 0.85
+    s.shadow_blur = 1
+    s.shadow_offset = 8
+    s.future_words = "hide"
+    s.emphasis_color = "#FFE01B"
+    return s
+
+
+def _create_deep_diver_style() -> CaptionStyle:
+    """Deep Diver: clean minimal white type, thin outline, calm cadence."""
+    s = CaptionStyle()
+    s.font_name = "Montserrat"
+    s.font_size = 64
+    s.uppercase = False
+    s.max_words_per_line = 5
+    s.highlight_color = "#9AE6FF"
+    s.outline_color = "#101216"
+    s.outline_width = 2
+    s.shadow_opacity = 0.5
+    s.shadow_blur = 12
+    s.entrance_pop = False
+    s.dim_opacity = 0.7
+    s.emphasis_color = "#9AE6FF"
     return s
 
 
@@ -879,7 +1135,7 @@ class Settings(BaseSettings):
 
     @property
     def max_video_duration_seconds(self) -> int:
-        return 21600  # 6 hours max (credit-guarded in API)
+        return 36000  # 10 hours max
 
     # yt-dlp Configuration
     @property
@@ -892,7 +1148,7 @@ class Settings(BaseSettings):
 
     @property
     def max_download_duration_seconds(self) -> int:
-        return 21600  # 6 hours max (credit-guarded in API)
+        return 36000  # 10 hours max
 
     # Transcription uses the same OpenRouter key as planning, unless a backend
     # with a local faster-whisper stack runs it on this machine ("local" and
@@ -1042,6 +1298,131 @@ class Settings(BaseSettings):
     def get_ytdlp_extra_args(self) -> list[str]:
         """Parse yt-dlp extra arguments (none by default)."""
         return []
+
+
+def _create_bounce_style() -> CaptionStyle:
+    """Bounce: sunny pill under dark type; the springy pop reads as a bounce."""
+    s = CaptionStyle()
+    s.font_name = "Poppins Black"
+    s.font_size = 76
+    s.highlight_color = "#111111"
+    s.highlight_box_color = "#FFD60A"
+    s.highlight_box_padding = 14
+    s.outline_width = 4
+    s.max_words_per_line = 3
+    return s
+
+
+def _create_quake_style() -> CaptionStyle:
+    """Quake: one huge red-hot word at a time for high-impact moments."""
+    s = CaptionStyle()
+    s.font_name = "Anton"
+    s.font_size = 96
+    s.max_words_per_line = 1
+    s.outline_width = 8
+    s.highlight_color = "#FF4D4D"
+    s.shadow_opacity = 0.9
+    return s
+
+
+def _create_blurswitch_style() -> CaptionStyle:
+    """Blur switch: airy cyan highlights over a soft shadow — the words 'switch' focus."""
+    s = CaptionStyle()
+    s.font_name = "Montserrat ExtraBold"
+    s.font_size = 72
+    s.outline_width = 0
+    s.highlight_color = "#9BE7FF"
+    s.shadow_opacity = 0.55
+    s.max_words_per_line = 4
+    return s
+
+
+def _create_highlighter_style() -> CaptionStyle:
+    """Highlighter: dark type on a marker-yellow box, like highlighted notes."""
+    s = CaptionStyle()
+    s.font_name = "Archivo Black"
+    s.font_size = 68
+    s.outline_width = 0
+    s.uppercase = False
+    s.highlight_color = "#111111"
+    s.highlight_box_color = "#FFE011"
+    s.highlight_box_padding = 18
+    s.max_words_per_line = 4
+    return s
+
+
+def _create_simple_style() -> CaptionStyle:
+    """Simple: clean lowercase Plus Jakarta with a whisper of shadow."""
+    s = CaptionStyle()
+    s.font_name = "Plus Jakarta Sans"
+    s.font_size = 70
+    s.outline_width = 0
+    s.uppercase = False
+    s.shadow_opacity = 0.35
+    s.max_words_per_line = 4
+    return s
+
+
+def _create_ticker_style() -> CaptionStyle:
+    """Ticker: white type on a dark news band, up to five words per line."""
+    s = CaptionStyle()
+    s.font_name = "Archivo Black"
+    s.font_size = 64
+    s.outline_width = 0
+    s.highlight_color = "#FFFFFF"
+    s.highlight_box_color = "#0F172A"
+    s.highlight_box_padding = 20
+    s.max_words_per_line = 5
+    return s
+
+
+def _create_retro_style() -> CaptionStyle:
+    """Retro: italic serif with warm highlights and a gentle glow."""
+    s = CaptionStyle()
+    s.font_name = "Instrument Serif Italic"
+    s.font_size = 92
+    s.italic = True
+    s.uppercase = False
+    s.outline_width = 0
+    s.highlight_color = "#FFB347"
+    s.shadow_opacity = 0.5
+    s.max_words_per_line = 4
+    return s
+
+
+def _create_mono_style() -> CaptionStyle:
+    """Mono: spaced capitals, no outline — minimal and modern."""
+    s = CaptionStyle()
+    s.font_name = "Plus Jakarta Sans"
+    s.font_size = 66
+    s.letter_spacing = 3
+    s.outline_width = 0
+    s.shadow_opacity = 0
+    s.highlight_color = "#C4F1FF"
+    s.max_words_per_line = 4
+    return s
+
+
+def _create_duo_style() -> CaptionStyle:
+    """Duo: white type whose active word flips to green — two-tone energy."""
+    s = CaptionStyle()
+    s.font_name = "Montserrat ExtraBold"
+    s.font_size = 78
+    s.outline_width = 6
+    s.highlight_color = "#39FF6A"
+    s.max_words_per_line = 3
+    return s
+def _create_glitch_style() -> CaptionStyle:
+    """Glitch: dense cyan pops with heavy black weight and tight tracking."""
+    s = CaptionStyle()
+    s.font_name = "Anton"
+    s.font_size = 78
+    s.letter_spacing = 2
+    s.outline_width = 7
+    s.highlight_color = "#00E5FF"
+    s.shadow_opacity = 0.9
+    s.max_words_per_line = 2
+    return s
 
 
 @lru_cache()

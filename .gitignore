@@ -29,3 +29,6 @@ __pycache__/
 # Regenerable fixtures and specs
 engine/tests/test_speech.wav
 zernio-mcp/openapi.yaml
+# Local render output
+output/
+engine/output/

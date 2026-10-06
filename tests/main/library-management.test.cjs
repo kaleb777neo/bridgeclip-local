@@ -182,6 +182,58 @@ test('a run becoming active during manifest validation cannot be deleted', async
   } finally { f.cleanup() }
 })
 
+test('deleteJobRun removes a completed run folder and dismisses its session job', async () => {
+  const f = fixture()
+  const id = '11111111-aaaa-bbbb-cccc-dddddddddddd'
+  const run = path.join(f.library, id)
+  fs.mkdirSync(run)
+  const clip = path.join(run, 'clip_00.mp4')
+  fs.writeFileSync(clip, 'bytes')
+  fs.writeFileSync(path.join(run, 'job_output.json'), JSON.stringify({
+    source_video_title: 'UUID run',
+    clips: [{ clip_index: 0, s3_url: `file://${clip}`, duration_ms: 1000, start_time_ms: 0, end_time_ms: 1000, summary: 'x', virality_score: 0.5 }]
+  }))
+  await f.main.deleteJobRun(run)
+  assert.equal(fs.existsSync(run), false)
+  assert.deepEqual(f.dismissed, [id])
+  assert.deepEqual(fs.readdirSync(f.library), ['completed-run'], 'the other run stays and no deletion folder is left')
+  assert.equal(fs.readFileSync(f.clip, 'utf8'), 'clip bytes')
+})
+
+test('deleteJobRun removes an unfinished run that has no job_output manifest', async () => {
+  const f = fixture()
+  const id = '22222222-1111-2222-1111-222222222222'
+  const run = path.join(f.library, id)
+  fs.mkdirSync(run)
+  fs.writeFileSync(path.join(run, 'run.log'), 'partial output only')
+  await f.main.deleteJobRun(run)
+  assert.equal(fs.existsSync(run), false, 'a failed/cancelled/interrupted folder is still removed')
+  assert.deepEqual(f.dismissed, [id])
+  assert.deepEqual(fs.readdirSync(f.library), ['completed-run'])
+})
+
+test('deleteJobRun refuses non-UUID names, outside paths, nested folders and live runs', async () => {
+  const f = fixture()
+  const notUuid = path.join(f.library, 'finished-run')
+  fs.mkdirSync(notUuid); fs.writeFileSync(path.join(notUuid, 'run.log'), 'x')
+  const nested = path.join(f.run, 'sub'); fs.mkdirSync(nested)
+  const cases = [
+    [notUuid, /cannot be deleted/],
+    [path.join(f.library, 'not-an-uuid'), /cannot be deleted/],
+    [f.library, /cannot be deleted/],
+    [f.dir, /cannot be deleted/],
+    [nested, /cannot be deleted/],
+    ['relative/33333333-3333-3333-3333-333333333333', /Library/]
+  ]
+  for (const [target, reason] of cases) await assert.rejects(f.main.deleteJobRun(target), reason)
+  const live = path.join(f.library, '33333333-3333-3333-3333-333333333333')
+  fs.mkdirSync(live); fs.writeFileSync(path.join(live, 'run.log'), 'x')
+  f.active.add('33333333-3333-3333-3333-333333333333')
+  await assert.rejects(f.main.deleteJobRun(live), /finish/)
+  assert.ok(fs.existsSync(live), 'a running job is never deleted')
+  assert.deepEqual(f.dismissed, [])
+})
+
 test('a favorite marker symlink cannot overwrite a file outside the run', async (t) => {
   if (!directoryLinkType) { t.skip('Symlinks unavailable'); return }
   const f = fixture()
@@ -225,7 +277,7 @@ test('selected clip deletion preserves sources, unselected files, metadata, post
     fs.copyFileSync(f.output.clips[1].s3_url, copy)
     await f.main.setLibraryPosted(f.run, 0, true)
     await f.main.setLibraryPosted(f.run, 2, true)
-    const output = await f.main.deleteLibraryClips(f.run, [2, 9])
+    const output = await f.main.deleteClipArtifacts(f.run, [2, 9])
     assert.equal(f.main.files.isManuallyPosted(f.run, 0), true)
     assert.equal(fs.existsSync(path.join(f.run, '.bridgeclip-posted-2')), false)
     assert.deepEqual(output.clips.map(c => c.clip_index), [0])
@@ -246,7 +298,7 @@ test('selected clip deletion preserves sources, unselected files, metadata, post
     assert.deepEqual(project.candidates[1].ranges, f.project.candidates[1].ranges)
     assert.deepEqual(project.transcript, f.project.transcript)
     assert.deepEqual(f.dismissed, [])
-    await f.main.deleteLibraryClips(f.run, [0])
+    await f.main.deleteClipArtifacts(f.run, [0])
     assert.equal((await f.reload().files.getJobHistory(f.library))[0].clipCount, 0)
     assert.equal(JSON.parse(fs.readFileSync(path.join(f.run, 'job_output.json'))).next_clip_index, 10)
     assert.ok(fs.existsSync(path.join(f.run, 'editor-source.mp4')))
@@ -257,21 +309,21 @@ test('selected clip deletion preserves sources, unselected files, metadata, post
 test('clip deletion rejects invalid selections and unsafe media without removing any files', async () => {
   const f = clipFixture()
   try {
-    for (const ids of [[], null, '0', [0, 0], [1], [-1], [0.1], [1000], ['0']]) await assert.rejects(f.main.deleteLibraryClips(f.run, ids))
-    for (const run of [f.library, f.dir, 'relative']) await assert.rejects(f.main.deleteLibraryClips(run, [0]))
+    for (const ids of [[], null, '0', [0, 0], [1], [-1], [0.1], [1000], ['0']]) await assert.rejects(f.main.deleteClipArtifacts(f.run, ids))
+    for (const run of [f.library, f.dir, 'relative']) await assert.rejects(f.main.deleteClipArtifacts(run, [0]))
     const keep = path.join(f.dir, 'clip_00.mp4')
     fs.writeFileSync(keep, 'outside')
     for (const file of [keep, path.join(f.run, 'editor-source.mp4')]) {
       const altered = structuredClone(f.output); altered.clips[0].s3_url = file
       fs.writeFileSync(path.join(f.run, 'job_output.json'), JSON.stringify(altered))
-      await assert.rejects(f.main.deleteLibraryClips(f.run, [0]), /outside/)
+      await assert.rejects(f.main.deleteClipArtifacts(f.run, [0]), /outside/)
       assert.ok(fs.existsSync(file))
     }
     fs.writeFileSync(path.join(f.run, 'job_output.json'), JSON.stringify(f.output))
     if (directoryLinkType) {
       const clip = path.join(f.run, 'clip_00.mp4')
       fs.unlinkSync(clip); fs.symlinkSync(keep, clip)
-      await assert.rejects(f.main.deleteLibraryClips(f.run, [0]), /unsafe/)
+      await assert.rejects(f.main.deleteClipArtifacts(f.run, [0]), /unsafe/)
       assert.equal(fs.readFileSync(keep, 'utf8'), 'outside')
     }
     assert.ok(fs.existsSync(path.join(f.run, 'clip_02.mp4')))
@@ -285,7 +337,7 @@ test('clip deletion restores media and both manifests if committing the output f
     fs.renameSync(from, to)
   } } })
   try {
-    await assert.rejects(f.main.deleteLibraryClips(f.run, [0, 2]), /disk failure/)
+    await assert.rejects(f.main.deleteClipArtifacts(f.run, [0, 2]), /disk failure/)
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.run, 'job_output.json'))), f.output)
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.run, 'editor-project.json'))), f.project)
     for (const clip of f.output.clips) assert.ok(fs.existsSync(clip.s3_url))
@@ -297,9 +349,9 @@ test('overlapping deletions re-read current metadata and tolerate already missin
   const f = clipFixture()
   try {
     fs.unlinkSync(path.join(f.run, 'clip_02.mp4'))
-    await Promise.all([f.main.deleteLibraryClips(f.run, [2]), f.main.deleteLibraryClips(f.run, [9])])
+    await Promise.all([f.main.deleteClipArtifacts(f.run, [2]), f.main.deleteClipArtifacts(f.run, [9])])
     assert.deepEqual((await f.main.files.getJobOutput(f.run)).clips.map(c => c.clip_index), [0])
-    await assert.rejects(f.main.deleteLibraryClips(f.run, [2]), /no longer/)
+    await assert.rejects(f.main.deleteClipArtifacts(f.run, [2]), /no longer/)
   } finally { f.cleanup() }
 })
 
@@ -308,9 +360,99 @@ test('clip deletion refuses active jobs and editor operations', async () => {
   const f = clipFixture({ './clip-editor': { editorBusy: () => busy } })
   try {
     busy = true
-    await assert.rejects(f.main.deleteLibraryClips(f.run, [0]), /editor to finish/)
+    await assert.rejects(f.main.deleteClipArtifacts(f.run, [0]), /editor to finish/)
     busy = false; f.active.add('completed-run')
-    await assert.rejects(f.main.deleteLibraryClips(f.run, [0]), /run to finish/)
+    await assert.rejects(f.main.deleteClipArtifacts(f.run, [0]), /run to finish/)
     assert.ok(fs.existsSync(path.join(f.run, 'clip_00.mp4')))
+  } finally { f.cleanup() }
+})
+
+test('duplicating a clip copies the render and srt, clones its editor candidate and never touches the original', async () => {
+  const f = clipFixture()
+  try {
+    // Mirror the engine: each rendered clip records the candidate that baked it.
+    const linked = JSON.parse(fs.readFileSync(path.join(f.run, 'job_output.json'), 'utf8'))
+    const owners = { 0: 'candidate-0', 2: 'candidate-1', 9: 'candidate-2' }
+    for (const clip of linked.clips) clip.editor_candidate = owners[clip.clip_index]
+    fs.writeFileSync(path.join(f.run, 'job_output.json'), JSON.stringify(linked))
+    const fresh = await f.main.duplicateClipArtifacts(f.run, [0])
+    // The duplicate is a new, never-recycled index with its own render and captions.
+    const original = fresh.clips.find((clip) => clip.clip_index === 0)
+    // The editor link lives on the raw manifest entry (parsed output drops it by design).
+    const duplicate = JSON.parse(fs.readFileSync(path.join(f.run, 'job_output.json'), 'utf8')).clips
+      .find((clip) => clip.clip_index === 1)
+    assert.ok(original && duplicate, 'the original stays and the duplicate lands at the first free index')
+    assert.equal(fs.readFileSync(path.join(f.run, 'clip_01.mp4'), 'utf8'), 'clip 0', 'the render is copied')
+    assert.equal(fs.readFileSync(path.join(f.run, 'clip_01.srt'), 'utf8'), 'sidecar', 'the captions sidecar is copied')
+    assert.equal(fresh.total_clips, 4)
+    assert.equal(original.summary, duplicate.summary, 'all settings carry over')
+    // The editor candidate is a clone: same edits, independent identity.
+    const project = JSON.parse(fs.readFileSync(path.join(f.run, 'editor-project.json'), 'utf8'))
+    const originalCandidate = project.candidates.find((c) => c.id === 'candidate-0')
+    const clonedCandidate = project.candidates.find((c) => c.id === duplicate.editor_candidate)
+    assert.ok(clonedCandidate, 'the duplicate links its own candidate')
+    assert.notEqual(clonedCandidate.id, originalCandidate.id)
+    assert.deepEqual(clonedCandidate.ranges, originalCandidate.ranges)
+    assert.deepEqual(clonedCandidate.exports, [1])
+    assert.deepEqual(originalCandidate.exports, [0, 2], 'the original candidate is untouched')
+    assert.ok(project.revision >= 1)
+    // An unedited clip duplicates without an editor link.
+    const plain = await f.main.duplicateClipArtifacts(f.run, [9])
+    const plainDuplicate = plain.clips.at(-1)
+    assert.equal(plainDuplicate.editor_candidate, undefined)
+    assert.equal(fs.existsSync(path.join(f.run, 'clip_03.mp4')), true)
+    await assert.rejects(f.main.duplicateClipArtifacts(f.run, [42]), /no longer in this run/)
+    await assert.rejects(f.main.duplicateClipArtifacts(f.run, 'zero'), /Select clips/)
+  } finally { f.cleanup() }
+})
+
+test('a failed duplication rolls the manifests back instead of stranding them in staging', async () => {
+  // renameSync fails exactly when the new job_output.json is being installed:
+  // the original has already been moved into staging, which the old rollback
+  // then deleted together with the staging dir — a permanent manifest loss.
+  const f = clipFixture({
+    fs: new Proxy({}, {
+      get(_target, prop) {
+        const value = fs[prop]
+        if (prop !== 'renameSync' || typeof value !== 'function') return value
+        return (source, dest) => {
+          if (typeof source === 'string' && source.includes('new-job_output.json')) throw new Error('injected rename failure')
+          return value.call(fs, source, dest)
+        }
+      }
+    })
+  })
+  try {
+    const manifestBefore = fs.readFileSync(path.join(f.run, 'job_output.json'), 'utf8')
+    const projectBefore = fs.readFileSync(path.join(f.run, 'editor-project.json'), 'utf8')
+    await assert.rejects(f.main.duplicateClipArtifacts(f.run, [0]), /injected rename failure/)
+    assert.equal(fs.readFileSync(path.join(f.run, 'job_output.json'), 'utf8'), manifestBefore, 'the original manifest comes back')
+    assert.equal(fs.readFileSync(path.join(f.run, 'editor-project.json'), 'utf8'), projectBefore, 'the half-installed project is replaced by its original')
+    assert.equal(fs.readFileSync(path.join(f.run, 'clip_00.mp4'), 'utf8'), 'clip 0', 'the render stays')
+    assert.equal(fs.readdirSync(f.run).filter((name) => name.startsWith('.duplicate-clips-')).length, 0, 'no staging left behind')
+  } finally { f.cleanup() }
+})
+
+test('a clip cover persists on the manifest, copies uploads into the run and clears back to auto', async () => {
+  const f = clipFixture()
+  try {
+    const outside = path.join(f.dir, 'brand-cover.jpg')
+    fs.writeFileSync(outside, 'cover bytes')
+    assert.equal(await f.main.clipThumbnail(f.run, 0), null, 'clips start with the auto cover')
+    const stored = await f.main.setClipThumbnail(f.run, 0, { kind: 'frame', atMs: 1500 })
+    assert.deepEqual(stored, { kind: 'frame', atMs: 1500 })
+    assert.deepEqual(await f.main.clipThumbnail(f.run, 0), { kind: 'frame', atMs: 1500 })
+    const uploaded = await f.main.setClipThumbnail(f.run, 0, { kind: 'image', path: outside })
+    assert.equal(uploaded.kind, 'image')
+    assert.match(uploaded.file, /clip_00-cover\.jpg$/)
+    assert.equal(fs.readFileSync(path.join(f.run, uploaded.file), 'utf8'), 'cover bytes', 'the upload is copied into the run')
+    const raw = JSON.parse(fs.readFileSync(path.join(f.run, 'job_output.json'), 'utf8'))
+    assert.deepEqual(raw.clips[0].thumbnail, { kind: 'image', file: uploaded.file })
+    assert.deepEqual(await f.main.setClipThumbnail(f.run, 0, null), null, 'clearing restores the auto cover')
+    assert.equal(await f.main.clipThumbnail(f.run, 0), null)
+    const cleared = JSON.parse(fs.readFileSync(path.join(f.run, 'job_output.json'), 'utf8'))
+    assert.equal(cleared.clips[0].thumbnail, undefined, 'the manifest entry drops the cover key')
+    await assert.rejects(f.main.setClipThumbnail(f.run, 0, { kind: 'frame', atMs: -5 }), /Pick a frame/)
+    await assert.rejects(f.main.setClipThumbnail(f.run, 7, { kind: 'image', path: outside }), /no longer in this run/)
   } finally { f.cleanup() }
 })

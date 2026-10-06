@@ -20,16 +20,34 @@ test('caption position is validated, saved in render edits and reset without cha
   assert.equal(reset.caption_y, null)
 })
 
+test('caption x is validated, saved in render edits and defaults to centered', () => {
+  const old = schema.parseEditorProject(structuredClone(fixture)).candidates[0]
+  assert.equal(old.caption_x, null)
+  for (const x of [NaN, Infinity, -.1, .09, .91, true, '0.5', {}]) {
+    assert.throws(() => schema.parseCandidateEdit({ ...old, caption_x: x }, fixture.duration_ms))
+  }
+  const ready = { ...old, status: 'ready' }
+  const placed = schema.refineEdit(ready, { caption_x: .3, caption_y: .5 })
+  assert.equal(placed.status, 'refining')
+  assert.equal(schema.candidateEdit(placed).caption_x, .3)
+  assert.notEqual(schema.renderEditKey(placed), schema.renderEditKey(ready))
+  const reset = schema.parseCandidateEdit(schema.candidateEdit({ ...placed, caption_x: null }), fixture.duration_ms)
+  assert.equal(reset.caption_x, null)
+})
+
 test('automatic caption anchors follow portrait layouts and landscape; manual placement overrides them', () => {
   const project = schema.parseEditorProject(structuredClone(fixture)), c = project.candidates[0]
   c.scenes = [{ at_ms: 0, layout: 'fill', crops: [[0, 0, 1, 1]] }]
-  assert.deepEqual(schema.captionAnchor(project, c, 2000), { y: 1340 / 1920, bottom: false })
+  assert.deepEqual(schema.captionAnchor(project, c, 2000), { x: 0.5, y: 1340 / 1920, bottom: false })
   c.scenes[0].layout = 'split'
-  assert.deepEqual(schema.captionAnchor(project, c, 2000), { y: .5, bottom: false })
+  assert.deepEqual(schema.captionAnchor(project, c, 2000), { x: 0.5, y: .5, bottom: false })
   c.scenes[0].layout = 'fit'
   assert.equal(schema.captionAnchor(project, c, 2000).bottom, true)
   project.aspect_ratio = '16:9'
-  assert.deepEqual(schema.captionAnchor(project, c, 2000), { y: 1 - 100 / 1080, bottom: true })
+  assert.deepEqual(schema.captionAnchor(project, c, 2000), { x: 0.5, y: 1 - 100 / 1080, bottom: true })
   c.caption_y = .2
-  assert.deepEqual(schema.captionAnchor(project, c, 2000), { y: .2, bottom: false })
+  assert.deepEqual(schema.captionAnchor(project, c, 2000), { x: 0.5, y: .2, bottom: false })
+  // A manual x rides every layout anchor.
+  c.caption_x = .7
+  assert.equal(schema.captionAnchor(project, c, 2000).x, .7)
 })

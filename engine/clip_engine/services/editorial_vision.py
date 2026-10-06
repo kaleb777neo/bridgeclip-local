@@ -4,6 +4,7 @@ Jev never receives images. These descriptions are explicitly model inferences
 about sampled instants; absent actions remain unknown.
 """
 import asyncio
+from clip_engine import asyncio_compat  # Installs asyncio.timeout on Python 3.10
 import base64
 import hashlib
 import json

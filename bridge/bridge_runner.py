@@ -46,8 +46,8 @@ FAILURES = (
      "This Twitch video is still live or processing.",
      "Wait until the broadcast has ended and its saved video is ready, then retry."),
     (("twitch vod duration is invalid or too long",),
-     "This Twitch video has no usable duration or exceeds the six hour limit.",
-     "Choose a completed video under six hours, or trim a downloaded file before adding it."),
+     "This Twitch video has no usable duration or exceeds the allowed length.",
+     "Choose a completed video within the length limit, or trim a downloaded file before adding it."),
     (("twitch vod unavailable",),
      "The Twitch VOD could not be downloaded.",
      "Check that the saved video plays while signed out. Deleted, expired and subscriber-only videos are not supported. You can also use a local file."),
@@ -368,6 +368,7 @@ async def run(config: dict) -> bool:
         auto_clip_count=config.get("auto_clip_count", True),
         duration_ranges=duration_ranges,
         aspect_ratio=config.get("aspect_ratio", "9:16"),
+        aspect_ratios=config.get("aspect_ratios"),
         layout_style=config.get("layout_style") or "auto",
         debug_capture=config.get("debug_capture", False),
         pacing=config.get("pacing") or "tight",
@@ -380,7 +381,13 @@ async def run(config: dict) -> bool:
         banner_platform=config.get("banner_platform"),
         banner_channel_url=config.get("banner_channel_url"),
         keyterms=config.get("keyterms") or None,
+        srt_path=config.get("srt_path"),
+        subject=config.get("subject"),
         clip_request=config.get("clip_request"),
+        logo=config.get("logo"),
+        intro=config.get("intro"),
+        outro=config.get("outro"),
+        cta_badges=config.get("cta_badges") or [],
     )
 
     emit({
@@ -454,8 +461,18 @@ def validate_config(config: object) -> dict:
     count = config.get("max_clips")
     if count is not None and (type(count) is not int or not 1 <= count <= 100):
         raise ValueError("max_clips must be between 1 and 100")
-    if config.get("aspect_ratio", "9:16") not in ("9:16", "16:9"):
+    if config.get("aspect_ratio", "9:16") not in ("9:16", "16:9", "1:1"):
         raise ValueError("Invalid aspect ratio")
+    ratios = config.get("aspect_ratios")
+    if ratios is not None and (
+        not isinstance(ratios, list) or not 1 <= len(ratios) <= 3 or len(set(ratios)) != len(ratios) or
+        any(not isinstance(ratio, str) or ratio not in ("9:16", "16:9", "1:1") for ratio in ratios)
+    ):
+        raise ValueError("Invalid aspect ratios")
+    if config.get("workflow", "automatic") == "review" and (
+        (ratios and len(ratios) > 1) or ("1:1" in (ratios or []) and config.get("aspect_ratio", "9:16") != "1:1")
+    ):
+        raise ValueError("Review & edit renders a single 9:16, 16:9 or 1:1 video")
     if config.get("layout_style", "auto") not in ("auto", "fill", "fit"):
         raise ValueError("Invalid layout style")
     if config.get("pacing", "tight") not in ("tight", "natural"):
@@ -497,6 +514,46 @@ def validate_config(config: object) -> dict:
         any(item not in DURATION_RANGE_IDS for item in ranges)
     ):
         raise ValueError("Invalid clip duration")
+    # Brand-template overlays, snapshotted by main; the logo path is main-owned.
+    logo = config.get("logo")
+    if logo is not None:
+        if not isinstance(logo, dict):
+            raise ValueError("Invalid brand logo")
+        path = logo.get("path")
+        if not isinstance(path, str) or not os.path.isabs(path) or "\0" in path or len(path) > 4096:
+            raise ValueError("Invalid brand logo path")
+        if logo.get("position") not in ("top-left", "top-right", "bottom-left", "bottom-right", "center"):
+            raise ValueError("Invalid brand logo position")
+        for field, lo, hi in (("scale", 0.05, 0.5), ("opacity", 0.1, 1), ("margin", 0, 0.5)):
+            value = logo.get(field)
+            if field == "margin" and value is None:
+                continue
+            if type(value) not in (int, float) or not lo <= value <= hi:
+                raise ValueError(f"Invalid brand logo {field}")
+    # Intro/outro brand videos: only the main-owned snapshot path crosses the bridge.
+    for slot in ("intro", "outro"):
+        video = config.get(slot)
+        if video is None:
+            continue
+        if not isinstance(video, dict):
+            raise ValueError(f"Invalid brand {slot}")
+        path = video.get("path")
+        if not isinstance(path, str) or not os.path.isabs(path) or "\0" in path or len(path) > 4096:
+            raise ValueError(f"Invalid brand {slot} path")
+    badges = config.get("cta_badges")
+    if badges is not None:
+        if not isinstance(badges, list) or len(badges) > 4:
+            raise ValueError("Invalid CTA badges")
+        for badge in badges:
+            if not isinstance(badge, dict):
+                raise ValueError("Invalid CTA badges")
+            if badge.get("kind") not in ("subscribe", "follow") or badge.get("position") not in (
+                "top-left", "top-right", "bottom-left", "bottom-right", "center"
+            ):
+                raise ValueError("Invalid CTA badges")
+            margin = badge.get("margin")
+            if margin is not None and (type(margin) not in (int, float) or not 0 <= margin <= 0.5):
+                raise ValueError("Invalid CTA badges")
     return config
 
 
@@ -507,7 +564,13 @@ def main() -> int:
     try:
         # Legacy CLI argument remains accepted; Electron uses stdin to keep
         # private source URLs out of process listings. Bound either transport.
-        raw = sys.argv[1] if len(sys.argv) == 2 else sys.stdin.read(65537)
+        if len(sys.argv) == 2:
+            raw = sys.argv[1]
+        else:
+            # Electron sends UTF-8; read bytes and decode explicitly so the
+            # Windows text layer (ANSI code page) cannot mangle diacritics.
+            stream = getattr(sys.stdin, 'buffer', None)
+            raw = stream.read(65537).decode('utf-8') if stream is not None else sys.stdin.read(65537)
         if len(raw) > 65536:
             raise ValueError("Config too large")
         config = validate_config(json.loads(raw))

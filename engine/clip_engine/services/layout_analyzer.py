@@ -162,6 +162,11 @@ LIP_MIN_COMPETING_AREA = 0.45
 LIP_NOISE_FLOOR = 1.5
 LIP_ACTIVITY_RATIO = 1.6
 LIP_MIN_SAMPLES = 4
+# Mid-shot turn-taking: re-pick the speaker every LIP_WINDOW_MS and only
+# commit a change once the same new winner holds LIP_SWITCH_CONFIRM windows
+# in a row, so one noisy window cannot jerk the camera across a split screen.
+LIP_WINDOW_MS = 2000
+LIP_SWITCH_CONFIRM = 2
 # Mouth band within a YuNet face box (boxes span forehead to chin).
 LIP_MOUTH_X = (0.28, 0.72)
 LIP_MOUTH_Y = (0.60, 0.95)
@@ -214,6 +219,17 @@ class Box:
 
     def to_list(self) -> list[float]:
         return [round(self.x, 4), round(self.y, 4), round(self.w, 4), round(self.h, 4)]
+
+
+def compact_focus_path(path: list[tuple[int, float, float]], limit: int = 40) -> list[list]:
+    """Downsample a focus path for JSON: strided points plus the true last one."""
+    if not path:
+        return []
+    step = max(1, -(-len(path) // limit))
+    points = list(path[::step])
+    if points[-1] is not path[-1]:
+        points.append(path[-1])
+    return [[int(t), round(cx, 4), round(cy, 4)] for t, cx, cy in points]
 
 
 @dataclass
@@ -270,8 +286,15 @@ class ShotLayout:
     cam_box_refined: bool = False
     manual_crops: list[tuple[float, float, float, float]] = field(default_factory=list)
     manual_from_crops: list[tuple[float, float, float, float]] = field(default_factory=list)
+    # Editor fill scenes keep the analyzer's focus path: (t_ms from shot start,
+    # cx, cy), so the baked crop follows the speaker instead of sitting still.
+    manual_focus_path: list[tuple[int, float, float]] = field(default_factory=list)
     manual_transition_start_ms: int = 0
     manual_transition_ms: int = 0
+    # Editor transition kinds that render as an xfade at this shot's incoming
+    # boundary (0/'fade' = none): duration in window ms and FFmpeg transition.
+    manual_xfade_ms: int = 0
+    manual_xfade_kind: str = "fade"
 
     def summary(self) -> dict:
         return {
@@ -286,6 +309,9 @@ class ShotLayout:
             "content_box": self.content_box.to_list() if self.content_box else None,
             "crop_bounds": self.crop_bounds.to_list() if self.crop_bounds else None,
             "cam_box_refined": self.cam_box_refined,
+            # Kept so an editor import can rebuild this exact framing without
+            # paying for the analysis a second time.
+            "focus_path": compact_focus_path(self.focus_path),
         }
 
 
@@ -621,20 +647,20 @@ def inset_speaker(
 
 def heuristic_layout(
     frames: list[FrameInfo], start_ms: int, end_ms: int, src_w: int, src_h: int,
-    diagnostic: Optional[dict] = None,
+    diagnostic: Optional[dict] = None, subject: Optional[dict] = None,
 ) -> ShotLayout:
     """Classify and track only the faces belonging to this layout segment."""
     content = segment_content_box(frames)
     tracks = track_faces(frames)
     bounds = None
-    if content is not None:
+    if content is not None and subject is None:
         main_track = inset_speaker(tracks, len(frames), content, src_w, src_h)
         if main_track is None:
             return ShotLayout(start_ms, end_ms, LayoutType.SCREEN, content_box=content)
         shot, bounds = ShotLayout(0, 0, LayoutType.TALKING_HEAD, people=[main_track.median_box()],
                                   crop_bounds=content), content
     else:
-        shot, main_track = classify_shot(tracks, len(frames), src_w, src_h)
+        shot, main_track = classify_shot(tracks, len(frames), src_w, src_h, subject)
     if diagnostic is not None:
         lookup = {(f.t_ms, id(box)): i for f in frames for i, box in enumerate(f.faces)}
         diagnostic["tracks"] = [{"id": i, "selected": track is main_track,
@@ -1012,12 +1038,26 @@ def expanded_webcam_intervals(
 
 def classify_shot(
     tracks: list[FaceTrack], shot_frames: int, src_w: int, src_h: int,
+    subject: Optional[dict] = None,
 ) -> tuple[ShotLayout, Optional[FaceTrack]]:
     """Heuristic layout for one shot from its face tracks.
 
     Returns the layout (times filled in by the caller) and, for talking-head
     shots, the track the camera should follow.
+
+    `subject` is a manual tracking hint: a normalized click point on the
+    frame. The on-camera track nearest the click becomes the followed
+    subject, even when another face is larger or a two-shot would fit —
+    the user asked to steer.
     """
+    if subject is not None:
+        px, py = float(subject['x']), float(subject['y'])
+        pool = [t for t in tracks if t.median_box().h >= MIN_FACE_HEIGHT]
+        if pool:
+            nearest = min(pool, key=lambda t: math.hypot(t.median_box().cx - px, t.median_box().cy - py))
+            box = nearest.median_box()
+            if math.hypot(box.cx - px, box.cy - py) <= 0.3:
+                return ShotLayout(0, 0, LayoutType.TALKING_HEAD, people=[box]), nearest
     present = [
         t for t in tracks
         if len(t.samples) >= max(1, MIN_TRACK_PRESENCE * shot_frames)
@@ -1061,8 +1101,11 @@ def competing_faces(tracks: list[FaceTrack], shot_frames: int) -> Optional[list[
     """The two largest on-camera tracks, when a listener could hold the lock.
 
     Mirrors classify_shot's subject selection, so the first track is whoever
-    the camera currently follows. None when the subject is uncontested or the
-    frame is already a balanced two shot (both people get framed anyway).
+    the camera currently follows. None when the subject is uncontested. There
+    is deliberately no "balanced two shot" exemption here: this only runs on a
+    TALKING_HEAD shot, whose narrow 9:16 crop follows a single face, so two
+    comparable people (side by side, or in split-screen panels that can never
+    share the crop) are exactly the ambiguous case worth a mouth decode.
     """
     present = [
         t for t in tracks
@@ -1075,10 +1118,6 @@ def competing_faces(tracks: list[FaceTrack], shot_frames: int) -> Optional[list[
         return None
     a, b = on_camera[0].median_box(), on_camera[1].median_box()
     if b.area < LIP_MIN_COMPETING_AREA * a.area:
-        return None
-    similar = min(a.h, b.h) / max(a.h, b.h) >= 0.5
-    separated = abs(a.cx - b.cx) >= 0.22
-    if len(on_camera) == 2 and similar and separated:
         return None
     return on_camera[:2]
 
@@ -1134,12 +1173,67 @@ def pick_talking_track(deltas: list[list[float]]) -> Optional[int]:
     return best
 
 
-def retarget_subject(shot: ShotLayout, track: FaceTrack, shot_start: int, shot_end: int,
-                     src_w: int, src_h: int) -> None:
-    """Repoint a talking-head shot's virtual camera at another face track."""
-    shot.people = [track.median_box()]
-    samples = [(t - shot_start, box) for t, box in track.samples]
-    shot.focus_path = smooth_focus_path(samples, shot_end - shot_start,
+def pick_speaker_timeline(deltas: list[list[float]], duration_ms: int,
+                          window_ms: int = LIP_WINDOW_MS) -> list[tuple[int, int]]:
+    """Committed (t_ms from shot start, track index) switch points across a shot.
+
+    Re-runs the mouth gate every `window_ms` and follows turn-taking, but a new
+    speaker is only adopted after it wins `LIP_SWITCH_CONFIRM` consecutive
+    windows; inconclusive windows hold the current subject. The list always
+    starts at (0, 0) so callers can treat it as a step function.
+    """
+    if len(deltas) < 2 or duration_ms <= 0:
+        return [(0, 0)]
+    frames_per_window = max(1, round(window_ms / 1000 * LIP_FPS))
+    committed: list[tuple[int, int]] = [(0, 0)]
+    current = 0
+    pending: Optional[int] = None
+    pending_count = 0
+    for window, t0 in enumerate(range(0, duration_ms, window_ms)):
+        lo, hi = window * frames_per_window, (window + 1) * frames_per_window
+        winner = pick_talking_track([track[lo:hi] for track in deltas])
+        if winner is None or winner == current:
+            pending, pending_count = None, 0
+            continue
+        if winner == pending:
+            pending_count += 1
+        else:
+            pending, pending_count = winner, 1
+        if pending_count >= LIP_SWITCH_CONFIRM:
+            current = pending
+            committed.append((t0, current))
+            pending, pending_count = None, 0
+    return committed
+
+
+def apply_speaker_timeline(shot: ShotLayout, rivals: list[FaceTrack], timeline: list[tuple[int, int]],
+                           shot_start: int, shot_end: int, src_w: int, src_h: int) -> None:
+    """Repoint a talking-head shot's virtual camera at whichever rival speaks.
+
+    Builds a merged face-sample stream by taking, at each moment, the box of
+    the track the timeline says is talking, then smooths it into one path so
+    the camera pans between split-screen speakers as the conversation turns.
+    """
+    duration = max(1, shot_end - shot_start)
+    local = [[(t - shot_start, box) for t, box in track.samples] for track in rivals]
+    switches = sorted(timeline)
+    def active_at(tr: int) -> int:
+        idx = 0
+        for t0, i in switches:
+            if t0 <= tr:
+                idx = i
+            else:
+                break
+        return idx
+    samples: list[tuple[int, Box]] = []
+    for tr in range(0, duration + 1, 250):
+        box = _box_at(local[active_at(tr)], tr)
+        if box is not None:
+            samples.append((tr, box))
+    if not samples:
+        return
+    shot.people = [rivals[active_at(duration // 2)].median_box()]
+    shot.focus_path = smooth_focus_path(samples, duration,
                                         inset_crop_width(shot.crop_bounds, src_w, src_h))
 
 
@@ -1499,6 +1593,7 @@ class LayoutAnalyzer:
         capture: bool = False,
         progress=None,
         precise: Optional[bool] = None,
+        subject: Optional[dict] = None,
     ) -> Optional[ClipLayoutPlan]:
         """Plan the framing for the render window [start_ms, start_ms + duration_ms).
 
@@ -1602,7 +1697,7 @@ class LayoutAnalyzer:
                     shot_frames.append(frame)
             decision = {"start_ms": shot_start, "end_ms": shot_end, "tracks": [],
                         "vision": {"status": "disabled" if not vision or not self._vision_enabled() else "unavailable"}} if capture else None
-            shot = heuristic_layout(shot_frames, shot_start, shot_end, src_w, src_h, decision)
+            shot = heuristic_layout(shot_frames, shot_start, shot_end, src_w, src_h, decision, subject)
             if decision is not None:
                 decision["heuristic"] = shot.summary()
             reference_ms = (shot_start + shot_end) // 2
@@ -1611,25 +1706,26 @@ class LayoutAnalyzer:
             if (lip_budget > 0 and not inset and vision
                     and shot.layout == LayoutType.TALKING_HEAD
                     and shot_end - shot_start >= LIP_MIN_SHOT_MS):
-                # The largest face may be a listener leaning toward the camera;
-                # mouth motion picks the speaker when the two are close enough
-                # to be confused, and never moves the camera on weak evidence.
+                # The largest face may be a listener leaning toward the camera,
+                # or one half of a split screen; mouth motion picks the speaker
+                # per window, so the camera follows turn-taking across the shot.
                 rivals = competing_faces(track_faces(shot_frames), len(shot_frames))
                 if rivals is not None:
                     lip_budget -= 1
                     deltas = await loop.run_in_executor(
                         None, self._mouth_activity, video_path, start_ms,
                         shot_start, shot_end, src_w, src_h, rivals)
-                    winner = pick_talking_track(deltas)
+                    timeline = pick_speaker_timeline(deltas, shot_end - shot_start)
+                    switched = any(i > 0 for _t, i in timeline)
                     if decision is not None:
                         decision["lips"] = {
                             "scores": [round(median(d), 2) if d else None for d in deltas],
-                            "switched": winner is not None and winner > 0}
-                    if winner is not None and winner > 0:
+                            "switched": switched}
+                    if switched:
                         logger.info(
-                            f"Retargeting subject at {shot_start / 1000:.1f}s to the talking face "
-                            f"(mouth motion {median(deltas[winner]):.1f} vs {median(deltas[0]):.1f})")
-                        retarget_subject(shot, rivals[winner], shot_start, shot_end, src_w, src_h)
+                            f"Following speakers across {shot_start / 1000:.1f}s-{shot_end / 1000:.1f}s "
+                            f"({len(timeline) - 1} switch(es) to the talking face)")
+                        apply_speaker_timeline(shot, rivals, timeline, shot_start, shot_end, src_w, src_h)
             if inset and decision is not None:
                 decision["vision"] = {"status": "content_region"}
             if vision and self._vision_enabled() and not inset:
@@ -1661,7 +1757,7 @@ class LayoutAnalyzer:
 
             shot.start_ms, shot.end_ms = shot_start, shot_end
             if shot.layout == LayoutType.SCREEN_CAM:
-                sub_shots = self._follow_webcam(shot, shot_frames, src_w, src_h, reference_ms)
+                sub_shots = self._follow_webcam(shot, shot_frames, src_w, src_h, reference_ms, subject)
                 self._refine_webcam_regions(sub_shots, keyframes, shot.cam_box)
             else:
                 sub_shots = [shot]
@@ -1717,7 +1813,7 @@ class LayoutAnalyzer:
     @staticmethod
     def _follow_webcam(
         shot: ShotLayout, frames: list[FrameInfo], src_w: int, src_h: int,
-        reference_ms: Optional[int] = None,
+        reference_ms: Optional[int] = None, subject: Optional[dict] = None,
     ) -> list[ShotLayout]:
         """Split a screen+webcam shot where the overlay moves, resizes or disappears."""
         cam = shot.cam_box
@@ -1764,7 +1860,7 @@ class LayoutAnalyzer:
         for start, end, face in segments:
             local_frames = [f for f in frames if start <= f.t_ms < end]
             if any(a <= start < b for a, b in expanded):
-                result.append(heuristic_layout(local_frames, start, end, src_w, src_h))
+                result.append(heuristic_layout(local_frames, start, end, src_w, src_h, subject))
                 continue
             if face is None and vision:
                 # The vision model saw the webcam; YuNet missing its face

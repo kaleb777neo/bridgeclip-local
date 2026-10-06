@@ -8,7 +8,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from clip_engine.services.manual_editor import prepare_project, review_candidate, manual_plan, validate_candidate, run_editor, signature, scene_motion, caption_transcript
+from clip_engine.services.manual_editor import (
+    prepare_project, review_candidate, manual_plan, validate_candidate, run_editor, signature, scene_motion,
+    caption_transcript, editor_bake_layers, EditorError,
+)
 from clip_engine.services.transcription_service import TranscriptSegment, TranscriptWord
 from clip_engine.services.coherence_review import CLIP_QUESTIONS, CUT_QUESTIONS
 from clip_engine.services.layout_renderer import build_layout_graph, shot_views
@@ -513,6 +516,12 @@ def test_invalid_caption_position_is_rejected(y):
         validate_candidate({**candidate(), 'caption_y': y}, 12000)
 
 
+@pytest.mark.parametrize('x', [True, '0.5', float('nan'), float('inf'), .09, .91, {}])
+def test_invalid_caption_x_position_is_rejected(x):
+    with pytest.raises(ValueError, match='caption position'):
+        validate_candidate({**candidate(), 'caption_x': x}, 12000)
+
+
 def export_fixture(tmp_path, monkeypatch, render):
     from dataclasses import asdict
     c = {**candidate(), 'status': 'ready', 'baked_hash': 'a' * 64}
@@ -649,3 +658,364 @@ def test_freed_editor_media_refuses_every_operation(monkeypatch, tmp_path):
             asyncio.run(run_editor({**config, 'action': action, 'source_id': 'a' * 32}))
         assert error.value.editor_code == 'source_missing'
     render.assert_not_called()
+    # Importing an automatic manifest is refused once a project exists.
+    with pytest.raises(ValueError, match='already has'):
+        asyncio.run(run_editor({'action': 'create-project', 'run': str(tmp_path), 'source': {'kind': 'file'}}))
+
+
+def automatic_run(tmp_path):
+    from dataclasses import asdict
+    (tmp_path / 'job_output.json').write_text(json.dumps({
+        'source_video_title': 'My video', 'editor_project': False, 'total_clips': 2, 'clips': [
+            {'clip_index': 0, 's3_url': str(tmp_path / 'clip_00.mp4'), 'duration_ms': 5000, 'start_time_ms': 1000,
+             'end_time_ms': 6000, 'virality_score': 0.9, 'layout_type': 'talking_head', 'summary': 'First'},
+            {'clip_index': 1, 's3_url': str(tmp_path / 'clip_01.mp4'), 'duration_ms': 4000, 'start_time_ms': 20000,
+             'end_time_ms': 24000, 'virality_score': 0.5, 'layout_type': 'screen', 'summary': 'Second'}],
+        'metrics': {'requested_settings': {'aspect_ratio': '9:16', 'video_speed': 1.5}, 'captions_status': 'enabled'}}))
+    (tmp_path / 'transcript.json').write_text(json.dumps({'segments': [asdict(s) for s in transcript()]}))
+    (tmp_path / 'editor-source.mp4').write_bytes(b'streamed by main')
+
+
+def patch_import(monkeypatch):
+    from clip_engine.services import manual_editor as module
+    monkeypatch.setattr(module, 'source_info', lambda path: {'width': 1920, 'height': 1080, 'duration': 30000,
+        'rotation': 0, 'sar': '1:1', 'audio': True})
+    async def preview(self, src, dest, **kwargs):
+        assert kwargs.get('duration_ms') == 30000
+        if kwargs.get('progress'):
+            kwargs['progress'](100)
+        Path(dest).write_bytes(b'preview')
+    monkeypatch.setattr(RenderingService, 'capture_framing_source', preview)
+
+
+def test_create_project_rebuilds_editable_baked_candidates_from_an_automatic_run(monkeypatch, tmp_path):
+    automatic_run(tmp_path)
+    patch_import(monkeypatch)
+    phases = []
+    asyncio.run(run_editor({'action': 'create-project', 'run': str(tmp_path), 'source': {'kind': 'file'}},
+        progress=lambda value: phases.append(value['phase'])))
+    project = json.loads((tmp_path / 'editor-project.json').read_text())
+    assert project['version'] == 1 and project['revision'] == 0 and project['aspect_ratio'] == '9:16'
+    assert (project['width'], project['height'], project['duration_ms']) == (1920, 1080, 30000)
+    assert project['frame_preview'] is True and project['title'] == 'My video'
+    assert [c['id'] for c in project['candidates']] == ['candidate-1', 'candidate-2']
+    for c, index in zip(project['candidates'], (0, 1)):
+        assert c['status'] == 'baked' and c['exports'] == [index] and c['review'] is None
+        assert c['captions'] is True and c['video_speed'] == 1.5 and c['caption_preset'] == 'pop'
+        assert len(c['scenes']) == 1 and c['scenes'][0]['at_ms'] == 0 and len(c['scenes'][0]['crops']) == 1
+        validate_candidate(c, project['duration_ms'], len(project['transcript']))
+    assert project['candidates'][0]['ranges'] == [[1000, 6000]] and project['candidates'][0]['score'] == 9
+    assert project['candidates'][1]['ranges'] == [[20000, 24000]]
+    assert 'preview' in phases
+    assert (tmp_path / 'editor-preview.mp4').read_bytes() == b'preview'
+    output = json.loads((tmp_path / 'job_output.json').read_text())
+    assert output['editor_project'] is True and output['clips'][0]['clip_index'] == 0
+
+
+def test_create_project_refuses_missing_source_and_empty_run(monkeypatch, tmp_path):
+    automatic_run(tmp_path)
+    (tmp_path / 'editor-source.mp4').unlink()
+    with pytest.raises(ValueError, match='Reconnect'):
+        asyncio.run(run_editor({'action': 'create-project', 'run': str(tmp_path), 'source': {'kind': 'file'}}))
+    assert not (tmp_path / 'editor-project.json').exists()
+    empty = tmp_path / 'empty'; empty.mkdir()
+    (empty / 'job_output.json').write_text(json.dumps({'clips': [], 'editor_project': False}))
+    with pytest.raises(ValueError, match='no clips'):
+        asyncio.run(run_editor({'action': 'create-project', 'run': str(empty), 'source': {'kind': 'url', 'url': 'https://x'}}))
+
+
+# ---------------------------------------------------------------------------
+# Bake overlays: validation, asset resolution and the render request
+# ---------------------------------------------------------------------------
+
+def bake_candidate():
+    c = candidate()
+    c.update(
+        logo={'asset': 'a' * 32 + '.png', 'position': 'top-left', 'scale': .2, 'opacity': .8},
+        intro_asset='b' * 32 + '.mov',
+        outro_asset='f' * 32 + '.mp4',
+        music={'asset': 'c' * 32 + '.wav', 'gain': .5},
+        brolls=[{'asset': 'd' * 32 + '.png', 'start_ms': 5000, 'end_ms': 6000},
+                {'asset': 'e' * 32 + '.mkv', 'start_ms': 2000, 'end_ms': 3000}],
+        text_overlays=[{'text': 'Sale\n70%', 'start_ms': 1000, 'end_ms': 2500, 'position': 'center'}],
+        audio_gain=1.5,
+    )
+    return c
+
+
+def write_assets(run, refs):
+    for ref in refs:
+        (Path(run) / f'editor-asset-{ref}').write_bytes(b'asset')
+
+
+def test_bake_overlays_validate_like_the_browser_parser():
+    validate_candidate(bake_candidate(), 12000)
+    # The browser stores b-rolls sorted; an unsorted list must also pass.
+    validate_candidate(bake_candidate(), 12000)
+    # Long text is clamped by the parser, not rejected (120 UTF-16 units).
+    c = bake_candidate()
+    c['text_overlays'] = [{'text': 'x' * 300, 'start_ms': 1000, 'end_ms': 2000, 'position': 'bottom-right'}]
+    validate_candidate(c, 12000)
+
+
+@pytest.mark.parametrize('patch,match', [
+    ({'logo': {'asset': 'nope.png', 'position': 'top-left', 'scale': .2, 'opacity': .8}}, 'logo'),
+    ({'logo': {'asset': 'a' * 32 + '.png', 'position': 'middle', 'scale': .2, 'opacity': .8}}, 'logo'),
+    ({'logo': {'asset': 'a' * 32 + '.png', 'position': 'top-left', 'scale': .04, 'opacity': .8}}, 'logo'),
+    ({'logo': {'asset': 'a' * 32 + '.png', 'position': 'top-left', 'scale': .51, 'opacity': .8}}, 'logo'),
+    ({'logo': {'asset': 'a' * 32 + '.png', 'position': 'top-left', 'scale': .2, 'opacity': .05}}, 'logo'),
+    ({'logo': {'asset': 'a' * 32 + '.png', 'position': 'top-left', 'scale': .2}}, 'logo'),
+    ({'intro_asset': 'zz' * 32 + '.mp4'}, 'intro'),
+    ({'intro_asset': 'b' * 32 + '.MOV'}, 'intro'),
+    ({'outro_asset': 'zz' * 32 + '.mp4'}, 'outro'),
+    ({'outro_asset': 'f' * 32 + '.MP4'}, 'outro'),
+    ({'music': {'asset': 'A' * 32 + '.wav', 'gain': .5}}, 'music'),
+    ({'music': {'asset': 'c' * 32 + '.wav', 'gain': 1.5}}, 'music'),
+    ({'music': {'asset': 'c' * 32 + '.wav'}}, 'music'),
+    ({'brolls': [{'asset': 'd' * 32 + '.png', 'start_ms': 1000, 'end_ms': 1050}]}, 'b-roll'),
+    ({'brolls': [{'asset': 'd' * 32 + '.png', 'start_ms': 5000, 'end_ms': 8000},
+                 {'asset': 'e' * 32 + '.png', 'start_ms': 7000, 'end_ms': 9000}]}, 'Overlapping'),
+    ({'brolls': [{'asset': 'd' * 32 + '.png', 'start_ms': 5000, 'end_ms': 13000}]}, 'interval'),
+    ({'brolls': [{'asset': 'd' * 32 + '.png', 'start_ms': i * 400, 'end_ms': i * 400 + 100}
+                 for i in range(25)]}, 'b-rolls'),
+    ({'text_overlays': [{'text': '   ', 'start_ms': 1000, 'end_ms': 2000, 'position': 'center'}]}, 'text overlay'),
+    ({'text_overlays': [{'text': 'bad\ttab', 'start_ms': 1000, 'end_ms': 2000, 'position': 'center'}]}, 'content'),
+    ({'text_overlays': [{'text': 'x', 'start_ms': 0, 'end_ms': 12500, 'position': 'center'}]}, 'interval'),
+    ({'text_overlays': [{'text': 'x', 'start_ms': 0, 'end_ms': 500, 'position': 'top-center'}]}, 'text overlay'),
+    ({'text_overlays': [{'text': 'x', 'start_ms': 0, 'end_ms': i * 400 + 100 + 100, 'position': 'center'}
+                        for i in range(21)]}, 'text overlays'),
+    ({'audio_gain': 2.5}, 'audio gain'),
+    ({'audio_gain': -0.5}, 'audio gain'),
+    ({'audio_gain': '1'}, 'audio gain'),
+])
+def test_invalid_bake_overlays_fail_before_rendering(patch, match):
+    with pytest.raises(ValueError, match=match):
+        validate_candidate({**candidate(), **patch}, 12000)
+
+
+@pytest.mark.parametrize('kind,valid', [('motion', True), ('dissolve', True), ('wipe', True), ('blur', False),
+                                         (1, False)])
+def test_transition_kind_follows_the_browser_enum(kind, valid):
+    c = candidate()
+    c['ranges'] = [[0, 4000]]
+    c['scenes'] = [{'at_ms': 0, 'layout': 'fill', 'crops': [[0, 0, .5, 1]]},
+                   {'at_ms': 2000, 'layout': 'fill', 'crops': [[.5, 0, .5, 1]], 'transition_ms': 600,
+                    'transition_kind': kind}]
+    if valid:
+        validate_candidate(c, 4000)
+    else:
+        with pytest.raises(ValueError, match='transition kind'):
+            validate_candidate(c, 4000)
+    # Without movement the parser drops the kind; an inert value must not reject.
+    c['scenes'][1]['transition_ms'] = 0
+    c['scenes'][1]['transition_kind'] = 'dissolve'
+    validate_candidate(c, 4000)
+
+
+def test_dissolve_and_wipe_scenes_become_xfade_shots_instead_of_motion_pieces():
+    for kind, expected in (('dissolve', 'fade'), ('wipe', 'wipeleft')):
+        c = candidate()
+        c['ranges'] = [[0, 4000]]
+        c['scenes'] = [{'at_ms': 0, 'layout': 'fill', 'crops': [[0, 0, .5, 1]]},
+                       {'at_ms': 2000, 'layout': 'fill', 'crops': [[.5, 0, .5, 1]], 'transition_ms': 600,
+                        'transition_kind': kind}]
+        validate_candidate(c, 4000)
+        plan = manual_plan({'width': 1920, 'height': 1080}, c)
+        assert [(s.start_ms, s.end_ms) for s in plan.shots] == [(0, 2000), (2000, 4000)]  # No easing split
+        assert plan.shots[1].manual_xfade_ms == 600 and plan.shots[1].manual_xfade_kind == expected
+        assert plan.shots[0].manual_xfade_ms == 0
+    # The default 'motion' kind keeps the existing crop-easing pieces.
+    c['scenes'][1]['transition_kind'] = 'motion'
+    plan = manual_plan({'width': 1920, 'height': 1080}, c)
+    assert all(s.manual_xfade_ms == 0 for s in plan.shots)
+    assert any(s.manual_transition_ms == 600 for s in plan.shots)
+
+
+def test_transition_kinds_map_onto_distinct_xfade_filters():
+    """The six announced effects each land on their own libavfilter transition."""
+    kinds = {'dissolve': 'fade', 'wipe': 'wipeleft', 'crossfade': 'fade', 'crosszoom': 'circleopen',
+             'zoomin': 'zoomin', 'zoomout': 'circleclose', 'fadein': 'fadeblack', 'fadeout': 'fadewhite'}
+    for kind, xfade in kinds.items():
+        c = candidate()
+        c['ranges'] = [[0, 4000]]
+        c['scenes'] = [{'at_ms': 0, 'layout': 'fill', 'crops': [[0, 0, .5, 1]]},
+                       {'at_ms': 2000, 'layout': 'fill', 'crops': [[.5, 0, .5, 1]], 'transition_ms': 600,
+                        'transition_kind': kind}]
+        validate_candidate(c, 4000)
+        plan = manual_plan({'width': 1920, 'height': 1080}, c)
+        assert plan.shots[1].manual_xfade_ms == 600, kind
+        assert plan.shots[1].manual_xfade_kind == xfade, kind
+    # The engine rejects unknown kinds defensively (the TS parser drops them first).
+    c['scenes'][1]['transition_kind'] = 'somerandom'
+    with pytest.raises(ValueError, match='transition kind'):
+        validate_candidate(c, 4000)
+
+
+def test_auto_reframe_off_pins_crops_and_ignores_tracking(tmp_path):
+    """Auto Reframe OFF: the scenes keep their own crops, tracking data ignored."""
+    from clip_engine.services.manual_editor import manual_plan, validate_candidate
+    base = candidate()
+    base['ranges'] = [[0, 4000]]
+    base['scenes'] = [
+        {'at_ms': 0, 'layout': 'fill', 'crops': [[0.4, 0, 0.5, 1]]},
+        {'at_ms': 2000, 'layout': 'fill', 'crops': [[0.1, 0, 0.5, 1]]},
+    ]
+
+    # Tracked focus path recorded by the scan for the first scene.
+    tracking = [[0, [[0.4, 0, 0.5, 1]], [[100, 0.45, 0.4], [200, 0.5, 0.4]]]]
+
+    # With Auto Reframe on (default): tracking participates.
+    validate_candidate(base, 4000)
+    on = manual_plan({'width': 1920, 'height': 1080}, base, tracking=tracking)
+    # With Auto Reframe off: tracking is ignored entirely.
+    off = dict(base)
+    off['auto_reframe'] = False
+    validate_candidate(off, 4000)
+    off_plan = manual_plan({'width': 1920, 'height': 1080}, off, tracking=tracking)
+    assert [(s.start_ms, s.end_ms) for s in on.shots] == [(s.start_ms, s.end_ms) for s in off_plan.shots]
+    # Crops stay exactly the user's own (center offsets untouched by tracking).
+    assert [s.manual_crops for s in off_plan.shots] == [[[0.4, 0, 0.5, 1]], [[0.1, 0, 0.5, 1]]]
+
+
+def test_auto_reframe_value_is_validated():
+    for value in (True, False, None):
+        c = candidate()
+        if value is None:
+            c.pop('auto_reframe', None)
+        else:
+            c['auto_reframe'] = value
+        validate_candidate(c, 12000)
+    for value in ('on', 1, {}):
+        with pytest.raises(ValueError, match='Invalid auto reframe'):
+            validate_candidate({**candidate(), 'auto_reframe': value}, 12000)
+
+
+def test_batch_request_validates_brand_intro_and_outro():
+    """The batch pipeline snapshots a pack's videos like the logo: only a
+    main-owned path crosses the bridge, anything else rejects."""
+    from clip_engine.services.ai_clipping_pipeline import ClippingJobRequest
+    ok = ClippingJobRequest(video_url='v', job_id='j',
+                            intro={'path': 'C:/brand/intro.mp4'}, outro={'path': 'C:/brand/outro.mp4'})
+    assert ok.intro['path'] == 'C:/brand/intro.mp4' and ok.outro['path'] == 'C:/brand/outro.mp4'
+    with pytest.raises(ValueError, match='Invalid brand intro'):
+        ClippingJobRequest(video_url='v', job_id='j', intro={'path': ''})
+    with pytest.raises(ValueError, match='Invalid brand intro'):
+        ClippingJobRequest(video_url='v', job_id='j', intro='intro.mp4')
+    with pytest.raises(ValueError, match='Invalid brand outro'):
+        ClippingJobRequest(video_url='v', job_id='j', outro={'nope': True})
+    with pytest.raises(ValueError, match='Invalid brand outro'):
+        ClippingJobRequest(video_url='v', job_id='j', outro=42)
+
+
+def test_bake_layers_resolve_run_assets_sort_and_clamp(tmp_path):
+    c = bake_candidate()
+    c['text_overlays'] = [{'text': 'x' * 300, 'start_ms': 1000, 'end_ms': 2000, 'position': 'center'}]
+    refs = [c['logo']['asset'], c['intro_asset'], c['outro_asset'], c['music']['asset'], *[b['asset'] for b in c['brolls']]]
+    write_assets(tmp_path, refs)
+    layers = editor_bake_layers(tmp_path, c)
+    assert layers['logo'] == {'path': str(tmp_path / f"editor-asset-{c['logo']['asset']}"),
+                              'position': 'top-left', 'scale': .2, 'opacity': .8}
+    assert layers['intro_path'] == str(tmp_path / f"editor-asset-{c['intro_asset']}")
+    assert layers['outro_path'] == str(tmp_path / f"editor-asset-{c['outro_asset']}")
+    assert layers['music'] == {'path': str(tmp_path / f"editor-asset-{c['music']['asset']}"), 'gain': .5}
+    assert [b['start_ms'] for b in layers['brolls']] == [2000, 5000]  # Sorted for the graph
+    assert layers['brolls'][0]['path'].endswith(f"editor-asset-{'e' * 32}.mkv")
+    assert len(layers['text_overlays'][0]['text']) == 120  # Clamped like the browser parser
+    assert layers['audio_gain'] == 1.5
+    assert set(layers) == {'logo', 'intro_path', 'outro_path', 'music', 'brolls', 'text_overlays', 'audio_gain'}
+    plain = editor_bake_layers(tmp_path, candidate())
+    assert plain == {}
+
+
+def test_bake_layers_missing_asset_is_an_invalid_edit(tmp_path):
+    c = bake_candidate()
+    write_assets(tmp_path, [c['logo']['asset'], c['intro_asset'], c['outro_asset'], *[b['asset'] for b in c['brolls']]])
+    with pytest.raises(EditorError) as error:
+        editor_bake_layers(tmp_path, c)
+    assert error.value.editor_code == 'invalid_edit'
+    assert c['music']['asset'] in str(error.value)
+
+
+def test_export_passes_bake_layers_and_ignores_speaker_annotations(monkeypatch, tmp_path):
+    from clip_engine.services.rendering_service import RenderResult
+    captured = {}
+    async def render(self, request):
+        captured['request'] = request
+        Path(request.output_path).write_bytes(b'final clip')
+        return RenderResult(request.output_path, 10, 5600, layout_type='two_shot')
+    config = export_fixture(tmp_path, monkeypatch, render)
+    project = json.loads((tmp_path / 'editor-project.json').read_text())
+    c = project['candidates'][0]
+    for key in ('logo', 'intro_asset', 'outro_asset', 'music', 'brolls', 'text_overlays', 'audio_gain'):
+        c[key] = bake_candidate()[key]
+    # UI-only annotations must not break the bake.
+    project.update(speaker_names={'1': 'Alice'}, keywords=['demo'])
+    (tmp_path / 'editor-project.json').write_text(json.dumps(project))
+    rows = json.loads((tmp_path / 'transcript.json').read_text())
+    for segment in rows['segments']:
+        segment['speaker'] = 'Alice'
+        for word in segment.get('words', []):
+            word['speaker'] = 'Alice'
+    (tmp_path / 'transcript.json').write_text(json.dumps(rows))
+    write_assets(tmp_path, [c['logo']['asset'], c['intro_asset'], c['outro_asset'], c['music']['asset'],
+                            *[b['asset'] for b in c['brolls']]])
+    asyncio.run(run_editor(config))
+    request = captured['request']
+    assert request.logo['path'].endswith(f"editor-asset-{c['logo']['asset']}") and request.logo['scale'] == .2
+    assert request.intro_path.endswith('editor-asset-' + c['intro_asset'])
+    assert request.outro_path.endswith('editor-asset-' + c['outro_asset'])
+    assert request.music == {'path': str(tmp_path / f"editor-asset-{c['music']['asset']}"), 'gain': .5}
+    assert [b['start_ms'] for b in request.brolls] == [2000, 5000]
+    assert request.text_overlays[0]['text'] == 'Sale\n70%'
+    assert request.audio_gain == 1.5
+    assert request.transcript_segments[0].text  # Transcript still parsed despite the extra speaker keys
+
+
+def test_missing_bake_asset_export_fails_as_invalid_edit_without_rendering(monkeypatch, tmp_path):
+    render = AsyncMock()
+    config = export_fixture(tmp_path, monkeypatch, render)
+    project = json.loads((tmp_path / 'editor-project.json').read_text())
+    project['candidates'][0]['logo'] = {'asset': 'a' * 32 + '.png', 'position': 'top-left', 'scale': .2, 'opacity': .8}
+    (tmp_path / 'editor-project.json').write_text(json.dumps(project))
+    with pytest.raises(ValueError) as error:
+        asyncio.run(run_editor(config))
+    assert error.value.editor_code == 'invalid_edit'
+    render.assert_not_called()
+
+
+@pytest.mark.parametrize('kind', ['dissolve', 'wipe'])
+def test_real_render_xfade_blends_or_wipes_at_the_scene_boundary(tmp_path, kind):
+    """Decoded pixels verify the overlap: a half-mix (dissolve) or a travelling
+    hard edge (wipe) between the two framings, on the exact concat frame grid."""
+    import shutil
+    import subprocess
+    import numpy as np
+    if not shutil.which('ffmpeg'):
+        pytest.skip('FFmpeg is needed for the actual xfade render check')
+    c = candidate()
+    c['ranges'] = [[0, 4000]]
+    c['scenes'] = [{'at_ms': 0, 'layout': 'fill', 'crops': [[0, 0, .5, 1]]},
+                   {'at_ms': 2000, 'layout': 'fill', 'crops': [[.5, 0, .5, 1]], 'transition_ms': 600,
+                    'transition_kind': kind}]
+    validate_candidate(c, 4000)
+    plan = manual_plan({'width': 320, 'height': 180}, c)
+    graph = build_layout_graph(plan, 160, 120, None, fps='30')
+    source = np.zeros((180, 320, 3), dtype=np.uint8)
+    source[:, :, 0] = np.arange(320)[None, :] * 255 / 320
+    result = subprocess.run(['ffmpeg', '-v', 'error', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', '320x180',
+        '-r', '30', '-i', 'pipe:0', '-filter_complex', graph, '-map', '[base]', '-pix_fmt', 'rgb24',
+        '-f', 'rawvideo', 'pipe:1'], input=source.tobytes() * 120, capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stderr.decode()
+    frames = np.frombuffer(result.stdout, dtype=np.uint8).reshape(-1, 120, 160, 3)
+    assert len(frames) == 120  # The borrowed overlap frames leave the total untouched
+    old = np.arange(160) * 255 / 320          # Left-half crop, column x shows source x
+    new = (np.arange(160) + 160) * 255 / 320  # Right-half crop
+    assert np.allclose(frames[30][:, :, 0], old[None, :], atol=3)
+    assert np.allclose(frames[110][:, :, 0], new[None, :], atol=3)
+    middle = frames[69][:, :, 0].mean(axis=0)  # ~50% through the 600 ms transition
+    if kind == 'dissolve':
+        assert np.all(np.abs(middle - (old + new) / 2) <= 12)
+    else:
+        oldish, newish = np.abs(middle - old) <= 8, np.abs(middle - new) <= 8
+        assert np.all(oldish | newish)  # A sharp edge, not a blend
+        assert 30 < int(oldish.sum()) < 130  # and mid-travel, not a pure framing

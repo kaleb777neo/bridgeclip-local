@@ -20,6 +20,27 @@ class PinnedDestination:
     host_header: str
 
 
+def is_public_ip(ip) -> bool:
+    """`is_global` with 6to4/Teredo/mapped-IPv4 unpacking and 192.0.0.0/24 fixed.
+
+    The stdlib only learned to look inside those tunnels in 3.13, and only
+    classified the IETF protocol-assignment range (192.0.0.0/24) as
+    non-global in later releases; on older runtimes `2002:7f00:1::`
+    (6to4-wrapped 127.0.0.1) and `192.0.0.8` count as global.
+    """
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        elif ip.sixtofour is not None:
+            ip = ip.sixtofour
+        elif ip.teredo is not None:
+            server, client = ip.teredo
+            return is_public_ip(server) and is_public_ip(client)
+    if ip.version == 4 and ip in ipaddress.IPv4Network('192.0.0.0/24'):
+        return False
+    return ip.is_global
+
+
 def resolve_public_destination(url: str) -> PinnedDestination:
     """Resolve once, reject non-public answers, then pin the request to one IP.
 
@@ -45,7 +66,7 @@ def resolve_public_destination(url: str) -> PinnedDestination:
         if not addresses:
             raise ValueError("Invalid public destination")
         ips = [ipaddress.ip_address(item[4][0]) for item in addresses]
-        if not all(ip.is_global for ip in ips):
+        if not all(is_public_ip(ip) for ip in ips):
             raise ValueError("Invalid public destination")
         ip = ips[0]
         address = f"[{ip}]" if ip.version == 6 else str(ip)
@@ -85,14 +106,13 @@ def _public_socket_address(sock: socket.socket, address: object) -> object:
         raise OSError("Invalid network destination")
     host, port = address[:2]
     try:
-        ip = ipaddress.ip_address(host)
-        if not ip.is_global:
+        if not is_public_ip(ipaddress.ip_address(host)):
             raise OSError("Network destination is not public")
         return address
     except ValueError:
         pass
     answers = socket.getaddrinfo(host, port, sock.family, sock.type, sock.proto)
-    if not answers or any(not ipaddress.ip_address(answer[4][0]).is_global for answer in answers):
+    if not answers or any(not is_public_ip(ipaddress.ip_address(answer[4][0])) for answer in answers):
         raise OSError("Network destination is not public")
     return answers[0][4]
 

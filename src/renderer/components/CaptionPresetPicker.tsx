@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
-import { Check, Pause, Play, RotateCcw } from 'lucide-react'
+import { Ban, Check, Pause, Play, RotateCcw } from 'lucide-react'
 import { cn } from '../lib/utils'
 import { Button } from './ui/Button'
 
@@ -29,6 +29,8 @@ interface CaptionPreset {
   /** Translucent plate behind the whole line. */
   plate?: string
   karaoke?: boolean
+  /** Fly the line in from a side. */
+  slide?: 'left' | 'up'
   /** How unspoken words look. */
   future?: 'show' | 'dim' | 'hide'
   maxWords?: number
@@ -226,6 +228,108 @@ const PRESETS: CaptionPreset[] = [
     uppercase: false,
     plate: 'rgb(255 255 255 / 0.94)',
     words: ['here is', 'how', 'it works']
+  },
+  {
+    id: 'glitch', name: 'Glitch', description: 'Dense cyan pops, tight tracking',
+    font: '"Anton", "Impact", "Arial Narrow", sans-serif', weight: 400, size: 19,
+    primary: '#FFFFFF', highlight: '#00E5FF', stroke: 7, shadow: 'hard', uppercase: true,
+    maxWords: 2, words: ['system', 'overload', 'now']
+  },
+  {
+    id: 'bounce', name: 'Bounce', description: 'Sunny pill under dark type',
+    font: '"Poppins", "Poppins Black", system-ui, sans-serif', weight: 900, size: 14,
+    primary: '#111111', highlight: '#111111', stroke: 4, shadow: 'soft', uppercase: true,
+    pill: '#FFD60A', words: ['ready', 'to', 'move']
+  },
+  {
+    id: 'quake', name: 'Quake', description: 'One huge red-hot word',
+    font: '"Anton", "Impact", "Arial Narrow", sans-serif', weight: 400, size: 26,
+    primary: '#FFFFFF', highlight: '#FF4D4D', stroke: 8, shadow: 'hard', uppercase: true,
+    maxWords: 1, words: ['', 'impact', '']
+  },
+  {
+    id: 'blurswitch', name: 'Blur Switch', description: 'Airy cyan highlights',
+    font: '"Montserrat", "Montserrat ExtraBold", system-ui, sans-serif', weight: 800, size: 14,
+    primary: '#FFFFFF', highlight: '#9BE7FF', stroke: 0, shadow: 'soft', uppercase: true,
+    maxWords: 4, words: ['focus', 'switches', 'fast']
+  },
+  {
+    id: 'highlighter', name: 'Highlighter', description: 'Dark type on marker yellow',
+    font: '"Archivo Black", "Arial Black", system-ui, sans-serif', weight: 400, size: 13,
+    primary: '#111111', highlight: '#111111', stroke: 0, shadow: 'none', uppercase: false,
+    plate: '#FFE011', maxWords: 4, words: ['mark', 'this', 'down']
+  },
+  {
+    id: 'simple', name: 'Simple', description: 'Clean lowercase, whisper shadow',
+    font: '"Plus Jakarta Sans", system-ui, sans-serif', weight: 700, size: 14,
+    primary: '#FFFFFF', highlight: '#C4F1FF', stroke: 0, shadow: 'soft', uppercase: false,
+    maxWords: 4, words: ['keep', 'it', 'simple']
+  },
+  {
+    id: 'ticker', name: 'Ticker', description: 'White on a dark news band',
+    font: '"Archivo Black", "Arial Black", system-ui, sans-serif', weight: 400, size: 12,
+    primary: '#FFFFFF', highlight: '#FFFFFF', stroke: 0, shadow: 'none', uppercase: true,
+    plate: '#0F172A', maxWords: 5, words: ['this', 'just', 'happened']
+  },
+  {
+    id: 'retro', name: 'Retro', description: 'Italic serif, warm glow',
+    font: '"Instrument Serif", "Georgia", serif', weight: 400, italic: true, size: 20,
+    primary: '#FFFFFF', highlight: '#FFB347', stroke: 0, shadow: 'halo', uppercase: false,
+    maxWords: 4, words: ['back', 'in', 'style']
+  },
+  {
+    id: 'mono', name: 'Mono', description: 'Spaced capitals, no outline',
+    font: '"Plus Jakarta Sans", system-ui, sans-serif', weight: 700, size: 13,
+    primary: '#FFFFFF', highlight: '#C4F1FF', stroke: 0, shadow: 'none', uppercase: true,
+    maxWords: 4, words: ['clean', 'and', 'modern']
+  },
+  {
+    id: 'duo', name: 'Duo', description: 'Active word flips to green',
+    font: '"Montserrat", "Montserrat ExtraBold", system-ui, sans-serif', weight: 800, size: 15,
+    primary: '#FFFFFF', highlight: '#39FF6A', stroke: 6, shadow: 'soft', uppercase: true,
+    words: ['double', 'the', 'energy']
+  },
+  {
+    id: 'karaoke', name: 'Karaoke', description: 'Sweep colors each word as spoken',
+    font: '"Poppins ExtraBold", "Poppins", system-ui, sans-serif', weight: 800, size: 16,
+    primary: '#FFFFFF', highlight: '#FF3D6E', stroke: 5, shadow: 'soft', uppercase: true,
+    karaoke: true, maxWords: 3, words: ['sing', 'every', 'word']
+  },
+  {
+    id: 'beasty', name: 'Beasty', description: 'Beast-mode type on a black slab',
+    font: '"Anton", "Arial Black", system-ui, sans-serif', weight: 400, size: 22,
+    primary: '#FFFFFF', highlight: '#FFE01B', stroke: 0, shadow: 'hard', uppercase: true,
+    pill: '#0B0B0D', maxWords: 2, words: ['total', 'beast', 'mode']
+  },
+  {
+    id: 'deepdiver', name: 'Deep Diver', description: 'Clean minimal, whisper outline',
+    font: '"Montserrat", system-ui, sans-serif', weight: 500, size: 13,
+    primary: '#FFFFFF', highlight: '#9AE6FF', stroke: 2, shadow: 'soft', uppercase: false,
+    maxWords: 5, words: ['calm', 'and', 'clear']
+  },
+  {
+    id: 'popline', name: 'Pop Line', description: 'The whole line pops in',
+    font: '"Poppins ExtraBold", "Poppins", system-ui, sans-serif', weight: 800, size: 16,
+    primary: '#FFFFFF', highlight: '#FF8A3D', stroke: 5, shadow: 'soft', uppercase: true,
+    maxWords: 4, words: ['whole', 'line', 'pops']
+  },
+  {
+    id: 'scale', name: 'Scale', description: 'Active words scale up',
+    font: '"Montserrat Black", "Montserrat", system-ui, sans-serif', weight: 900, size: 16,
+    primary: '#FFFFFF', highlight: '#7C5CFF', stroke: 5, shadow: 'soft', uppercase: true,
+    maxWords: 3, words: ['grows', 'on', 'beat']
+  },
+  {
+    id: 'slideleft', name: 'Slide Left', description: 'Flies in from the right',
+    font: '"Poppins ExtraBold", "Poppins", system-ui, sans-serif', weight: 800, size: 15,
+    primary: '#FFFFFF', highlight: '#3DFF8B', stroke: 5, shadow: 'soft', uppercase: true,
+    slide: 'left', maxWords: 4, words: ['slides', 'in', 'clean']
+  },
+  {
+    id: 'slideup', name: 'Slide Up', description: 'Rises into place',
+    font: '"Poppins ExtraBold", "Poppins", system-ui, sans-serif', weight: 800, size: 15,
+    primary: '#FFFFFF', highlight: '#4AC7FF', stroke: 5, shadow: 'soft', uppercase: true,
+    slide: 'up', maxWords: 4, words: ['rises', 'into', 'place']
   },
   {
     id: 'subtle',
@@ -447,14 +551,50 @@ interface CaptionPresetPickerProps {
   onChange: (preset: string) => void
   disabled?: boolean
   showPreview?: boolean
+  /** Offer a "No caption" tile for footage that already has captions baked in. */
+  allowNone?: boolean
+  noneSelected?: boolean
+  onSelectNone?: () => void
 }
 
-export function CaptionPresetPicker({ value, onChange, disabled, showPreview = false }: CaptionPresetPickerProps): React.JSX.Element {
+export function CaptionPresetPicker({ value, onChange, disabled, showPreview = false, allowNone = false, noneSelected = false, onSelectNone }: CaptionPresetPickerProps): React.JSX.Element {
   const current = PRESETS.find((preset) => preset.id === value) ?? PRESETS[0]
   return (
     <div>
-      {showPreview && <CaptionMotionPreview key={current.id} preset={current} disabled={disabled} />}
+      {showPreview && !noneSelected && <CaptionMotionPreview key={current.id} preset={current} disabled={disabled} />}
       <div className="grid grid-cols-[repeat(auto-fill,minmax(104px,1fr))] gap-2" role="radiogroup" aria-label="Caption style">
+        {allowNone && (
+          <button
+            type="button"
+            role="radio"
+            aria-checked={noneSelected}
+            aria-label="No caption"
+            aria-description="Clean output — skip burned-in captions"
+            title="Clean output — skip burned-in captions"
+            disabled={disabled}
+            onClick={onSelectNone}
+            className={cn(
+              'glass-tile glass-tile-hover group relative rounded-xl p-1 text-left hover:-translate-y-0.5',
+              noneSelected && 'glass-selected',
+              disabled && 'opacity-50'
+            )}
+          >
+            <span
+              className="relative flex h-[60px] items-center justify-center overflow-hidden rounded-lg shadow-[inset_0_0_0_1px_rgb(255_255_255/0.06)]"
+              style={{ background: SCENE }}
+            >
+              <Ban className="h-6 w-6 text-ink-subtle" aria-hidden />
+              {noneSelected && (
+                <span className="absolute right-1.5 top-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-accent text-accent-ink shadow-[0_0_0_1px_rgb(var(--accent)/0.6)] animate-pop-in">
+                  <Check className="h-2.5 w-2.5" strokeWidth={3.5} />
+                </span>
+              )}
+            </span>
+            <span className={cn('block truncate px-1.5 pb-0.5 pt-1.5 text-xs font-semibold', noneSelected ? 'text-ink' : 'text-ink/90')}>
+              No caption
+            </span>
+          </button>
+        )}
         {PRESETS.map((preset) => {
           const selected = value === preset.id
           return (

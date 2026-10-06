@@ -1,6 +1,6 @@
 import { normalizeVideoSource, twitchSourceError, twitchVodId, youtubeSourceUrl } from '../../shared/video-source'
 import { useCallback, useRef, useState } from 'react'
-import { FileVideo, FolderOpen, Link2, UploadCloud, X, Youtube, Twitch } from 'lucide-react'
+import { CirclePlay, Clapperboard, Facebook, FileVideo, Film, FolderOpen, Instagram, Linkedin, Link2, Music2, Presentation, Twitter, UploadCloud, Video, X, Youtube, Twitch } from 'lucide-react'
 import { basename, cn, formatTimecode, isUrl, localFileUrl, youtubeId } from '../lib/utils'
 import { getApi } from '../lib/ipc'
 import { Button } from './ui/Button'
@@ -153,6 +153,18 @@ function DropZone({
           <div role="group" aria-label="Supported video links" className="mt-2 flex flex-wrap items-center gap-2">
             <Badge icon={<Youtube aria-hidden className="h-3.5 w-3.5 text-[#ff0033]" />}>YouTube</Badge>
             <Badge icon={<Twitch aria-hidden className="h-3.5 w-3.5 text-[#a970ff]" />}>Twitch VODs</Badge>
+            <Badge icon={<Clapperboard aria-hidden className="h-3.5 w-3.5 text-[#53fc18]" />}>Kick</Badge>
+            <Badge icon={<Music2 aria-hidden className="h-3.5 w-3.5" />}>TikTok</Badge>
+            <Badge icon={<Instagram aria-hidden className="h-3.5 w-3.5 text-[#e1306c]" />}>Instagram</Badge>
+            <Badge icon={<Video aria-hidden className="h-3.5 w-3.5 text-[#1ab7ea]" />}>Vimeo</Badge>
+            <Badge icon={<Facebook aria-hidden className="h-3.5 w-3.5 text-[#1877f2]" />}>Facebook</Badge>
+            <Badge icon={<Linkedin aria-hidden className="h-3.5 w-3.5 text-[#0a66c2]" />}>LinkedIn</Badge>
+            <Badge icon={<Twitter aria-hidden className="h-3.5 w-3.5" />}>X / Twitter</Badge>
+            <Badge icon={<CirclePlay aria-hidden className="h-3.5 w-3.5 text-[#85cc00]" />}>Rumble</Badge>
+            <Badge icon={<Presentation aria-hidden className="h-3.5 w-3.5" />}>StreamYard</Badge>
+            <Badge icon={<Film aria-hidden className="h-3.5 w-3.5 text-[#0061ff]" />}>Dropbox</Badge>
+            <Badge icon={<FolderOpen aria-hidden className="h-3.5 w-3.5 text-[#34a853]" />}>Google Drive</Badge>
+            <Badge icon={<Video aria-hidden className="h-3.5 w-3.5 text-[#4a8cff]" />}>Zoom</Badge>
           </div>
         </div>
       </div>
@@ -162,7 +174,7 @@ function DropZone({
           inputSize="lg"
           className="min-w-0 flex-1"
           value={draft}
-          placeholder="YouTube, Twitch VOD or direct video link"
+          placeholder="YouTube, Twitch, Vimeo, Dropbox, Drive, Zoom, Rumble, Facebook, LinkedIn, X or direct link"
           aria-label="Video link"
           leading={<Link2 className="h-4 w-4" />}
           onChange={(e) => {

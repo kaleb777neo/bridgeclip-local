@@ -723,7 +723,7 @@ class TranscriptionService:
                 timeout=10, check=True,
             )
             duration = float(result.stdout)
-            if not math.isfinite(duration) or not 0 < duration <= 6 * 3600 + 1:
+            if not math.isfinite(duration) or not 0 < duration <= 10 * 3600 + 1:
                 raise ValueError()
             return duration
         except (OSError, ValueError, subprocess.SubprocessError):

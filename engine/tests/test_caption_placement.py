@@ -308,3 +308,38 @@ def test_manual_caption_position_pins_all_layers_and_burns_at_selected_height(tm
     rows = np.nonzero(frame.max(axis=2) > 100)[0]
     assert len(rows) > 20
     assert abs((rows.min() + rows.max()) / 2 / h - y) < .06
+
+
+def test_manual_caption_x_pins_horizontally_without_touching_automatic_y(tmp_path):
+    """caption_x alone moves the pin off center while the layout keeps choosing Y."""
+    renderer = RenderingService()
+    style = get_caption_preset('paper')
+    style.font_size = 40
+    shot = talking_head(Box(.4, .2, .2, .4), 2000)
+    plan = plan_with(shot, shot.people)
+    request = RenderRequest(video_path='unused.mp4', output_path=str(tmp_path / 'out.mp4'),
+        start_time_ms=1000, end_time_ms=3000, source_width=SRC_W, source_height=SRC_H,
+        transcript_segments=[TranscriptSegment(1000, 3000, 'Hello world', words=[
+            TranscriptWord('Hello', 1000, 2000), TranscriptWord('world', 2000, 3000)])],
+        caption_style=style, caption_x=.3)
+    w, h = 360, 640
+    ass = asyncio.run(renderer._generate_captions(request, w, h, 1000, TimeMap([(0, 2000)]), plan, False, plan))
+    positions = POS.findall(open(ass).read())
+    assert positions and {p[1] for p in positions} == {str(round(w * .3))}
+
+
+def test_manual_caption_x_and_y_pin_every_layer_at_the_chosen_spot(tmp_path):
+    w, h = 360, 640
+    renderer = RenderingService()
+    style = get_caption_preset('paper')
+    style.font_size = 40
+    shot = talking_head(Box(.4, .2, .2, .4), 2000)
+    plan = plan_with(shot, shot.people)
+    request = RenderRequest(video_path='unused.mp4', output_path=str(tmp_path / 'out.mp4'),
+        start_time_ms=1000, end_time_ms=3000, source_width=SRC_W, source_height=SRC_H,
+        transcript_segments=[TranscriptSegment(1000, 3000, 'Hello world', words=[
+            TranscriptWord('Hello', 1000, 2000), TranscriptWord('world', 2000, 3000)])],
+        caption_style=style, caption_y=.5, caption_x=.7)
+    ass = asyncio.run(renderer._generate_captions(request, w, h, 1000, TimeMap([(0, 2000)]), plan, False, plan))
+    positions = POS.findall(open(ass).read())
+    assert positions and set(positions) == {('5', str(round(w * .7)), str(round(h * .5)))}

@@ -11,6 +11,9 @@ export interface StartedJob {
   queued: boolean
 }
 
+/** Output formats the wizard can pick; primary first. */
+export type WizardAspectRatio = '9:16' | '16:9' | '1:1'
+
 /**
  * The Create form, kept outside the component so the chosen video and options
  * survive navigating away (e.g. to Settings to add a key) and a failed run.
@@ -21,8 +24,11 @@ export interface ClipDraft {
   clippingMode: 'quality' | 'economy' | 'advanced'
   plannerModel: string
   transcriptionModel: string
-  aspectRatio: '9:16' | '16:9'
-  /** 9:16 framing: smart per-shot layouts, always full frame, or letterbox. */
+  /** Output formats for every clip, primary first; review workflows keep one. */
+  aspectRatios: WizardAspectRatio[]
+  /** Brand pack selected in the wizard; its fields are applied to the draft on select, and later manual edits win. */
+  templateId: string | null
+  /** Framing for 9:16 / 1:1 output: smart per-shot layouts, always full frame, or letterbox. */
   layoutStyle: 'auto' | 'fill' | 'fit'
   /** Paid vision verification for ambiguous shots in Smart framing. */
   layoutVision: boolean
@@ -35,9 +41,17 @@ export interface ClipDraft {
   autoClipCount: boolean
   maxClips: number
   includeCaptions: boolean
+  /** Only add caption without clipping: caption the whole video, no clip selection. */
+  captionsOnly: boolean
   captionPreset: string
+  /** User-uploaded .srt for the transcript; null uses AI transcription. */
+  srtPath: string | null
+  srtName: string | null
   /** Automatic clips: the title card at the top of each clip. */
   includeTitle: boolean
+  /** Channel banner from a brand pack; the wizard has no banner editor, so these only arrive via draftPatchForTemplate. */
+  bannerPlatform: string | null
+  bannerChannelUrl: string | null
   trimOpen: boolean
   trimStart: string
   trimEnd: string
@@ -61,7 +75,8 @@ export const useDraftStore = create<DraftState>((set) => ({
   clippingMode: 'quality',
   plannerModel: '',
   transcriptionModel: '',
-  aspectRatio: '9:16',
+  aspectRatios: ['9:16'],
+  templateId: null,
   layoutStyle: 'auto',
   layoutVision: true,
   pacing: 'tight',
@@ -71,8 +86,13 @@ export const useDraftStore = create<DraftState>((set) => ({
   autoClipCount: true,
   maxClips: 5,
   includeCaptions: true,
+  captionsOnly: false,
   captionPreset: 'pop',
+  srtPath: null,
+  srtName: null,
   includeTitle: true,
+  bannerPlatform: null,
+  bannerChannelUrl: null,
   trimOpen: false,
   trimStart: '',
   trimEnd: '',

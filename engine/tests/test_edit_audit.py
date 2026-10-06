@@ -87,7 +87,7 @@ async def fixture():
     """Use real policy and adapter with mocked provider replies for the UI fixture."""
     from unittest.mock import patch
     gate, _ = reviewer(lambda state, q: 'removal_safe' not in q and 'setup' in state['retained_dialogue'] and 'qualification' in state['retained_dialogue'])
-    async def completion(_client, _payload):
+    async def completion(_client, _payload, provider="openrouter"):
         return repair_response(json.dumps({'omit': False, 'start_segment': 0, 'end_segment': 3, 'title': 'A supported result'})), {'cost': .001, 'prompt_tokens': 400, 'completion_tokens': 40, 'total_tokens': 440}
     segment = ClipPlanSegment(3000, 8000, .9, summary='Result')
     accepted = report()

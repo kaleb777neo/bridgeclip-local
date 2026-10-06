@@ -1,8 +1,14 @@
-import { openEditor, saveEditor, runEditor, cancelEditor, replaceEditorSource } from './clip-editor'
-import { editorCloseReady, freeEditorMedia, readEditorProgress } from './clip-editor'
+import { openEditor, saveEditor, runEditor, cancelEditor, createEditorProject, replaceEditorSource, addEditorAsset, assetKinds, importEditorAudio, attachEditorAudio, listEditorVoices, previewEditorVoiceover, renderMotionClip } from './clip-editor'
+import { listAudioLibrary, removeAudioTrack } from './audio-library'
+import { planMotionShots } from './motion-studio'
+import { editorCloseReady, editorOperationProgress, editorWaveform, freeEditorMedia, readEditorProgress } from './clip-editor'
+import { generateEditorHook, generateEditorEnhance, detectBadTakes, generateTitleByStyle, type TitleStyle } from './editor-ai'
+import { exportRunFcpXml } from './export-fcpxml'
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
-import { existsSync, realpathSync } from 'fs'
-import { loadSettings, publicSettings, replaceApiKey, savePublicSettings, type ApiKeyName, type PublicSettings } from './settings-store'
+import { existsSync, lstatSync, realpathSync } from 'fs'
+import { extname, isAbsolute } from 'path'
+import { addVocabularyTerm, loadSettings, publicSettings, replaceApiKey, savePublicSettings, type ApiKeyName, type PublicSettings } from './settings-store'
+import { autoImportStatus, initAutoImport, pollAutoImport } from './auto-import'
 import { ensureOutputDir, getJobHistory, getJobOutput, generateThumbnail } from './file-manager'
 import { measureOutputStorage } from './output-storage'
 import { inspectEdits } from './edit-inspector'
@@ -20,6 +26,8 @@ import { logger, getLogFilePath } from './logger'
 import { assertAbsolutePath, assertMediaPath, assertTrustedSender, authorizeMedia, isTrustedExternalUrl, isWebUrl, isWithinDirectory, openAuthorizedMedia } from './security'
 import { assertPublicWebUrl } from './network-policy'
 import { validateJobConfig } from './validation'
+import { deleteTemplate, listTemplates, saveTemplate } from './templates-store'
+import { applyTemplateSnapshot } from './template-resolve'
 import { getModelCatalog, resolveAdvancedModels } from './openrouter-models'
 import { cancelLocalAiSetup, ensureOllamaRunning, getLocalAiStatus, setupLocalAi } from './local-ai'
 import { getYouTubePreview } from './youtube-preview'
@@ -29,7 +37,7 @@ import { automationEnhancementGroups, enhanceAutomationBatch, automationContentS
 import { acknowledgeAutomationWarnings, retryAutomationContent, dismissAutomationMetadataError, automationLibraryClip, reorderAutomationContent, reviewAutomationContent, showAutomationContentInFolder } from './automations'
 import { libraryPostingStatus, libraryMetadataSource, enhanceLibraryMetadata } from './library-posting'
 import { libraryPostingSummary } from './library-posting'
-import { deleteLibraryClips, deleteLibraryRun, setLibraryFavorite, setLibraryPosted } from './library-management'
+import { clipThumbnail, deleteJobRun, deleteClipArtifacts, duplicateClipArtifacts, deleteLibraryRun, setClipThumbnail, setLibraryFavorite, setLibraryPosted } from './library-management'
 import {
   cancelZernioConnect,
   connectZernioAccount,
@@ -42,6 +50,7 @@ import {
   syncZernioAccounts,
   checkZernioStatus
 } from './zernio/service'
+import { analyticsBestTime, analyticsDashboard } from './zernio/analytics'
 import {
   calendarPosts,
   cancelPost,
@@ -54,6 +63,7 @@ import {
   openPostLink,
   openTikTokLegal,
   probeClipForPosting,
+  sourceVideoLinkFor,
   publishClip,
   refreshPosts,
   reschedulePost,
@@ -92,6 +102,8 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
     return true
   })
 
+  /** Brand Vocabulary: one proper noun from the editor's transcript, merged into the saved terms. */
+  handle('settings:addVocabularyTerm', (_event, term: unknown) => addVocabularyTerm(term))
   handle('settings:save', (_event, settings: PublicSettings) => {
     const current = loadSettings()
     if (!settings || typeof settings !== 'object') throw new Error('Invalid settings')
@@ -100,6 +112,11 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
     if (app.isPackaged && settings.pythonPath !== current.pythonPath) throw new Error('Runtime paths cannot be changed in packaged builds')
     return savePublicSettings(settings)
   })
+
+  // Brand templates: read-only built-ins plus the user's saved packs.
+  handle('templates:list', () => listTemplates())
+  handle('templates:save', (_event, template: unknown, logoPath: unknown = null, introPath: unknown = null, outroPath: unknown = null) => saveTemplate(template, logoPath, introPath, outroPath))
+  handle('templates:delete', (_event, id: unknown) => deleteTemplate(id))
 
   handle('settings:replaceApiKey', (_event, key: ApiKeyName, value: string) => {
     const previousZernioKey = key === 'zernioApiKey' ? loadSettings().zernioApiKey : null
@@ -122,6 +139,8 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
 
   // Posting clips through Zernio. Uploads and post links stay in the main process.
   handle('zernio:posts:probe', (_event, clipPath: unknown, durationMs: unknown) => probeClipForPosting(clipPath, durationMs))
+  /** Whether the clip's run has a source video link (drives the YouTube "full video link" checkbox). */
+  handle('zernio:posts:sourceVideoLink', (_event, clipPath: unknown) => sourceVideoLinkFor(clipPath))
   handle('zernio:posts:tiktokCreatorInfo', (_event, accountId: unknown) => getTikTokCreatorInfo(accountId))
   handle('zernio:posts:publish', (event, request: unknown) => publishClip(request, (progress) => {
     if (!event.sender.isDestroyed()) event.sender.send('zernio:postProgress', progress)
@@ -138,6 +157,10 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
   handle('zernio:posts:dismiss', (_event, postId: unknown) => dismissPost(postId))
   handle('zernio:posts:open', (_event, postId: unknown, targetIndex: unknown) => openPostLink(postId, targetIndex))
   handle('zernio:posts:openTikTokLegal', (_event, key: unknown) => openTikTokLegal(key))
+
+  // Read-only Zernio analytics for the Analytics page.
+  handle('zernio:analytics:dashboard', (_event, from: unknown, to: unknown) => analyticsDashboard(from, to))
+  handle('zernio:analytics:bestTime', () => analyticsBestTime())
 
   handle('automations:enhancementGroups', (_event, id: unknown) => automationEnhancementGroups(id))
   handle('automations:enhanceBatch', (_event, id: unknown, ids: unknown, key: unknown, guidance: unknown) => enhanceAutomationBatch(id, ids, key, guidance))
@@ -197,6 +220,8 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
 
     try {
       config = validateJobConfig(config)
+      // Brand-template snapshot: materialize the pack, then revalidate the run.
+      config = applyTemplateSnapshot(config)
       // The Advanced-mode catalog is OpenRouter's; the other backends serve
       // their own models and would also fail the catalog fetch.
       if (config.clippingMode === 'advanced' && loadSettings().aiProvider === 'cloud') {
@@ -205,6 +230,12 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
       if (isWebUrl(config.videoUrl)) await assertPublicWebUrl(config.videoUrl)
       else assertMediaPath(config.videoUrl, loadSettings().outputDirectory)
       if (config.bannerChannelUrl) await assertPublicWebUrl(config.bannerChannelUrl)
+      if (config.srtPath !== undefined) {
+        if (typeof config.srtPath !== 'string' || !isAbsolute(config.srtPath) || config.srtPath.includes('\0') ||
+            extname(config.srtPath).toLowerCase() !== '.srt') throw new Error('Choose a valid .srt subtitle file')
+        const srtStat = lstatSync(config.srtPath)
+        if (!srtStat.isFile() || srtStat.isSymbolicLink() || srtStat.size > 5 * 1024 * 1024) throw new Error('The .srt file could not be read (5 MB limit).')
+      }
     } catch (error) { return { error: error instanceof Error ? error.message : 'Invalid job options' } }
     const settings = loadSettings()
 
@@ -298,6 +329,7 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
 
   handle('jobs:list', () => listJobs())
   handle('jobs:dismiss', (_event, jobId: unknown) => typeof jobId === 'string' && dismissJob(jobId))
+  handle('jobs:deleteRun', (_event, outputDir: unknown) => deleteJobRun(outputDir))
 
   handle('diagnostics:getLogPath', () => {
     return getLogFilePath()
@@ -322,7 +354,27 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
   handle('history:setPosted', (_event, outputDir: unknown, clipIndex: unknown, posted: unknown) => setLibraryPosted(outputDir, clipIndex, posted))
   handle('history:setFavorite', (_event, outputDir: unknown, favorite: unknown) => setLibraryFavorite(outputDir, favorite))
   handle('history:delete', (_event, outputDir: unknown) => deleteLibraryRun(outputDir))
-  handle('history:deleteClips', (_event, outputDir: unknown, indices: unknown) => deleteLibraryClips(outputDir, indices))
+  handle('history:deleteClips', (_event, outputDir: unknown, indices: unknown) => deleteClipArtifacts(outputDir, indices))
+  handle('history:duplicateClips', (_event, outputDir: unknown, indices: unknown) => duplicateClipArtifacts(outputDir, indices))
+  /** The clip's canonical cover: frame time or uploaded image, applied to every post of the clip. */
+  handle('history:thumbnail', (_event, outputDir: unknown, clipIndex: unknown) => clipThumbnail(outputDir, clipIndex))
+  /** Auto Import: status, settings update and a manual poll. */
+  handle('autoImport:status', () => autoImportStatus())
+  handle('autoImport:set', (_event, patch: unknown) => {
+    const request = patch && typeof patch === 'object' ? patch as Record<string, unknown> : {}
+    const current = loadSettings()
+    const playlists = typeof request.playlists === 'string' ? request.playlists : current.autoImportPlaylists
+    const enabled = typeof request.enabled === 'boolean' ? request.enabled : current.autoImportEnabled
+    const interval = typeof request.intervalMinutes === 'number' && Number.isFinite(request.intervalMinutes) && request.intervalMinutes >= 15
+      ? Math.min(Math.floor(request.intervalMinutes), 1440) : current.autoImportIntervalMinutes
+    return savePublicSettings({ ...current, autoImportPlaylists: playlists, autoImportEnabled: enabled, autoImportIntervalMinutes: interval })
+  })
+  handle('autoImport:pollNow', async () => {
+    const before = autoImportStatus()
+    if (!before.config.enabled || !before.config.playlists.length) return { queued: [], errors: ['Auto Import is off or has no playlists.'] }
+    return pollAutoImport()
+  })
+  handle('history:setThumbnail', (_event, outputDir: unknown, clipIndex: unknown, thumb: unknown) => setClipThumbnail(outputDir, clipIndex, thumb))
   handle('history:metadataSource', (_event, outputDir: unknown, clipIndex: unknown) => libraryMetadataSource(outputDir, clipIndex))
   handle('history:enhanceMetadata', (_event, outputDir: unknown, clipIndex: unknown, options: unknown) => enhanceLibraryMetadata(outputDir, clipIndex, options))
   handle('history:getJob', (_event, outputDir: string) => {
@@ -332,15 +384,114 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
   })
 
   handle('editor:open', (_event, path: unknown) => openEditor(path))
-  handle('editor:save', (_event, path: unknown, revision: unknown, edits: unknown) => saveEditor(path, revision, edits))
-  handle('editor:run', (_event, path: unknown, revision: unknown, id: unknown, action: unknown) => runEditor(path, revision, id, action))
+  handle('editor:createProject', (_event, path: unknown, mediaPath?: unknown, focusClipIndex?: unknown) => createEditorProject(path, mediaPath, focusClipIndex))
+  handle('editor:save', (_event, path: unknown, revision: unknown, edits: unknown, speakerNames: unknown) => saveEditor(path, revision, edits, speakerNames))
+  handle('editor:addAsset', async (_event, path: unknown, kind: unknown) => {
+    const window = getMainWindow()
+    if (!window) return null
+    const pickers: Record<string, { title: string; filters: { name: string; extensions: string[] }[] }> = {
+      image: { title: 'Choose an Image', filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }] },
+      video: { title: 'Choose a Video', filters: [{ name: 'Video Files', extensions: ['mp4', 'm4v', 'mov', 'mkv', 'webm'] }] },
+      audio: { title: 'Choose an Audio Track', filters: [{ name: 'Audio Files', extensions: ['mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac'] }] }
+    }
+    const picker = typeof kind === 'string' ? pickers[kind] : undefined
+    if (!picker) throw new Error('Invalid asset kind')
+    const result = await dialog.showOpenDialog(window, { properties: ['openFile'], title: picker.title, filters: [...picker.filters, { name: 'All Files', extensions: ['*'] }] })
+    if (result.canceled || result.filePaths.length === 0) return null
+    return addEditorAsset(path, kind, authorizeMedia(result.filePaths[0]))
+  })
+  /** Import tab: a dropped media file — main infers image/video/audio from its extension. */
+  handle('editor:addAssetDropped', async (_event, path: unknown, file: unknown) => {
+    const source = typeof file === 'string' ? authorizeMedia(file) : null
+    if (!source) throw new Error('That is not a supported media file.')
+    const ext = extname(source).slice(1).toLowerCase()
+    const kind = Object.entries(assetKinds).find(([, spec]) => spec.exts.includes(ext))?.[0]
+    if (!kind) throw new Error("That file type can't be used here. Choose a png, jpg, webp, mp4, mov, mkv, webm, mp3, wav, m4a, aac, ogg or flac file.")
+    return addEditorAsset(path, kind, source)
+  })
+  /** "Add audio": a dropped file's path, a picked file, or a pasted link — the engine extracts the audio track. */
+  handle('editor:importAudio', async (_event, path: unknown, payload: unknown) => {
+    const request = payload && typeof payload === 'object' ? payload as Record<string, unknown> : null
+    if (request?.mode === 'link') {
+      if (typeof request.url !== 'string') throw new Error('Paste the link to the audio or video')
+      return importEditorAudio(path, { kind: 'link', url: request.url })
+    }
+    if (request?.mode === 'file') {
+      let picked: string
+      if (typeof request.path === 'string') picked = authorizeMedia(request.path)
+      else {
+        const window = getMainWindow()
+        if (!window) throw new Error('The window is unavailable')
+        const result = await dialog.showOpenDialog(window, { properties: ['openFile'], title: 'Choose an Audio or Video File',
+          filters: [{ name: 'Audio & Video', extensions: ['mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac', 'mp4', 'm4v', 'mov', 'webm'] }, { name: 'All Files', extensions: ['*'] }] })
+        if (result.canceled || result.filePaths.length === 0) return null
+        picked = authorizeMedia(result.filePaths[0])
+      }
+      return importEditorAudio(path, { kind: 'file', path: picked })
+    }
+    throw new Error('Invalid audio import')
+  })
+  handle('audioLibrary:list', () => listAudioLibrary())
+  handle('audioLibrary:remove', (_event, id: unknown) => removeAudioTrack(id))
+  handle('audioLibrary:attach', (_event, path: unknown, id: unknown) => attachEditorAudio(path, id))
+  /** Motion Studio: plan shots for an idea via the configured AI provider. */
+  handle('editor:motionPlan', async (_event, payload: unknown) => {
+    const request = payload && typeof payload === 'object' ? payload as Record<string, unknown> : null
+    if (!request || typeof request.idea !== 'string' || !Array.isArray(request.references)) throw new Error('Describe the idea first.')
+    const references = request.references.flatMap((r) => (r && typeof r === 'object' && typeof (r as { asset?: unknown }).asset === 'string' &&
+        /^[a-f0-9]{32}\.[a-z0-9]{2,4}$/.test((r as { asset: string }).asset)
+      ? [{ asset: (r as { asset: string }).asset,
+           name: typeof (r as { name?: unknown }).name === 'string' ? (r as { name: string }).name : '',
+           kind: (r as { kind?: unknown }).kind === 'video' ? 'video' as const : (r as { kind?: unknown }).kind === 'audio' ? 'audio' as const : 'image' as const }]
+      : []))
+    const style = ['auto', 'clean', 'dynamic', 'cinematic'].includes(request.style as string) ? request.style as 'auto' : 'auto'
+    const lengthMs = request.lengthMs === 4000 || request.lengthMs === 8000 ? request.lengthMs : 6000
+    return planMotionShots({ idea: request.idea, references, style, lengthMs })
+  })
+  /** Motion Studio: render a reviewed shot plan with the local generator. */
+  handle('editor:motionRender', (_event, path: unknown, plan: unknown, audioAsset: unknown) => renderMotionClip(path, plan, audioAsset))
+  handle('editor:run', (_event, path: unknown, revision: unknown, id: unknown, action: unknown, subject: unknown) => runEditor(path, revision, id, action, subject))
   handle('editor:cancel', (_event, path: unknown) => cancelEditor(path))
+  /** Editor AI tools: thin wrappers, all prompt building and validation live in editor-ai. */
+  handle('editor:titleStyle', async (_event, payload: unknown) => {
+    const input = payload && typeof payload === 'object' ? payload as Record<string, unknown> : null
+    const title = typeof input?.title === 'string' ? input.title : ''
+    const caption = typeof input?.caption === 'string' ? input.caption : ''
+    const style = input?.style
+    if (!title.trim() || style !== 'interesting' && style !== 'catchy' && style !== 'serious' && style !== 'question') throw new Error('Invalid title regeneration request')
+    return generateTitleByStyle({ title, caption }, style as TitleStyle)
+  })
+  handle('editor:aiHook', async (_event, path: unknown, candidateId: unknown) => {
+    const { project } = await openEditor(path)
+    return generateEditorHook(project, typeof candidateId === 'string' ? candidateId.slice(0, 100) : '')
+  })
+  handle('editor:aiBadTakes', async (_event, path: unknown, candidateId: unknown) => {
+    const { project } = await openEditor(path)
+    return detectBadTakes(project, typeof candidateId === 'string' ? candidateId.slice(0, 100) : '')
+  })
+  handle('editor:aiEnhance', async (_event, path: unknown, candidateId: unknown) => {
+    const { project } = await openEditor(path)
+    return generateEditorEnhance(project, typeof candidateId === 'string' ? candidateId.slice(0, 100) : '')
+  })
   handle('editor:replaceSource', (_event, path: unknown, revision: unknown, replacement: unknown) => replaceEditorSource(path, revision, replacement))
   handle('editor:progress', (_event, path: unknown) => readEditorProgress(path))
+  handle('editor:operationProgress', (_event, path: unknown) => editorOperationProgress(path))
+  handle('editor:waveform', (_event, path: unknown) => editorWaveform(path))
   handle('editor:freeMedia', (_event, path: unknown, revision: unknown) => freeEditorMedia(path, revision))
+  /** Voiceover Studio: installed Windows voices + scratch preview synthesis. */
+  handle('editor:voiceVoices', (_event, path: unknown) => listEditorVoices(path))
+  handle('editor:voicePreview', (_event, path: unknown, config: unknown) => previewEditorVoiceover(path, config))
   handle('editor:closeReady', (_event, saved: unknown) => editorCloseReady(saved))
 
   handle('edits:inspect', (_event, outputDir: string) => inspectEdits(outputDir, loadSettings().outputDirectory))
+
+  handle('dialog:selectSrt', async () => {
+    const window = getMainWindow()
+    if (!window) return null
+    const result = await dialog.showOpenDialog(window, { properties: ['openFile'], title: 'Choose a Subtitle File', filters: [{ name: 'Subtitles', extensions: ['srt'] }, { name: 'All Files', extensions: ['*'] }] })
+    if (result.canceled || result.filePaths.length === 0) return null
+    return result.filePaths[0]
+  })
 
   handle('thumbnails:generate', async (_event, videoPath: string, seekSeconds?: number) => {
     if (isAutomationMedia(videoPath)) authorizeMedia(videoPath)
@@ -398,6 +549,25 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
     return authorizeMedia(result.filePaths[0])
   })
 
+  // Brand-pack logo picker: the templates store re-checks the picked path (real file,
+  // image extension, size cap) before copying it into the pack's asset folder.
+  handle('dialog:selectImage', async () => {
+    const window = getMainWindow()
+    if (!window) return null
+
+    const result = await dialog.showOpenDialog(window, {
+      properties: ['openFile'],
+      title: 'Choose a Logo',
+      filters: [
+        { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] },
+        { name: 'All Files', extensions: ['*'] }
+      ]
+    })
+
+    if (result.canceled || result.filePaths.length === 0) return null
+    return result.filePaths[0]
+  })
+
   // A file dropped on the calendar's upload zone arrives as an absolute path; authorizeMedia
   // rejects anything that isn't a real supported media file, same gate the picker uses.
   handle('dialog:authorizeDrop', (_event, path: unknown) => {
@@ -425,40 +595,85 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
     if (result.canceled || result.filePaths.length === 0) return { success: false, count: 0, failedCount: 0 }
 
     const destDir = result.filePaths[0]
-    const { open, rm } = await import('fs/promises')
+    const { rm } = await import('fs/promises')
+    const { createWriteStream } = await import('fs')
     const { pipeline } = await import('stream/promises')
+    const { Transform } = await import('stream')
     const { extname, join } = await import('path')
     let count = 0
-
-    for (const clip of clips) {
-      try {
-        const source = await openAuthorizedMedia(clip.path, loadSettings().outputDirectory)
-        try {
-          const ext = extname(clip.path) || '.mp4'
-          const safeName = Array.from(clip.name).filter((char) => char.charCodeAt(0) >= 32).join('').replace(/[<>:"/\\|?*]+/g, '-').replace(/\s+/g, ' ').trim().slice(0, 120) || 'clip'
-          let suffix = 0
-          while (true) {
-            const dest = join(destDir, `${safeName}${suffix ? ` (${suffix})` : ''}${ext}`)
-            let target: Awaited<ReturnType<typeof open>> | undefined
-            try {
-              target = await open(dest, 'wx', 0o600)
-              await pipeline(source.handle.createReadStream({ autoClose: false }), target.createWriteStream({ autoClose: false }))
-              await target.close()
-              break
-            } catch (error) {
-              await target?.close()
-              if (target) await rm(dest, { force: true })
-              if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || ++suffix > 10000) throw error
-            }
-          }
-          count++
-        } finally {
-          await source.handle.close()
-        }
-      } catch { /* Counted below as an unsuccessful copy. */ }
+    const failures: string[] = []
+    // Live per-clip progress for the Bulk download dialog; integer percent so a
+    // big file emits one event per percent, not one per chunk.
+    const report = (index: number, name: string, percent: number, status: 'copying' | 'done' | 'failed'): void => {
+      window.webContents.send('clips:bulkExportProgress', { total: clips.length, index, name, percent, status })
     }
 
-    return { success: count > 0, count, failedCount: clips.length - count, destDir }
+    for (const [index, clip] of clips.entries()) {
+      report(index, clip.name, 0, 'copying')
+      const ext = extname(clip.path) || '.mp4'
+      const safeName = Array.from(clip.name).filter((char) => char.charCodeAt(0) >= 32).join('').replace(/[<>:"/\\|?*]+/g, '-').replace(/\s+/g, ' ').trim().slice(0, 120) || 'clip'
+      let suffix = 0
+      try {
+        while (true) {
+          const dest = join(destDir, `${safeName}${suffix ? ` (${suffix})` : ''}${ext}`)
+          // A fresh authorized open per attempt: a pipeline destroyed mid-copy
+          // (the name collision surfaces as the write stream's first error)
+          // leaves the FileHandle's read state unusable, so retries re-open.
+          let source: Awaited<ReturnType<typeof openAuthorizedMedia>> | undefined
+          try {
+            source = await openAuthorizedMedia(clip.path, loadSettings().outputDirectory)
+            const total = source.size
+            // The write stream must own its close (autoClose default): a
+            // FileHandle write stream with autoClose:false never signals
+            // completion to pipeline. Reads stay pinned to the authorized
+            // inode via the source handle.
+            let copied = 0
+            let lastPercent = -1
+            const meter = new Transform({
+              transform(chunk: Buffer, _enc, cb) {
+                copied += chunk.length
+                const percent = total > 0 ? Math.min(99, Math.floor((copied * 100) / total)) : 100
+                if (percent !== lastPercent) {
+                  lastPercent = percent
+                  report(index, clip.name, percent, 'copying')
+                }
+                cb(null, chunk)
+              }
+            })
+            await pipeline(source.handle.createReadStream({ autoClose: false }), meter, createWriteStream(dest, { flags: 'wx', mode: 0o600 }))
+            break
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+              // The name is taken — never touch that file, take the next suffix.
+              if (++suffix > 10000) throw error
+              continue
+            }
+            await rm(dest, { force: true }) // A partial copy is ours to remove.
+            throw error
+          } finally {
+            await source?.handle.close()
+          }
+        }
+        count++
+        report(index, clip.name, 100, 'done')
+      } catch {
+        failures.push(clip.name)
+        report(index, clip.name, 0, 'failed')
+      }
+    }
+
+    return { success: count > 0, count, failedCount: clips.length - count, destDir, failures }
+  })
+
+  handle('clips:exportFcpXml', async (_event, outputDir: string, clipIndices: unknown) => {
+    assertAbsolutePath(outputDir)
+    if (!isWithinDirectory(outputDir, loadSettings().outputDirectory)) throw new Error('Invalid run folder')
+    if (clipIndices !== null && clipIndices !== undefined &&
+        (!Array.isArray(clipIndices) || clipIndices.length > 500 || !clipIndices.every((index) => Number.isSafeInteger(index) && (index as number) >= 0))) {
+      throw new Error('Invalid clip selection')
+    }
+    const indices = Array.isArray(clipIndices) && clipIndices.length > 0 ? (clipIndices as number[]) : null
+    return exportRunFcpXml(getMainWindow(), outputDir, indices, loadSettings())
   })
 
   handle('system:isPackaged', () => {

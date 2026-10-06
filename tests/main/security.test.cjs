@@ -28,7 +28,7 @@ const jobOutput = loadShared('job-output.ts')
 const videoSource = loadShared('video-source.ts')
 const runHistory = loadSource('run-history.ts', { '../shared/video-source': videoSource })
 const security = loadSource('security.ts', { electron: {}, '../shared/brand': loadShared('brand.ts') })
-const { validateJobConfig } = loadSource('validation.ts', { './security': security, '../shared/video-source': videoSource, '../shared/job-contract': jobContract, '../shared/openrouter-models': loadShared('openrouter-models.ts') })
+const { validateJobConfig } = loadSource('validation.ts', { './security': security, './templates-store': { getTemplate: (id) => (id === 'clean' || id === 'saved-one' ? { id, builtIn: id === 'clean' } : null) }, '../shared/video-source': videoSource, '../shared/job-contract': jobContract, '../shared/openrouter-models': loadShared('openrouter-models.ts') })
 
 test('development checks the staged FFmpeg that the clipping engine uses', async () => {
   const binDir = path.join(__dirname, '../../engine-bin')
@@ -180,10 +180,15 @@ test('the native picker authorizes media and shell opening rejects aliased appli
         dialog: { showOpenDialog: async () => ({ canceled: false, filePaths: [video] }) }
       },
       './settings-store': { loadSettings: () => ({ outputDirectory: library }) },
+      './audio-library': { listAudioLibrary: async () => ({ tracks: [] }), removeAudioTrack: async () => true },
+      './motion-studio': { planMotionShots: async () => null },
+      './auto-import': { initAutoImport() {}, pollAutoImport: async () => null, autoImportStatus: () => null },
       './file-manager': {},
       './output-storage': { measureOutputStorage: async (directory) => ({ outputDirectory: directory, bytes: 0 }) },
       './clip-editor': {},
+      './editor-ai': {},
       './edit-inspector': { inspectEdits: async () => ({}) },
+      './export-fcpxml': {},
       './run-history': runHistory,
       './pipeline-runner': {},
       './job-manager': { initJobManager() {} },
@@ -191,11 +196,14 @@ test('the native picker authorizes media and shell opening rejects aliased appli
       './security': security,
       './network-policy': {},
       './validation': {},
+      './templates-store': {},
+      './template-resolve': {},
       './openrouter-models': {},
       './youtube-preview': { getYouTubePreview: async () => ({ title: 'A video' }) },
       './tools': {}, './local-ai': { modelsDir: () => '/tmp/bridgeclip-models' },
       './zernio/service': {},
       './zernio/posts': {},
+      './zernio/analytics': {},
       './automations': {},
       './library-posting': {},
       './library-management': {}
@@ -287,7 +295,62 @@ test('job validation rejects malformed options and invalid trim intervals', () =
   for (const option of jobContract.DURATION_OPTIONS) assert.doesNotThrow(() => validateJobConfig({ ...job, durationRanges: [option.id] }))
   assert.equal(validateJobConfig({ ...job, videoUrl: 'https://go.twitch.tv/videos/123?t=30s' }).videoUrl, 'https://www.twitch.tv/videos/123')
   for (const videoUrl of ['https://twitch.tv/channel', 'https://clips.twitch.tv/Clip']) assert.throws(() => validateJobConfig({ ...job, videoUrl }), /completed Twitch VOD/)
-  for (const patch of [{ maxClips: -1 }, { startTimeSeconds: NaN }, { startTimeSeconds: 5, endTimeSeconds: 3 }, { videoUrl: 'file:///etc/passwd' }, { durationRanges: ['unexpected'] }, { includeCaptions: 'false' }, { includeTitle: 'false' }, { layoutVision: 'true' }, { aspectRatio: '1:1' }, { clippingMode: 'unknown' }]) assert.throws(() => validateJobConfig({ ...job, ...patch }))
+  for (const patch of [{ maxClips: -1 }, { startTimeSeconds: NaN }, { startTimeSeconds: 5, endTimeSeconds: 3 }, { videoUrl: 'file:///etc/passwd' }, { durationRanges: ['unexpected'] }, { includeCaptions: 'false' }, { includeTitle: 'false' }, { layoutVision: 'true' }, { aspectRatio: '4:3' }, { clippingMode: 'unknown' }]) assert.throws(() => validateJobConfig({ ...job, ...patch }))
+  // 1:1 is a first-class output format now (Faza B), and so are format lists.
+  assert.equal(validateJobConfig({ ...job, aspectRatio: '1:1', aspectRatios: ['1:1'] }).aspectRatio, '1:1')
+})
+
+test('multi-format output lists stay unique, capped and anchored to the primary ratio', () => {
+  const job = { videoUrl: 'https://example.com/video', maxClips: 5, autoClipCount: true, includeCaptions: true, aspectRatio: '9:16', layoutStyle: 'auto', layoutVision: true, pacing: 'tight', captionPreset: 'pop', durationRanges: ['short'], startTimeSeconds: null, endTimeSeconds: null, bannerPlatform: null, bannerChannelUrl: null }
+  assert.deepEqual(validateJobConfig({ ...job, aspectRatios: ['9:16', '1:1', '16:9'] }).aspectRatios, ['9:16', '1:1', '16:9'])
+  assert.deepEqual(validateJobConfig({ ...job, aspectRatio: '1:1', aspectRatios: ['1:1'] }).aspectRatios, ['1:1'])
+  // "Run again" resubmits the stored request, which must round-trip unchanged.
+  const stored = validateJobConfig({ ...job, aspectRatios: ['9:16', '1:1'] })
+  assert.deepEqual(validateJobConfig(stored).aspectRatios, ['9:16', '1:1'])
+  for (const aspectRatios of [
+    [], ['9:16', '9:16'], ['9:16', '4:3'], ['9:16', '16:9', '1:1', '1:1'], '9:16', [9],
+    ['1:1', '9:16'] // does not start with the primary ratio
+  ]) assert.throws(() => validateJobConfig({ ...job, aspectRatios }), /output formats/, JSON.stringify(aspectRatios))
+  // Review & edit renders one 9:16, 16:9 or 1:1 video: no extra formats.
+  assert.equal(validateJobConfig({ ...job, workflow: 'review', aspectRatio: '1:1', aspectRatios: ['1:1'] }).aspectRatio, '1:1', 'square review is allowed')
+  assert.throws(() => validateJobConfig({ ...job, workflow: 'review', aspectRatios: ['9:16', '16:9'] }), /single 9:16, 16:9 or 1:1/)
+  assert.throws(() => validateJobConfig({ ...job, workflow: 'review', aspectRatios: ['9:16', '1:1'] }), /single 9:16, 16:9 or 1:1/)
+  assert.doesNotThrow(() => validateJobConfig({ ...job, workflow: 'review', aspectRatios: ['9:16'] }))
+  assert.doesNotThrow(() => validateJobConfig({ ...job, workflow: 'review', aspectRatio: '16:9', aspectRatios: ['16:9'] }))
+})
+
+test('brand template provenance and materialized overlays validate in main', () => {
+  const job = { videoUrl: 'https://example.com/video', maxClips: 5, autoClipCount: true, includeCaptions: true, aspectRatio: '9:16', layoutStyle: 'auto', layoutVision: true, pacing: 'tight', captionPreset: 'pop', durationRanges: ['short'], startTimeSeconds: null, endTimeSeconds: null, bannerPlatform: null, bannerChannelUrl: null }
+  // The store mock knows 'clean' (built-in) and 'saved-one'; anything else fails closed.
+  assert.equal(validateJobConfig({ ...job, templateId: 'clean' }).templateId, 'clean')
+  assert.doesNotThrow(() => validateJobConfig({ ...job, templateId: 'saved-one' }))
+  for (const templateId of ['gone', 'Bad Id', 'x'.repeat(65), {}, 7]) assert.throws(() => validateJobConfig({ ...job, templateId }), /brand template/i, JSON.stringify(templateId))
+  const logo = { path: path.join(os.tmpdir(), 'templates', 'saved-one', 'logo.png'), position: 'bottom-right', scale: .15, opacity: .9 }
+  const badges = [{ kind: 'subscribe', position: 'top-right', margin: .12 }]
+  const snapshot = validateJobConfig({ ...job, templateId: 'clean', logo, ctaBadges: badges })
+  assert.deepEqual(snapshot.logo, logo)
+  assert.deepEqual(snapshot.ctaBadges, badges)
+  // The stored snapshot must revalidate unchanged, like every "Run again".
+  assert.deepEqual(validateJobConfig(snapshot).logo, logo)
+  assert.doesNotThrow(() => validateJobConfig({ ...job, logo: { ...logo, margin: 0 } }))
+  assert.doesNotThrow(() => validateJobConfig({ ...job, ctaBadges: [{ kind: 'follow', position: 'center' }] }))
+  for (const bad of [{ ...logo, path: 'logo.png' }, { ...logo, path: 'a\0.png' }, { ...logo, path: path.join(os.tmpdir(), 'templates', 'x', 'logo.png'.repeat(2000)) },
+    { ...logo, position: 'middle' }, { ...logo, scale: .6 }, { ...logo, opacity: 0 }, { ...logo, margin: .6 }, 'logo', null]) {
+    assert.throws(() => validateJobConfig({ ...job, logo: bad }), /brand logo/i)
+  }
+  for (const bad of [[], 'bad', [{ kind: 'like', position: 'top-left' }], [{ kind: 'follow', position: 'nowhere' }], [{ kind: 'follow', position: 'center', margin: 2 }],
+    ...[[...Array.from({ length: 5 }, () => ({ kind: 'follow', position: 'center' }))]]]) {
+    assert.throws(() => validateJobConfig({ ...job, ctaBadges: bad }), /CTA badges/i)
+  }
+  // Brand intro/outro video snapshots carry the same main-owned absolute path rule.
+  const video = { path: path.join(os.tmpdir(), 'templates', 'saved-one', 'intro.mp4') }
+  const withVideos = validateJobConfig({ ...job, templateId: 'clean', intro: video, outro: { path: path.join(os.tmpdir(), 'templates', 'saved-one', 'outro.webm') } })
+  assert.deepEqual(withVideos.intro, video)
+  assert.deepEqual(validateJobConfig(withVideos).intro, video)
+  for (const bad of [{ path: 'intro.mp4' }, { path: 'a\0.mp4' }, { path: '' }, { nope: true }, 'intro.mp4', null, 7]) {
+    assert.throws(() => validateJobConfig({ ...job, intro: bad }), /brand intro/i)
+    assert.throws(() => validateJobConfig({ ...job, outro: bad }), /brand outro/i)
+  }
 })
 
 test('saved provider keys remain in main and migrate away from legacy encoding', () => {
@@ -1028,5 +1091,116 @@ test('one unreadable Jev field falls back to its default without hiding saved ke
     // Saving still validates strictly.
     assert.throws(() => store.savePublicSettings({ ...store.publicSettings(loaded), jevThreshold: '2' }), /Invalid Jev threshold/)
     assert.throws(() => store.savePublicSettings({ ...store.publicSettings(loaded), jevEnabled: 'maybe' }), /Invalid Jev/)
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
+test('brand overlay edits accept only run-local asset refs and dirty the render key', () => {
+  const { parseCandidateEdit, renderEditKey } = loadShared('clip-editor.ts')
+  const candidate = { id: 'cand-1', title: 'A clip', ranges: [[0, 4000]], scenes: [{ at_ms: 0, layout: 'fill', crops: [[0, 0, 1, 1]] }], captions: true, caption_preset: 'pop', video_speed: 1 }
+  const ref = `${'a'.repeat(32)}.png`
+  const parsed = parseCandidateEdit({ ...candidate,
+    logo: { asset: ref, position: 'top-right', scale: .2, opacity: .8 },
+    cta_badges: [{ kind: 'subscribe', position: 'bottom-right' }, { kind: 'follow', position: 'center', start_ms: 1000, end_ms: 3000 }] }, 12000)
+  assert.equal(parsed.logo.asset, ref)
+  assert.equal(JSON.stringify(parsed.cta_badges), JSON.stringify([{ kind: 'subscribe', position: 'bottom-right' }, { kind: 'follow', position: 'center', start_ms: 1000, end_ms: 3000 }]))
+  for (const asset of ['../../secret.png', `${'a'.repeat(32)}/../../outside.png`, `/${'a'.repeat(32)}.png`, `${'A'.repeat(32)}.png`,
+    `${'a'.repeat(31)}.png`, `${'a'.repeat(32)}.png.png`, `${'a'.repeat(32)}`, 'editor-asset-' + ref]) {
+    assert.throws(() => parseCandidateEdit({ ...candidate, logo: { asset, position: 'center', scale: .2, opacity: .8 } }, 12000), /Invalid editor project/, asset)
+  }
+  for (const badges of [[{ kind: 'like', position: 'center' }], [{ kind: 'subscribe', position: 'middle' }], [{ kind: 'subscribe' }],
+    [{ kind: 'subscribe', position: 'center', start_ms: 1000 }], [{ kind: 'subscribe', position: 'center', end_ms: 3000 }],
+    [{ kind: 'subscribe', position: 'center', start_ms: 1000, end_ms: 20000 }],
+    Array.from({ length: 11 }, () => ({ kind: 'subscribe', position: 'center' }))]) {
+    assert.throws(() => parseCandidateEdit({ ...candidate, cta_badges: badges }, 12000), /Invalid editor project/, JSON.stringify(badges))
+  }
+  const plain = parseCandidateEdit(candidate, 12000)
+  assert.equal(renderEditKey(plain), renderEditKey(parseCandidateEdit({ ...candidate, cta_badges: [] }, 12000)), 'an empty badge list normalizes away')
+  const logoPatch = (logo) => renderEditKey(parseCandidateEdit({ ...candidate, logo: { asset: ref, position: 'center', scale: .2, opacity: .8, ...logo } }, 12000))
+  for (const logo of [{}, { position: 'top-left' }, { scale: .3 }, { opacity: .4 }, { asset: `${'b'.repeat(32)}.png` }]) {
+    assert.notEqual(logoPatch(logo), renderEditKey(plain), JSON.stringify(logo))
+  }
+  assert.equal(logoPatch({ position: 'center' }), logoPatch({}), 'equivalent logos keep the same key')
+  const badgeKey = (badges) => renderEditKey(parseCandidateEdit({ ...candidate, cta_badges: badges }, 12000))
+  assert.notEqual(badgeKey([{ kind: 'subscribe', position: 'bottom-left' }]), renderEditKey(plain))
+  assert.notEqual(badgeKey([{ kind: 'subscribe', position: 'bottom-left' }]), badgeKey([{ kind: 'subscribe', position: 'top-left' }]))
+  assert.notEqual(badgeKey([{ kind: 'subscribe', position: 'bottom-left' }]), badgeKey([{ kind: 'subscribe', position: 'bottom-left', start_ms: 100, end_ms: 3000 }]))
+  assert.notEqual(badgeKey([{ kind: 'subscribe', position: 'bottom-left' }]), badgeKey([{ kind: 'follow', position: 'bottom-left' }]))
+  // Intro/outro video assets parse like the other run-local refs and dirty the key.
+  const videoRef = `${'c'.repeat(32)}.mp4`
+  const withVideos = parseCandidateEdit({ ...candidate, intro_asset: videoRef, outro_asset: `${'d'.repeat(32)}.mov` }, 12000)
+  assert.equal(withVideos.intro_asset, videoRef)
+  assert.equal(withVideos.outro_asset, `${'d'.repeat(32)}.mov`)
+  assert.throws(() => parseCandidateEdit({ ...candidate, outro_asset: '../../outside.mp4' }, 12000), /Invalid editor project/)
+  assert.notEqual(renderEditKey(withVideos), renderEditKey(plain))
+  const same = parseCandidateEdit({ ...candidate, outro_asset: `${'d'.repeat(32)}.mov` }, 12000)
+  assert.equal(renderEditKey({ ...plain, outro_asset: withVideos.outro_asset }), renderEditKey(same))
+  // Auto Censor config parses normalized and dirties the key; broken configs reject.
+  const censor = parseCandidateEdit({ ...candidate, censor: { words: ['Fuck', 'HELL ', 'fuck'], captions: 'first', audio: 'bleep' } }, 12000)
+  // The parse runs inside a vm realm: compare structurally via JSON, not deepEqual.
+  assert.equal(JSON.stringify(censor.censor), JSON.stringify({ words: ['fuck', 'hell'], captions: 'first', audio: 'bleep' }))
+  assert.notEqual(renderEditKey(censor), renderEditKey(plain))
+  assert.equal(renderEditKey(parseCandidateEdit({ ...candidate, censor: { words: ['hell'], captions: 'first', audio: 'bleep' } }, 12000)),
+    renderEditKey(parseCandidateEdit({ ...candidate, censor: { words: ['HELL'], captions: 'first', audio: 'bleep' } }, 12000)))
+  for (const bad of [
+    { words: [], captions: 'asterisk', audio: 'mute' },
+    { words: ['x'.repeat(41)], captions: 'asterisk', audio: 'mute' },
+    { words: ['ok'], captions: 'blanked', audio: 'mute' },
+    { words: ['ok'], captions: 'asterisk', audio: 'silence' },
+    { words: ['ok'], captions: 'off', audio: 'off' },
+    { words: 'fuck', captions: 'asterisk', audio: 'mute' },
+    'fuck'
+  ]) {
+    assert.throws(() => parseCandidateEdit({ ...candidate, censor: bad }, 12000), /Invalid editor project/, JSON.stringify(bad))
+  }
+  // Music start offset (Add Music): 0–10 minutes, invalid values reject, key dirties.
+  const music = parseCandidateEdit({ ...candidate, music: { asset: `${'e'.repeat(32)}.m4a`, gain: .3, start_ms: 45000 } }, 12000)
+  assert.equal(music.music.start_ms, 45000)
+  assert.notEqual(renderEditKey(music), renderEditKey(parseCandidateEdit({ ...candidate, music: { asset: `${'e'.repeat(32)}.m4a`, gain: .3 } }, 12000)))
+  for (const start of [600001, -1000, 'chorus']) {
+    assert.throws(() => parseCandidateEdit({ ...candidate, music: { asset: `${'e'.repeat(32)}.m4a`, gain: .3, start_ms: start } }, 12000), /Invalid editor project/)
+  }
+})
+
+test('editor asset import copies authorized media into the run folder only', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-assets-'))
+  try {
+    const libraryDir = path.join(root, 'library')
+    fs.mkdirSync(libraryDir)
+    const library = fs.realpathSync(libraryDir)
+    const run = path.join(library, 'run-one')
+    fs.mkdirSync(run)
+    const logo = path.join(library, 'logo.png')
+    fs.writeFileSync(logo, 'png-bytes')
+    const clip = path.join(library, 'intro.mp4')
+    fs.writeFileSync(clip, 'mp4-bytes')
+    const outside = path.join(root, 'outside.png')
+    fs.writeFileSync(outside, 'keep')
+    if (fileLinksAvailable) fs.symlinkSync(outside, path.join(library, 'escape.png'))
+    else t.diagnostic('File symlinks unavailable; symlinked asset assertion skipped')
+    const editor = loadSource('clip-editor.ts', {
+      './settings-store': { loadSettings: () => ({ outputDirectory: library }), getSettingsForBridge: () => ({}) },
+      './security': security,
+      './audio-library': { importTrack: async () => null, listAudioLibrary: async () => ({ tracks: [] }), removeAudioTrack: async () => true },
+      './file-manager': {}, './pipeline-runner': {}, './tools': {},
+      './logger': { logger: { info() {}, warn() {}, error() {} } }
+    })
+    const picked = await editor.addEditorAsset(run, 'image', logo)
+    assert.match(picked.asset, /^[a-f0-9]{32}\.png$/)
+    assert.equal(picked.name, 'logo.png')
+    const copied = path.join(run, `editor-asset-${picked.asset}`)
+    assert.equal(fs.readFileSync(copied, 'utf8'), 'png-bytes')
+    assert.equal(fs.readFileSync(logo, 'utf8'), 'png-bytes')
+    await assert.rejects(editor.addEditorAsset(run, 'sticker', logo), /Invalid asset kind/)
+    await assert.rejects(editor.addEditorAsset(run, 'image', clip), /file type can.t be used here/)
+    await assert.rejects(editor.addEditorAsset(run, 'image', outside), /outside the library/)
+    if (fileLinksAvailable) await assert.rejects(editor.addEditorAsset(run, 'image', path.join(library, 'escape.png')), /outside the library/)
+    const elsewhere = path.join(root, 'run-two')
+    fs.mkdirSync(elsewhere)
+    await assert.rejects(editor.addEditorAsset(elsewhere, 'image', logo), /outside the library/)
+    const aliasRun = path.join(root, 'library', '..', 'elsewhere-run')
+    fs.mkdirSync(path.join(root, 'elsewhere-run'))
+    await assert.rejects(editor.addEditorAsset(aliasRun, 'image', logo), /outside the library/)
+    assert.deepEqual(fs.readdirSync(run), [`editor-asset-${picked.asset}`], 'rejections write nothing into the run')
+    assert.equal(fs.readdirSync(elsewhere).length, 0)
   } finally { fs.rmSync(root, { recursive: true, force: true }) }
 })

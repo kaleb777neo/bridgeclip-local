@@ -154,3 +154,36 @@ def test_caption_timebase_includes_audio_padding(monkeypatch, tmp_path):
     pad_ms = service.settings.audio_padding_ms
     assert captured["clip_start_ms"] == start_ms - pad_ms
     assert captured["clip_end_ms"] == start_ms + duration_ms + pad_ms
+
+
+def test_slide_presets_fly_in_via_move_and_pop_keeps_scale(tmp_path):
+    """Slide Left/Up pin with \\move (offset start); pop/scale keep the \\fscx pop."""
+    import asyncio
+    import re
+
+    from clip_engine.config import get_caption_preset
+    from clip_engine.services.transcription_service import TranscriptSegment
+
+    def kinds_for(preset_id):
+        style = get_caption_preset(preset_id)
+        style.font_size = 40
+        out = tmp_path / f"{preset_id}.ass"
+        asyncio.run(CaptionGeneratorService().generate_captions(
+            transcript_segments=[TranscriptSegment(
+                0, 1200, "hello world", words=[TranscriptWord("hello", 0, 600), TranscriptWord("world", 600, 1200)],
+            )],
+            clip_start_ms=0, clip_end_ms=1200, output_path=str(out),
+            caption_style=style, anchors=[(10 ** 9, 5, 400)],
+        ))
+        lines = [line for line in out.read_text().splitlines() if line.startswith("Dialogue:")]
+        kinds = set()
+        for line in lines:
+            match = re.search(r"\\an5\\(pos|move)", line)
+            assert match, line
+            kinds.add(match.group(1))
+        return kinds
+
+    assert kinds_for('slideleft') == {'move'}
+    assert kinds_for('slideup') == {'move'}
+    assert kinds_for('popline') == {'pos'}
+    assert kinds_for('scale') == {'pos'}

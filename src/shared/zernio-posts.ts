@@ -168,6 +168,20 @@ export function defaultFacebookFormat(media: ClipMediaInfo): FacebookFormat {
   return checkClip('facebook', media, { facebookFormat: 'reel' }).blocking ? 'feed' : 'reel'
 }
 
+// ---- Format recommendation -------------------------------------------------
+
+/** The output format each platform's placement favors for video posts. */
+export function recommendedAspect(platform: ZernioPlatform): string {
+  if (platform === 'tiktok' || platform === 'instagram') return '9:16'
+  if (platform === 'facebook' || platform === 'twitter' || platform === 'linkedin') return '1:1'
+  return '16:9'
+}
+
+/** The clip's rendered variant for `aspect`, or null when only the primary exists. */
+export function pickVariant<T extends { aspect_ratio: string }>(variants: T[] | null | undefined, aspect: string): T | null {
+  return variants?.find((variant) => variant.aspect_ratio === aspect) ?? null
+}
+
 /** Characters as people count them (code points), close to how the platforms count. */
 export function captionLength(caption: string): number {
   return [...caption].length
@@ -339,6 +353,8 @@ export interface YouTubePostOptions {
   madeForKids: boolean
   categoryId?: string
   tags?: string[]
+  /** Append the source video's full link between the caption and its hashtags. */
+  sourceLink?: boolean
 }
 
 export interface PostOptions {

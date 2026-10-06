@@ -4,6 +4,7 @@ Contract: https://openrouter.ai/docs/guides/community/jev; pricing snapshot: 202
 One instance belongs to one job. Cancellation propagates; failures are data.
 """
 import asyncio
+from clip_engine import asyncio_compat  # Installs asyncio.timeout on Python 3.10
 import copy
 import email.utils
 import hashlib

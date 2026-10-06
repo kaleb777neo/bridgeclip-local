@@ -187,3 +187,14 @@ export function layoutDayCards<T>(
   flush()
   return { cards, more }
 }
+
+/** Drag & drop on the calendar: move a post's when onto another day,
+ *  keeping its time of day — or to explicit minutes on that day (week grid).
+ *  Returns the new ISO timestamp. */
+export function movedWhen(whenIso: string, dayKey: string, minutes?: number): string {
+  const original = new Date(whenIso)
+  const [year, month, day] = dayKey.split('-').map(Number)
+  const keep = minutes ?? original.getHours() * 60 + original.getMinutes()
+  const date = new Date(year, (month || 1) - 1, day || 1, 0, Math.max(0, Math.min(24 * 60 - 1, Math.round(keep))))
+  return Number.isFinite(original.getTime()) && Number.isFinite(date.getTime()) ? date.toISOString() : whenIso
+}

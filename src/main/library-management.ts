@@ -1,11 +1,11 @@
 import { editorBusy } from './clip-editor'
 import { randomUUID } from 'crypto'
-import { closeSync, constants, type Dirent, fstatSync, lstatSync, mkdtempSync, openSync, readSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'fs'
+import { closeSync, constants, copyFileSync, existsSync, type Dirent, fstatSync, lstatSync, mkdtempSync, openSync, readSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'fs'
 import { readdir, rm } from 'fs/promises'
-import { basename, dirname, isAbsolute, join, resolve } from 'path'
+import { basename, dirname, extname, isAbsolute, join, resolve } from 'path'
 import { DELETING_RUN_PREFIX, getJobOutput, isManuallyPosted, isRunFavorite, LIBRARY_FAVORITE_FILE, manualPostedFile, removeRunThumbnails } from './file-manager'
 import { logger } from './logger'
-import { parseJobOutput, type JobOutput } from '../shared/job-output'
+import { parseJobOutput, type ClipArtifact, type JobOutput } from '../shared/job-output'
 import { parseEditorProject } from '../shared/clip-editor'
 import { dismissJob, liveJobIds } from './job-manager'
 import { loadSettings } from './settings-store'
@@ -75,6 +75,50 @@ export async function deleteLibraryRun(outputDir: unknown): Promise<void> {
 }
 
 /**
+ * Delete a run straight from the Jobs list, whether it finished or not. Failed,
+ * cancelled and interrupted runs have no job_output.json, so they can only be
+ * recognised by their UUID folder name directly inside the Library; the same
+ * guarded rename-then-remove as a completed run still applies.
+ */
+export async function deleteJobRun(outputDir: unknown): Promise<void> {
+  const librarySetting = loadSettings().outputDirectory
+  if (typeof outputDir !== 'string' || !isAbsolute(outputDir) || outputDir.includes('\0')) throw new Error('Choose a run in your Library.')
+  const library = realpathSync(librarySetting)
+  const path = resolve(outputDir)
+  if (!UUID.test(basename(path))) throw new Error('This run cannot be deleted.')
+  const original = lstatSync(path)
+  const canonical = realpathSync(path)
+  const check = (): string => {
+    const current = lstatSync(path)
+    if (loadSettings().outputDirectory !== librarySetting || realpathSync(librarySetting) !== library ||
+        !current.isDirectory() || current.isSymbolicLink() || realpathSync(path) !== canonical ||
+        dirname(canonical) !== library || realpathSync(dirname(path)) !== library ||
+        current.dev !== original.dev || current.ino !== original.ino) throw new Error('The run changed. Refresh and try again.')
+    if (editorBusy(path)) throw new Error('Wait for the editor to finish before deleting this run.')
+    if (liveJobIds().has(basename(path))) throw new Error('Wait for this run to finish before deleting it.')
+    return path
+  }
+  check()
+  // Only a completed run has a manifest listing cached thumbnails; an unfinished
+  // folder's previews are removed with the folder itself.
+  const output = await getJobOutput(path, library)
+  if (output) removeRunThumbnails(check(), output)
+  // Rename right after the final check (no await in between), then delete.
+  const p = check()
+  const trash = join(library, `${DELETING_RUN_PREFIX}${randomUUID()}`)
+  renameSync(p, trash)
+  const moved = lstatSync(trash)
+  if (!moved.isDirectory() || moved.isSymbolicLink() || moved.dev !== original.dev || moved.ino !== original.ino) {
+    try { renameSync(trash, p) } catch { /* Best effort: it is still a folder directly inside the Library. */ }
+    throw new Error('The run changed. Refresh and try again.')
+  }
+  dismissJob(basename(p))
+  try { rmSync(trash, { recursive: true }) } catch {
+    logger.warn('jobs.delete.cleanup_deferred', { message: 'Some run files could not be removed; they will be removed at the next start.' })
+  }
+}
+
+/**
  * Finish run deletions interrupted by a crash or a locked file. Only real
  * directories named .deleting-<uuid> directly inside the Library are removed.
  */
@@ -131,7 +175,7 @@ function readRunJson(run: string, name: string): Record<string, unknown> {
   } finally { closeSync(fd) }
 }
 
-export async function deleteLibraryClips(outputDir: unknown, indices: unknown): Promise<JobOutput> {
+export async function deleteClipArtifacts(outputDir: unknown, indices: unknown): Promise<JobOutput> {
   if (!Array.isArray(indices) || indices.length === 0 || indices.length > 1000 ||
       indices.some((id) => !Number.isSafeInteger(id) || id < 0 || id > 999) || new Set(indices).size !== indices.length) {
     throw new Error('Select clips from this Library run to delete.')
@@ -212,4 +256,201 @@ export async function deleteLibraryClips(outputDir: unknown, indices: unknown): 
   // cleanup starts, since some deleted files may already have been removed.
   try { rmSync(staging, { recursive: true }) } catch { throw new Error('Clips were removed from the Library, but some files could not be cleaned up in the run folder.') }
   return parseJobOutput(raw)!
+}
+
+/**
+ * Duplicate Library clips: copy each rendered file (and its .srt sidecar) to a
+ * fresh, never-recycled index and clone the linked editor candidate, so edits
+ * to the duplicate never touch the original. Unedited clips duplicate as
+ * plain library entries with no editor link.
+ */
+export async function duplicateClipArtifacts(outputDir: unknown, indices: unknown): Promise<JobOutput> {
+  if (!Array.isArray(indices) || indices.length === 0 || indices.length > 100 ||
+      indices.some((id) => !Number.isSafeInteger(id) || id < 0 || id > 999) || new Set(indices).size !== indices.length) {
+    throw new Error('Select clips from this Library run to duplicate.')
+  }
+  const { check } = await checkedRun(outputDir)
+  const run = check(), canonical = realpathSync(run)
+  const raw = readRunJson(run, 'job_output.json'), output = parseJobOutput(raw)
+  if (!output) throw new Error('Invalid Library metadata.')
+  const selected = new Set<number>(indices)
+  const picked = output.clips.filter((clip) => selected.has(clip.clip_index))
+  if (picked.length !== selected.size) throw new Error('Some selected clips are no longer in this run. Refresh and retry.')
+  if (output.clips.length + picked.length > 1000) throw new Error('Duplicating would exceed the 1000-clip limit for this run.')
+  // The duplicate clones the RAW manifest entry, so every persisted setting
+  // (editor links, layout choices, future fields) carries over intact.
+  const rawClips = new Map<number, Record<string, unknown>>(
+    (Array.isArray(raw.clips) ? raw.clips : []).map((clip) => {
+      const record = clip as Record<string, unknown>
+      return [record.clip_index as number, record]
+    })
+  )
+  const pad = (index: number): string => `clip_${String(index).padStart(2, '0')}`
+  const safeSource = (clip: Record<string, unknown>): string => {
+    const file = resolve(String(clip.s3_url).replace(/^file:\/\//, ''))
+    if (basename(file) !== `${pad(clip.clip_index as number)}.mp4` || realpathSync(dirname(file)) !== canonical) {
+      throw new Error('The selected clip is outside its Library run.')
+    }
+    const stat = lstatSync(file)
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('The selected clip has an unsafe file path.')
+    return file
+  }
+
+  // Editor project: clone the linked candidate per duplicate so edits to the
+  // duplicate never touch the original.
+  let project: Record<string, unknown> | null = null
+  const cloneIds = new Map<number, string>()
+  if (output.editor_project) {
+    project = readRunJson(run, 'editor-project.json')
+    parseEditorProject(project)
+    const candidates = project.candidates as Record<string, unknown>[]
+    for (const clip of picked) {
+      const rawClip = rawClips.get(clip.clip_index)
+      const source = typeof rawClip?.editor_candidate === 'string' ? rawClip.editor_candidate : null
+      const original = source ? candidates.find((c) => c.id === source) : undefined
+      if (!original) continue
+      const clone = structuredClone(original)
+      clone.id = `${String(source).slice(0, 47)}-copy-${randomUUID().replaceAll('-', '').slice(0, 8)}`
+      clone.exports = []
+      candidates.push(clone)
+      cloneIds.set(clip.clip_index, String(clone.id))
+    }
+    project.revision = (project.revision as number) + 1
+  }
+
+  const used = new Set(output.clips.map((clip) => clip.clip_index))
+  let next = Number.isSafeInteger(raw.next_clip_index) ? raw.next_clip_index as number : 0
+  const changes: { entry: Record<string, unknown>; sourceFile: string; srtSource: string | null; index: number }[] = []
+  for (const clip of picked) {
+    const rawClip = rawClips.get(clip.clip_index)!
+    const sourceFile = safeSource(rawClip)
+    while (used.has(next) || existsSync(join(run, `${pad(next)}.mp4`))) next++
+    if (next > 999) throw new Error('Too many clips in this run to duplicate.')
+    used.add(next)
+    const srtSource = join(run, `${pad(clip.clip_index)}.srt`)
+    const entry = structuredClone(rawClip)
+    entry.clip_index = next
+    entry.s3_url = join(run, `${pad(next)}.mp4`)
+    if (cloneIds.has(clip.clip_index)) {
+      entry.editor_candidate = cloneIds.get(clip.clip_index)
+      entry.editor_revision = project!.revision as number
+    } else {
+      delete entry.editor_candidate
+      delete entry.editor_revision
+    }
+    changes.push({ entry, sourceFile, srtSource: existsSync(srtSource) ? srtSource : null, index: next })
+    next++
+  }
+  for (const change of changes) {
+    const cloneCandidate = project ? (project.candidates as Record<string, unknown>[]).find((c) => c.id === change.entry.editor_candidate) : undefined
+    if (cloneCandidate) cloneCandidate.exports = [change.index]
+  }
+  raw.next_clip_index = next
+  raw.clips = [...(raw.clips as unknown[]), ...changes.map((change) => change.entry)]
+  raw.total_clips = (raw.clips as unknown[]).length
+
+  const staging = mkdtempSync(join(run, '.duplicate-clips-'))
+  const moved: Array<{ path: string; backup: string }> = [], copied: string[] = []
+  try {
+    for (const [name, value] of [['editor-project.json', project], ['job_output.json', raw]] as [string, Record<string, unknown> | null][]) {
+      if (!value) continue
+      writeFileSync(join(staging, `new-${name}`), JSON.stringify(value), { mode: 0o600, flag: 'wx' })
+    }
+    for (const change of changes) {
+      const target = join(run, `${pad(change.index)}.mp4`)
+      copyFileSync(change.sourceFile, target); copied.push(target)
+      if (change.srtSource) {
+        const srt = join(run, `${pad(change.index)}.srt`)
+        copyFileSync(change.srtSource, srt); copied.push(srt)
+      }
+    }
+    for (const [name, value] of [['editor-project.json', project], ['job_output.json', raw]] as [string, Record<string, unknown> | null][]) {
+      if (!value) continue
+      const path = join(run, name), backup = join(staging, name)
+      renameSync(path, backup); moved.push({ path, backup })
+      renameSync(join(staging, `new-${name}`), path)
+    }
+  } catch (error) {
+    try {
+      // Every original already moved aside goes back, newest first; rename
+      // replaces a half-installed new file, so `moved` alone covers both a
+      // manifest that failed mid-install and one never installed at all.
+      for (const { path, backup } of moved.reverse()) renameSync(backup, path)
+      for (const path of copied.reverse()) unlinkSync(path)
+      rmSync(staging, { recursive: true })
+    } catch { throw new Error('Duplication failed and could not be fully restored. The recovery files remain in the run folder. Reopen the Library to check its files.') }
+    throw error
+  }
+  try { rmSync(staging, { recursive: true }) } catch { /* Best effort. */ }
+  return parseJobOutput(raw)!
+}
+
+/** A clip's canonical cover: a frame time or an uploaded image, stored on the raw manifest entry. */
+export interface ClipThumbnail { kind: 'frame' | 'image'; atMs?: number; file?: string }
+
+function writeRunJson(run: string, name: string, value: Record<string, unknown>): void {
+  const temp = join(run, `.${name}-${randomUUID()}.tmp`)
+  try {
+    writeFileSync(temp, JSON.stringify(value), { mode: 0o600, flag: 'wx' })
+    renameSync(temp, join(run, name))
+  } finally { try { unlinkSync(temp) } catch { /* Already committed. */ } }
+}
+
+/** The stored cover for a clip, resolved to an absolute file when it is an uploaded image. */
+export async function clipThumbnail(outputDir: unknown, clipIndex: unknown): Promise<ClipThumbnail | null> {
+  if (!Number.isSafeInteger(clipIndex) || (clipIndex as number) < 0 || (clipIndex as number) > 999) throw new Error('Choose a clip.')
+  const { check } = await checkedRun(outputDir)
+  const run = check()
+  const raw = readRunJson(run, 'job_output.json')
+  const entry = (Array.isArray(raw.clips) ? raw.clips : []).find((clip) => (clip as Record<string, unknown>).clip_index === clipIndex) as Record<string, unknown> | undefined
+  const thumb = entry?.thumbnail as ClipThumbnail | undefined
+  if (!thumb || (thumb.kind !== 'frame' && thumb.kind !== 'image')) return null
+  if (thumb.kind === 'image') {
+    if (typeof thumb.file !== 'string') return null
+    const file = join(run, thumb.file)
+    try {
+      const stat = lstatSync(file)
+      if (!stat.isFile() || stat.isSymbolicLink()) return null
+    } catch { return null }
+    return { kind: 'image', file }
+  }
+  return { kind: 'frame', atMs: Number.isFinite(thumb.atMs) ? thumb.atMs : 0 }
+}
+
+/** Store (or clear, with null) a clip's cover. Uploaded images are copied into the run. */
+export async function setClipThumbnail(outputDir: unknown, clipIndex: unknown, thumb: unknown): Promise<ClipThumbnail | null> {
+  if (!Number.isSafeInteger(clipIndex) || (clipIndex as number) < 0 || (clipIndex as number) > 999) throw new Error('Choose a clip.')
+  const { check } = await checkedRun(outputDir)
+  const run = check()
+  const raw = readRunJson(run, 'job_output.json')
+  const clips = (Array.isArray(raw.clips) ? raw.clips : []) as Record<string, unknown>[]
+  const entry = clips.find((clip) => clip.clip_index === clipIndex)
+  if (!entry) throw new Error('This clip is no longer in this run. Refresh and retry.')
+
+  let stored: ClipThumbnail | null = null
+  if (thumb && typeof thumb === 'object') {
+    const request = thumb as { kind?: unknown; atMs?: unknown; path?: unknown }
+    if (request.kind === 'frame') {
+      if (!Number.isFinite(request.atMs) || (request.atMs as number) < 0) throw new Error('Pick a frame inside the video.')
+      stored = { kind: 'frame', atMs: Math.round(request.atMs as number) }
+    } else if (request.kind === 'image') {
+      if (typeof request.path !== 'string') throw new Error('Choose an image file for the cover.')
+      const { authorizeMedia } = await import('./security')
+      const canonical = authorizeMedia(request.path)
+      const index = Number(clipIndex)
+      const target = join(run, `${padClip(index)}-cover${extname(canonical).toLowerCase()}`)
+      copyFileSync(canonical, target)
+      stored = { kind: 'image', file: basename(target) }
+    }
+  }
+
+  if (stored) entry.thumbnail = stored
+  else delete entry.thumbnail
+  // An old uploaded cover leaves with the replacement; nothing else references it.
+  writeRunJson(run, 'job_output.json', raw)
+  return stored
+}
+
+function padClip(index: number): string {
+  return `clip_${String(index).padStart(2, '0')}`
 }

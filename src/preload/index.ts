@@ -1,8 +1,8 @@
 import type { JevThresholdSettings } from '../shared/jev-settings'
 import type { LibraryClipTarget } from '../shared/library-posting'
 import type { AutomationReviewResult } from '../shared/automations'
-import type { CandidateEdit, EditorProgressSummary, EditorSession } from '../shared/clip-editor'
-import type { JobOutput } from '../shared/job-output'
+import type { AudioTrack, CandidateEdit, EditorProgressSummary, EditorSession, MotionPlan } from '../shared/clip-editor'
+import type { BulkExportProgress, JobOutput } from '../shared/job-output'
 import type { EditAudit } from '../shared/editorial'
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type {
@@ -17,7 +17,9 @@ import type {
   ZernioStatusCheck
 } from '../shared/zernio'
 import type { CalendarResult, ClipMediaInfo, PostClipRequest, PostClipResult, PostProgress, PostRecord, PostsRefreshResult, TikTokCreatorInfo, TikTokLegalLink } from '../shared/zernio-posts'
+import type { BestTimeResult, DashboardResult } from '../shared/zernio-analytics'
 import type { ClipJobRequest, JobSnapshot } from '../shared/jobs'
+import type { BrandTemplate } from '../shared/templates'
 import type { MetadataEnhancement, AutomationSourceGroup, AutomationBatchResult, AutomationSourceContext, Automation, AutomationUpdate, AutomationTikTokReview, AutomationTikTokReviewUpdate } from '../shared/automations'
 import type { LibraryClipPostingStatus, LibraryEnhancementOptions, LibraryRunPostingCounts } from '../shared/library-posting'
 import type { OpenRouterCatalog } from '../shared/openrouter-models'
@@ -42,6 +44,12 @@ export interface ClipSettings extends JevThresholdSettings {
   outputDirectory: string
   pythonPath: string
   customVocabulary: string
+  /** Brand pack auto-applied to new projects; empty string = none. */
+  defaultTemplateId: string
+  /** Auto Import: YouTube playlist URLs/IDs, one per line. */
+  autoImportPlaylists: string
+  autoImportEnabled: boolean
+  autoImportIntervalMinutes: number
 }
 
 export type { ClipJobRequest, JobSnapshot } from '../shared/jobs'
@@ -83,12 +91,44 @@ export interface BridgeClipAPI {
   source: { youtubePreview: (url: string, details?: boolean) => Promise<YouTubePreview> }
   editor: {
     open: (path: string) => Promise<EditorSession>
-    save: (path: string, revision: number, edits: CandidateEdit[]) => Promise<EditorSession>
-    run: (path: string, revision: number, id: string, action: 'review' | 'export' | 'export-all' | 'scan-cameras') => Promise<EditorSession>
+    /** Re-attach an automatic run's source (URL, or the file the user picked) to make its clips editable.
+     * `focusClipIndex` prepares only that reel's preview window first (fast per-reel edit). */
+    createProject: (path: string, mediaPath?: string, focusClipIndex?: number) => Promise<EditorSession>
+    save: (path: string, revision: number, edits: CandidateEdit[], speakerNames?: Record<string, string>) => Promise<EditorSession>
+    /** Opens a picker for the kind (image | video | audio), copies the choice into the project; null when cancelled. */
+    addAsset: (path: string, kind: 'image' | 'video' | 'audio') => Promise<{ asset: string; name: string } | null>
+    /** Import tab: a dropped media file; main infers the kind from its extension. */
+    addAssetDropped: (path: string, file: string) => Promise<{ asset: string; name: string } | null>
+    /** "Add audio": a dropped/picked audio-or-video file or a pasted link; extracts the track, saves it to the audio library and returns the asset to set as the clip's music. Null when cancelled. */
+    importAudio: (path: string, source: { mode: 'file'; path?: string } | { mode: 'link'; url: string }) => Promise<{ asset: string; name: string; durationMs: number; track: AudioTrack } | null>
+    /** The saved audio library, shared by every project; attach copies a track into this project. */
+    audioList: () => Promise<AudioTrack[]>
+    audioAttach: (path: string, id: string) => Promise<{ asset: string; name: string }>
+    audioRemove: (id: string) => Promise<boolean>
+    /** Motion Studio: plan shots for an idea via the configured AI provider. */
+    motionPlan: (request: { idea: string; references: { asset: string; name: string; kind: 'image' | 'video' | 'audio' }[]; style: string; lengthMs: number }) => Promise<MotionPlan>
+    /** Motion Studio: render a reviewed shot plan with the local generator. */
+    motionRender: (path: string, plan: MotionPlan, audioAsset?: string) => Promise<{ asset: string; durationMs: number }>
+    run: (path: string, revision: number, id: string, action: 'review' | 'export' | 'export-all' | 'scan-cameras' | 'auto-frame' | 'build-preview', subject?: { atMs: number; x: number; y: number }) => Promise<EditorSession>
     cancel: (path: string) => Promise<void>
+    /** "AI hook": one punchy opening line (≤120 chars) for the candidate, on the configured local/NVIDIA provider. */
+    aiHook: (path: string, candidateId: string) => Promise<{ text: string }>
+    /** Rewrite a video title in one of the announced styles (interesting/catchy/serious/question). */
+    titleStyle: (input: { title: string; caption: string; style: 'interesting' | 'catchy' | 'serious' | 'question' }) => Promise<{ title: string }>
+    /** "AI enhance": a sharper title (≤200 chars) plus up to 5 caption cleanups for the candidate. */
+    aiEnhance: (path: string, candidateId: string) => Promise<{ title: string; caption_edits: { segment: number; text: string }[] }>
+    /** Speech cleanup: flags retakes, restarts, repetitions and self-corrections as covered transcript line spans. */
+    aiBadTakes: (path: string, candidateId: string) => Promise<{ start: number; end: number; reason: string }[]>
+    /** Voiceover Studio: the installed Windows voices, and a scratch preview synthesis. */
+    voiceVoices: (path: string) => Promise<string[]>
+    voicePreview: (path: string, config: { script: string; voice: string; rate: number; pronunciations: { word: string; say: string }[] }) => Promise<{ asset: string; durationMs: number }>
     replaceSource: (path: string, revision: number, replacement: string) => Promise<EditorSession>
     /** Status counts only; cheap enough for list rows and polling. */
     progress: (path: string) => Promise<EditorProgressSummary>
+    /** Live import/operation state, also before the editor project exists. */
+    operationProgress: (path: string) => Promise<{ operation: EditorProgressSummary['operation']; batch?: EditorProgressSummary['batch']; progress?: EditorProgressSummary['progress'] }>
+    /** Normalized audio peaks (0–1) across the source, for the timeline waveform. */
+    waveform: (path: string) => Promise<number[]>
     freeMedia: (path: string, revision: number) => Promise<EditorSession>
     /** Main asks the open editor to save before a close or quit continues. */
     onSaveBeforeClose: (callback: () => void) => () => void
@@ -129,13 +169,35 @@ export interface BridgeClipAPI {
     approveTikTokReview: (id: string, contentId: string, update: AutomationTikTokReviewUpdate) => Promise<Automation[]>
     removeContent: (id: string, contentId: string) => Promise<Automation[]>
   }
+  autoImport: {
+    /** Status + current Auto Import config. */
+    status: () => Promise<{ config: { enabled: boolean; playlists: string[]; intervalMinutes: number; maxPerPoll: number }; lastPollAt: string | null; importedCount: number; polling: boolean }>
+    /** Persists the Auto Import config. */
+    set: (patch: { playlists?: string; enabled?: boolean; intervalMinutes?: number }) => Promise<ClipSettings>
+    /** Polls every configured playlist now. */
+    pollNow: () => Promise<{ queued: { videoId: string; title: string }[]; errors: string[] }>
+  },
   settings: {
     load: () => Promise<ClipSettings>
     /** Pass true to count again instead of reusing a result from the last few seconds. */
     storageUsage: (fresh?: boolean) => Promise<OutputStorageUsage>
     save: (settings: ClipSettings) => Promise<ClipSettings>
+    /** Brand Vocabulary: one proper noun (from the editor's transcript), merged into the saved terms. */
+    addVocabularyTerm: (term: string) => Promise<{ terms: string[] }>
     replaceApiKey: (key: 'openrouterApiKey' | 'nvidiaApiKey' | 'zernioApiKey', value: string) => Promise<ClipSettings>
     selectOutputDir: () => Promise<string | null>
+  }
+  templates: {
+    /** Built-in packs first, then the user's saved ones. */
+    list: () => Promise<BrandTemplate[]>
+    /**
+     * Inserts or replaces a pack. The picked paths (logo image, intro/outro
+     * videos) are copied by main into the pack's asset folder; null keeps the
+     * stored asset.
+     */
+    save: (template: BrandTemplate, logoPath?: string | null, introPath?: string | null, outroPath?: string | null) => Promise<BrandTemplate>
+    /** false when the id was not a saved pack; built-ins throw instead. */
+    delete: (id: string) => Promise<boolean>
   }
   zernio: {
     checkStatus: () => Promise<ZernioStatusCheck>
@@ -160,6 +222,8 @@ export interface BridgeClipAPI {
     /** Posting clips. Uploads, post creation and links run in the main process. */
     posts: {
       probe: (clipPath: string, durationMs: number | null) => Promise<ClipMediaInfo>
+      /** The clip's run's original video URL, or null; drives the YouTube full-video-link checkbox. */
+      sourceVideoLink: (clipPath: string) => Promise<string | null>
       tiktokCreatorInfo: (accountId: string) => Promise<TikTokCreatorInfo>
       /** Uploads the clip and creates the post; progress arrives via onProgress. */
       publish: (request: PostClipRequest) => Promise<PostClipResult>
@@ -181,6 +245,13 @@ export interface BridgeClipAPI {
       openCalendarLink: (platform: string, url: string) => Promise<void>
       openTikTokLegal: (key: TikTokLegalLink) => Promise<void>
     }
+    /** Read-only workspace analytics; Zernio problems arrive as an error field, never a rejection. */
+    analytics: {
+      /** Dashboard totals, followers, daily series and top posts for a UTC day window. */
+      dashboard: (from: string, to: string) => Promise<DashboardResult>
+      /** Average engagement per weekday/UTC-hour slot, over the workspace's whole history. */
+      bestTime: () => Promise<BestTimeResult>
+    }
   }
   job: {
     /** Queues a clipping run; it starts right away when a slot is free (`queued: false`). */
@@ -190,6 +261,8 @@ export interface BridgeClipAPI {
     list: () => Promise<JobSnapshot[]>
     /** Forget a finished job for this session; its run folder stays in the library. */
     dismiss: (jobId: string) => Promise<boolean>
+    /** Delete a run's whole folder from disk, whether it finished or not. */
+    deleteRun: (outputDir: string) => Promise<void>
     /** A fresh snapshot each time any job changes. */
     onUpdate: (callback: (job: JobSnapshot) => void) => () => void
   }
@@ -197,6 +270,11 @@ export interface BridgeClipAPI {
     setFavorite: (outputDir: string, favorite: boolean) => Promise<boolean>
     delete: (outputDir: string) => Promise<void>
     deleteClips: (outputDir: string, indices: number[]) => Promise<JobOutput>
+    /** Copies each clip's render (+ .srt) to a fresh index and clones its editor candidate. */
+    duplicateClips: (outputDir: string, indices: number[]) => Promise<JobOutput>
+    /** The clip's canonical cover (frame time or uploaded image), or null for the auto cover. */
+    thumbnail: (outputDir: string, clipIndex: number) => Promise<{ kind: 'frame' | 'image'; atMs?: number; file?: string } | null>
+    setThumbnail: (outputDir: string, clipIndex: number, thumb: { kind: 'frame'; atMs: number } | { kind: 'image'; path: string } | null) => Promise<{ kind: 'frame' | 'image'; atMs?: number; file?: string } | null>
     postingStatus: (outputDir: string) => Promise<LibraryClipPostingStatus[]>
     /** Posted counts for many runs at once, for the Library list. */
     postingSummary: (outputDirs: string[]) => Promise<LibraryRunPostingCounts[]>
@@ -216,11 +294,17 @@ export interface BridgeClipAPI {
   }
   dialog: {
     selectVideo: () => Promise<string | null>
+    /** Absolute path of a picked logo image for a brand pack; main copies it into the pack's folder. */
+    selectImage: () => Promise<string | null>
+    selectSrt: () => Promise<string | null>
     /** The absolute path of a file the user actually dropped, authorized for posting; null for anything else. */
     authorizeDrop: (file: File) => Promise<string | null>
   }
   clips: {
-    bulkExport: (clips: { path: string; name: string }[]) => Promise<{ success: boolean; count: number; failedCount: number; destDir?: string }>
+    bulkExport: (clips: { path: string; name: string }[]) => Promise<{ success: boolean; count: number; failedCount: number; destDir?: string; failures?: string[] }>
+    /** Live per-clip progress (clips:bulkExportProgress) while a bulk export copies files. */
+    onBulkExportProgress: (cb: (progress: BulkExportProgress) => void) => () => void
+    exportFcpXml: (outputDir: string, clipIndices?: number[] | null) => Promise<{ success: boolean; canceled?: boolean; fileName?: string; destDir?: string; clipCount?: number; failedCount?: number; srtCount?: number }>
   }
   system: {
     isPackaged: () => Promise<boolean>
@@ -261,11 +345,28 @@ const api: BridgeClipAPI = {
   source: { youtubePreview: (url, details = false) => ipcRenderer.invoke('source:youtubePreview', url, details) },
   editor: {
     open: (path) => ipcRenderer.invoke('editor:open', path),
-    save: (path, revision, edits) => ipcRenderer.invoke('editor:save', path, revision, edits),
-    run: (path, revision, id, action) => ipcRenderer.invoke('editor:run', path, revision, id, action),
+    createProject: (path, mediaPath, focusClipIndex) => ipcRenderer.invoke('editor:createProject', path, mediaPath, focusClipIndex),
+    save: (path, revision, edits, speakerNames) => ipcRenderer.invoke('editor:save', path, revision, edits, speakerNames),
+    addAsset: (path, kind) => ipcRenderer.invoke('editor:addAsset', path, kind),
+    addAssetDropped: (path, file) => ipcRenderer.invoke('editor:addAssetDropped', path, file),
+    importAudio: (path, source) => ipcRenderer.invoke('editor:importAudio', path, source),
+    audioList: () => ipcRenderer.invoke('audioLibrary:list'),
+    audioAttach: (path, id) => ipcRenderer.invoke('audioLibrary:attach', path, id),
+    audioRemove: (id) => ipcRenderer.invoke('audioLibrary:remove', id),
+    motionPlan: (request) => ipcRenderer.invoke('editor:motionPlan', request),
+    motionRender: (path, plan, audioAsset) => ipcRenderer.invoke('editor:motionRender', path, plan, audioAsset),
+    run: (path, revision, id, action, subject) => ipcRenderer.invoke('editor:run', path, revision, id, action, subject),
     cancel: (path) => ipcRenderer.invoke('editor:cancel', path),
+    aiHook: (path, candidateId) => ipcRenderer.invoke('editor:aiHook', path, candidateId),
+    titleStyle: (input) => ipcRenderer.invoke('editor:titleStyle', input),
+    aiEnhance: (path, candidateId) => ipcRenderer.invoke('editor:aiEnhance', path, candidateId),
+    aiBadTakes: (path, candidateId) => ipcRenderer.invoke('editor:aiBadTakes', path, candidateId),
+    voiceVoices: (path) => ipcRenderer.invoke('editor:voiceVoices', path),
+    voicePreview: (path, config) => ipcRenderer.invoke('editor:voicePreview', path, config),
     replaceSource: (path, revision, replacement) => ipcRenderer.invoke('editor:replaceSource', path, revision, replacement),
     progress: (path) => ipcRenderer.invoke('editor:progress', path),
+    operationProgress: (path) => ipcRenderer.invoke('editor:operationProgress', path),
+    waveform: (path) => ipcRenderer.invoke('editor:waveform', path),
     freeMedia: (path, revision) => ipcRenderer.invoke('editor:freeMedia', path, revision),
     onSaveBeforeClose: (callback) => subscribe<void>('editor:saveBeforeClose', () => callback()),
     closeReady: (saved) => ipcRenderer.invoke('editor:closeReady', saved)
@@ -303,12 +404,23 @@ const api: BridgeClipAPI = {
     approveTikTokReview: (id, contentId, update) => ipcRenderer.invoke('automations:approveTikTokReview', id, contentId, update),
     removeContent: (id, contentId) => ipcRenderer.invoke('automations:removeContent', id, contentId)
   },
+  autoImport: {
+    status: () => ipcRenderer.invoke('autoImport:status'),
+    set: (patch) => ipcRenderer.invoke('autoImport:set', patch),
+    pollNow: () => ipcRenderer.invoke('autoImport:pollNow')
+  },
   settings: {
     load: () => ipcRenderer.invoke('settings:load'),
     storageUsage: (fresh) => ipcRenderer.invoke('settings:storageUsage', fresh === true),
     save: (settings) => ipcRenderer.invoke('settings:save', settings),
+    addVocabularyTerm: (term) => ipcRenderer.invoke('settings:addVocabularyTerm', term),
     replaceApiKey: (key, value) => ipcRenderer.invoke('settings:replaceApiKey', key, value),
     selectOutputDir: () => ipcRenderer.invoke('settings:selectOutputDir')
+  },
+  templates: {
+    list: () => ipcRenderer.invoke('templates:list'),
+    save: (template, logoPath = null, introPath = null, outroPath = null) => ipcRenderer.invoke('templates:save', template, logoPath, introPath, outroPath),
+    delete: (id) => ipcRenderer.invoke('templates:delete', id)
   },
   zernio: {
     checkStatus: () => ipcRenderer.invoke('zernio:checkStatus'),
@@ -324,6 +436,7 @@ const api: BridgeClipAPI = {
     onReset: (callback) => subscribe('zernio:reset', callback),
     posts: {
       probe: (clipPath, durationMs) => ipcRenderer.invoke('zernio:posts:probe', clipPath, durationMs),
+      sourceVideoLink: (clipPath) => ipcRenderer.invoke('zernio:posts:sourceVideoLink', clipPath),
       tiktokCreatorInfo: (accountId) => ipcRenderer.invoke('zernio:posts:tiktokCreatorInfo', accountId),
       publish: (request) => ipcRenderer.invoke('zernio:posts:publish', request),
       cancelUpload: (attemptId) => ipcRenderer.invoke('zernio:posts:cancelUpload', attemptId),
@@ -339,6 +452,10 @@ const api: BridgeClipAPI = {
       open: (postId, targetIndex) => ipcRenderer.invoke('zernio:posts:open', postId, targetIndex),
       openCalendarLink: (platform, url) => ipcRenderer.invoke('zernio:posts:openCalendarLink', platform, url),
       openTikTokLegal: (key) => ipcRenderer.invoke('zernio:posts:openTikTokLegal', key)
+    },
+    analytics: {
+      dashboard: (from, to) => ipcRenderer.invoke('zernio:analytics:dashboard', from, to),
+      bestTime: () => ipcRenderer.invoke('zernio:analytics:bestTime')
     }
   },
   job: {
@@ -346,12 +463,16 @@ const api: BridgeClipAPI = {
     cancel: (jobId) => ipcRenderer.invoke('job:cancel', jobId),
     list: () => ipcRenderer.invoke('jobs:list'),
     dismiss: (jobId) => ipcRenderer.invoke('jobs:dismiss', jobId),
+    deleteRun: (outputDir) => ipcRenderer.invoke('jobs:deleteRun', outputDir),
     onUpdate: (callback) => subscribe('jobs:update', callback)
   },
   history: {
     setFavorite: (outputDir, favorite) => ipcRenderer.invoke('history:setFavorite', outputDir, favorite),
     delete: (outputDir) => ipcRenderer.invoke('history:delete', outputDir),
     deleteClips: (outputDir, indices) => ipcRenderer.invoke('history:deleteClips', outputDir, indices),
+    duplicateClips: (outputDir, indices) => ipcRenderer.invoke('history:duplicateClips', outputDir, indices),
+    thumbnail: (outputDir, clipIndex) => ipcRenderer.invoke('history:thumbnail', outputDir, clipIndex),
+    setThumbnail: (outputDir, clipIndex, thumb) => ipcRenderer.invoke('history:setThumbnail', outputDir, clipIndex, thumb),
     postingStatus: (outputDir) => ipcRenderer.invoke('history:postingStatus', outputDir),
     postingSummary: (outputDirs) => ipcRenderer.invoke('history:postingSummary', outputDirs),
     setPosted: (outputDir, clipIndex, posted) => ipcRenderer.invoke('history:setPosted', outputDir, clipIndex, posted),
@@ -369,13 +490,17 @@ const api: BridgeClipAPI = {
   },
   dialog: {
     selectVideo: () => ipcRenderer.invoke('dialog:selectVideo'),
+    selectImage: () => ipcRenderer.invoke('dialog:selectImage'),
+    selectSrt: () => ipcRenderer.invoke('dialog:selectSrt'),
     authorizeDrop: (file: File) => {
       const path = webUtils.getPathForFile(file)
       return path ? ipcRenderer.invoke('dialog:authorizeDrop', path) : Promise.resolve(null)
     }
   },
   clips: {
-    bulkExport: (clips) => ipcRenderer.invoke('clips:bulkExport', clips)
+    bulkExport: (clips) => ipcRenderer.invoke('clips:bulkExport', clips),
+    onBulkExportProgress: (cb) => subscribe('clips:bulkExportProgress', cb),
+    exportFcpXml: (outputDir, clipIndices) => ipcRenderer.invoke('clips:exportFcpXml', outputDir, clipIndices ?? null)
   },
   system: {
     isPackaged: () => ipcRenderer.invoke('system:isPackaged'),

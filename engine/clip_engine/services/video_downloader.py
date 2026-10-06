@@ -35,7 +35,11 @@ from clip_engine.services.media_process import (guarded_ytdlp_children, run_medi
 logger = logging.getLogger(__name__)
 
 MAX_SOURCE_BYTES = 20 * 1000 ** 3
-DOWNLOAD_DEADLINE_SECONDS = 4 * 60 * 60
+# Links whose path already names a video file are raw downloads; page links
+# (Vimeo, Dropbox, Drive, Zoom, Rumble, social platforms…) use yt-dlp instead.
+DIRECT_VIDEO_EXTENSIONS = ('.mp4', '.mov', '.webm', '.mkv', '.m4v', '.avi', '.ts')
+
+DOWNLOAD_DEADLINE_SECONDS = 12 * 60 * 60
 # Stop a download before it leaves the disk this close to full.
 MIN_FREE_BYTES = 1000 ** 3
 PROBE_TIMEOUT_SECONDS = 30
@@ -50,6 +54,12 @@ MAX_PROBE_OUTPUT_BYTES = 1024 * 1024
 # measures the shorter side, so 2160 covers both landscape 4K and vertical
 # 2160x3840. SDR is preferred because renders are SDR H.264 without tone mapping.
 YOUTUBE_FORMAT_SORT = ["hdr:SDR", "res:2160", "fps"]
+# Non-YouTube platforms (Kick, TikTok, Instagram) go through yt-dlp extractors with a
+# generic progressive/merge selector; the AV1 ban still applies to the bundled FFmpeg.
+PLATFORM_FORMAT_SELECTORS = [
+    "bv*[vcodec!^=av01]+ba/b[acodec!^=mp4a]/b[vcodec!^=av01]/b",
+]
+
 YOUTUBE_FORMAT_SELECTORS = [
     # Best separate video + audio streams (the only way to get >720p).
     "bv*[vcodec!^=av01]+ba/b[vcodec!^=av01]",
@@ -112,7 +122,7 @@ UA_LIST = [
 
 
 # Source types for videos
-VideoSourceType = Literal["youtube", "twitch", "s3", "direct_url", "local"]
+VideoSourceType = Literal["youtube", "twitch", "s3", "direct_url", "generic", "local"]
 
 
 @dataclass
@@ -292,6 +302,14 @@ class VideoDownloaderService:
         if twitch_vod_url(url_or_key):
             return "twitch"
 
+        host = (parsed.hostname or "").lower()
+        if host == "kick.com" or host.endswith(".kick.com"):
+            return "platform"
+        if host == "tiktok.com" or host.endswith(".tiktok.com"):
+            return "platform"
+        if host == "instagram.com" or host.endswith(".instagram.com") or host == "instagr.am":
+            return "platform"
+
         # S3 URL formats. The desktop app has no S3 source: boto3 would sign a
         # pasted bucket URL with the user's ambient ~/.aws credentials, so
         # local mode fetches it anonymously as a direct URL instead.
@@ -307,8 +325,17 @@ class VideoDownloaderService:
         if host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be"}:
             return "youtube"
         
-        # Direct video URL
-        return "direct_url"
+        # A link that clearly points at a video FILE downloads as a raw
+        # byte stream; every other page link (Vimeo, Dropbox, Google Drive,
+        # Zoom, Rumble, Facebook, LinkedIn, X, StreamYard…) goes through
+        # yt-dlp's generic extractor.
+        # Share links on file hosts are still pages (their raw download needs
+        # platform-specific parameters, e.g. Dropbox's ?dl=1).
+        if host.endswith("dropbox.com") or host.endswith("google.com"):
+            return "generic"
+        if parsed.path.lower().endswith(DIRECT_VIDEO_EXTENSIONS):
+            return "direct_url"
+        return "generic"
 
     def _progress(self, label, downloaded=None, total=None):
         callback = getattr(self, 'progress_callback', None)
@@ -361,6 +388,14 @@ class VideoDownloaderService:
                 result = await self._download_from_youtube(twitch_vod_url(url), output_path, output_dir, max_duration_seconds, source_type="twitch")
             elif source_type == "youtube":
                 result = await self._download_from_youtube(url, output_path, output_dir, max_duration_seconds)
+            elif source_type == "platform":
+                result = await self._download_from_youtube(
+                    url, output_path, output_dir, max_duration_seconds,
+                    source_type="platform", format_selectors=PLATFORM_FORMAT_SELECTORS)
+            elif source_type == "generic":
+                result = await self._download_from_youtube(
+                    url, output_path, output_dir, max_duration_seconds,
+                    source_type="generic", format_selectors=PLATFORM_FORMAT_SELECTORS)
             else:
                 result = await self._download_direct_url(url, output_path)
 
@@ -410,6 +445,7 @@ class VideoDownloaderService:
         output_dir: str,
         max_duration_seconds: Optional[int] = None,
         source_type: VideoSourceType = "youtube",
+        format_selectors: Optional[list[str]] = None,
     ) -> DownloadResult:
         """
         Download video from YouTube or Twitch using yt-dlp Python library.
@@ -463,7 +499,7 @@ class VideoDownloaderService:
 
         # Highest available quality first; see YOUTUBE_FORMAT_SELECTORS.
         # CRITICAL: All selectors MUST exclude AV1 (the bundled FFmpeg can't decode it).
-        format_selectors = ["b[vcodec!^=av01]"] if source_type == "twitch" else YOUTUBE_FORMAT_SELECTORS
+        selectors = format_selectors or (["b[vcodec!^=av01]"] if source_type == "twitch" else YOUTUBE_FORMAT_SELECTORS)
 
         # Run download in thread pool to not block event loop
         loop = asyncio.get_event_loop()
@@ -475,10 +511,10 @@ class VideoDownloaderService:
             last_error = None
 
             attempts = YOUTUBE_TRANSIENT_ATTEMPTS if source_type == "youtube" else 1
-            for fmt_idx, format_selector in enumerate(format_selectors):
+            for fmt_idx, format_selector in enumerate(selectors):
                 for attempt in range(1, attempts + 1):
                     try:
-                        logger.info(f"Format attempt {fmt_idx + 1}/{len(format_selectors)}: {format_selector[:50]}...")
+                        logger.info(f"Format attempt {fmt_idx + 1}/{len(selectors)}: {format_selector[:50]}...")
 
                         ydl_opts = self._build_ytdlp_opts(
                             output_path=output_path,

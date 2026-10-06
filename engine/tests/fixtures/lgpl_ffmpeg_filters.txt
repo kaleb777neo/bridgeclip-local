@@ -19,6 +19,7 @@ ass
 atempo
 atrim
 avgblur
+colorchannelmixer
 concat
 crop
 drawbox
@@ -45,4 +46,10 @@ tpad
 trim
 volume
 vstack
+xfade
 zoompan
+colorbalance
+hue
+unsharp
+
+curves aevalsrc adelay

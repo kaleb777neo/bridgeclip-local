@@ -17,9 +17,10 @@ FFmpeg.
 """
 
 from bisect import bisect_left
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from math import ceil
+from string import punctuation as _punct
 from typing import Optional
 
 from clip_engine.services.layout_analyzer import Box, ClipLayoutPlan, LayoutType, ShotLayout
@@ -404,7 +405,19 @@ def shot_chain(
                     f"scale=w='round({qw}/{cw})':h='round({qh}/{ch})':eval=frame:{scale},"
                     f"crop=w={qw}:h={qh}:x='{x0}*round({qw}/{cw})':y='{y0}*round({qh}/{ch})':exact=1")
             else:
-                transform = f"crop={w}:{h}:{x}:{y}"
+                if n == 1 and shot.manual_focus_path:
+                    # Keep the scene's zoom (the static rect size), but let the
+                    # crop follow the analyzed focus path like the pipeline's
+                    # talking-head render does, so the speaker stays framed.
+                    xs = [((shot.start_ms + t) / 1000, _clamp(cx * src_w - w / 2, 0, src_w - w))
+                          for t, cx, _cy in shot.manual_focus_path]
+                    ys = [((shot.start_ms + t) / 1000, _clamp(cy * src_h - h * PERSON_FACE_Y, 0, src_h - h))
+                          for t, _cx, cy in shot.manual_focus_path]
+                    x_expr = piecewise_expr(xs) if w < src_w else "0"
+                    y_expr = piecewise_expr(ys) if h < src_h else "0"
+                    transform = f"crop=w={w}:h={h}:x='{x_expr}':y='{y_expr}'"
+                else:
+                    transform = f"crop={w}:{h}:{x}:{y}"
             parts.append(f"[{source}]{transform},scale={pw}:{ph}:{scale},setsar=1[{target}]")
         if n > 1:
             parts.append(''.join(f"[mp{i}_{j}]" for j in range(n)) + f"vstack=inputs={n}[v{i}]")
@@ -540,8 +553,122 @@ def measured_loudness_filter(measured: dict) -> Optional[str]:
         f":measured_I={values['input_i']:.2f}:measured_TP={values['input_tp']:.2f}"
         f":measured_LRA={values['input_lra']:.2f}:measured_thresh={values['input_thresh']:.2f}"
         f":offset={values['target_offset']:.2f}:linear=true,"
-        f"aresample=48000,{FINITE_AUDIO},{AUDIO_FORMAT}"
+            f"aresample=48000,{FINITE_AUDIO},{AUDIO_FORMAT}"
     )
+
+
+def speech_enhancement_filter(denoise: Optional[float], enhance: Optional[float]) -> str:
+    """Opus-style Speech Enhancement: FFT denoise plus a voice lift; 0/absent = off.
+
+    `denoise` 0–1 drives afftdn's reduction amount (noise removal).
+    `enhance` 0–1 lifts the voice band (presence EQ over a mud cut), evens
+    dynamics (compressor with makeup) and lifts low or uneven audio. Applied
+    to the speech BEFORE loudness normalization, so the result stays at the
+    same normalized loudness regardless of the settings.
+    """
+    d = denoise if type(denoise) in (int, float) and 0 < denoise <= 1 else 0
+    e = enhance if type(enhance) in (int, float) and 0 < enhance <= 1 else 0
+    chain = []
+    if d > 0:
+        chain.append(f"afftdn=nr={0.01 + d * 0.89:.3f}:nf=-25")
+    if e > 0:
+        chain.append("highpass=f=85")
+        chain.append(f"equalizer=f=320:t=q:w=1.2:g=-{1 + e * 2:.2f}")
+        chain.append(f"equalizer=f=3150:t=q:w=2:g={1.5 + e * 3.5:.2f}")
+        chain.append(f"acompressor=threshold={-28 + e * 8:.0f}dB:ratio={1.6 + e * 1.6:.2f}:attack=12:release=180:makeup={1 + e * 5:.2f}")
+    return ','.join(chain)
+
+
+# Auto Censor: a censored word is the stem itself or a common inflection
+# ("fuck" catches "fucks/fucked/fucking"; exact matches keep "class" safe
+# from the "ass" stem).
+CENSOR_SUFFIXES = ('s', 'es', 'ed', 'ing', 'in', 'er', 'ers', 'y', 'ty')
+
+
+def censor_hit(token: str, stems: list[str]) -> bool:
+    """True when a transcript token matches one of the censor stems."""
+    core = token.strip(_punct).lower()
+    if not core:
+        return False
+    for stem in stems:
+        if core == stem or (core.startswith(stem) and core[len(stem):] in CENSOR_SUFFIXES):
+            return True
+    return False
+
+
+def mask_word(token: str, mode: str, stems: list[str]) -> str:
+    """Mask one transcript token for captions, keeping punctuation and timing."""
+    if not censor_hit(token, stems):
+        return token
+    lead = len(token) - len(token.lstrip(_punct))
+    trail = len(token) - len(token.rstrip(_punct))
+    core = token[lead:len(token) - trail if trail else len(token)]
+    if not core:
+        return token
+    masked = f"{core[0]}{'*' * (len(core) - 1)}" if mode == 'first' else '*' * len(core)
+    return f"{token[:lead]}{masked}{token[len(token) - trail:] if trail else ''}"
+
+
+def censor_transcript(transcript, censor: Optional[dict]):
+    """Mask censored words in caption text per `censor` ('asterisk'/'first').
+
+    Word timings stay intact — only the displayed text changes. Absent/off
+    censor config returns the transcript unchanged.
+    """
+    if not censor or censor.get('captions', 'off') == 'off':
+        return transcript
+    stems = [w.strip().lower() for w in censor.get('words', []) if isinstance(w, str) and w.strip()]
+    if not stems:
+        return transcript
+    mode = censor['captions']
+    result = []
+    for segment in transcript:
+        words = [replace(w, word=mask_word(w.word, mode, stems)) for w in segment.words]
+        text = ' '.join(w.word for w in words) if segment.words else segment.text
+        result.append(replace(segment, text=text, words=words))
+    return result
+
+
+def censor_intervals(transcript, words: list) -> list[tuple[float, float]]:
+    """Pre-speed output-time (seconds) spans of censored words, sorted+merged."""
+    stems = [w.strip().lower() for w in words if isinstance(w, str) and w.strip()]
+    if not stems:
+        return []
+    hits: list[tuple[float, float]] = []
+    for segment in transcript:
+        for word in segment.words:
+            if censor_hit(word.word, stems):
+                hits.append((word.start_time_ms / 1000, max(word.start_time_ms, word.end_time_ms) / 1000))
+    hits.sort()
+    merged: list[list[float]] = []
+    for a, b in hits:
+        if merged and a <= merged[-1][1] + 0.02:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged]
+
+
+def censor_audio_layers(mutes: Optional[list[tuple[float, float]]], bleep: bool, total_s: float):
+    """Auto Censor on the concatenated speech: `volume=0` over each interval,
+    optionally with a 1 kHz bleep tone mixed in over just those spans.
+
+    Returns (speech-chain suffix, extra graph parts); '' keeps the graph
+    byte-identical when censoring is off. Interval times share the caption
+    clock (pre-speed output time), so muted audio lands under masked words.
+    """
+    if not mutes:
+        return '', []
+    expr = '+'.join(f"between(t,{a:.3f},{b:.3f})" for a, b in mutes)
+    suffix = f"volume=0:enable='{expr}'"
+    parts: list[str] = []
+    if bleep:
+        parts.append(f"aevalsrc=0.22*sin(2*PI*1000*t):s=48000:d={max(total_s, 0.001):.3f},"
+                     f"volume=0:enable='not({expr})'[censor_tone]")
+        suffix += ",[censor_tone]amix=inputs=2:duration=first:dropout_transition=0:normalize=0"
+    return suffix, parts
+
+
 EDGE_FADE_S = 0.012
 START_FADE_S = 0.03
 END_FADE_S = 0.08
@@ -600,6 +727,78 @@ def video_frame_pieces(plan: ClipLayoutPlan, keeps: Optional[list[tuple[int, int
     return video_pieces
 
 
+def _xfade_junctions(plan: ClipLayoutPlan, pieces: list[tuple[int, int, int]], fps: str):
+    """(extension frames per piece, xfade junctions before a piece index).
+
+    An editor dissolve/wipe scene keeps the source clock: the previous piece
+    borrows the incoming shot's first transition_ms of source frames (same
+    instants, old framing), and an xfade overlaps the two framings where a
+    concat would have cut. Works for any composed shot pair (fill and split);
+    when a user cut lands on the scene boundary the overlap footage does not
+    exist and the junction silently stays a hard cut.
+    """
+    rate = Fraction(fps)
+    ext: dict[int, int] = {}
+    junctions: dict[int, tuple[int, str]] = {}
+    seen: set[int] = set()
+    for k, (i, start_frame, count) in enumerate(pieces):
+        shot = plan.shots[i]
+        first_of_shot = i not in seen
+        seen.add(i)
+        if k == 0 or not first_of_shot or not shot.manual_xfade_ms:
+            continue
+        prev_i, prev_start, prev_count = pieces[k - 1]
+        if prev_i != i - 1 or prev_start + prev_count != start_frame:
+            continue  # No contiguous footage across the boundary: a hard cut.
+        frames = max(1, round(shot.manual_xfade_ms * float(rate) / 1000))
+        if frames > count:
+            continue  # The whole incoming piece cannot blend and leave a tail.
+        ext[k - 1] = frames
+        junctions[k] = (frames, shot.manual_xfade_kind or "fade")
+    return ext, junctions
+
+
+def _xfade_join(pieces: list[tuple[int, int, int]], ext: dict[int, int], junctions: dict[int, tuple[int, str]],
+                fps: str) -> list[str]:
+    """Concat/xfade filters joining every [v{k}] piece into [base].
+
+    Durations are tracked in output frames; every junction consumes its
+    incoming piece's first `t` frames under the blend, so the composite stays
+    exactly on the frame grid a plain concat would produce.
+    """
+    rate = Fraction(fps)
+    sec = lambda frames: f"{float(Fraction(frames) / rate):.6f}"
+    parts: list[str] = []
+    cur = '[v0]'
+    cur_dur = pieces[0][2] + ext.get(0, 0)
+    tail: list[str] = []
+    tail_dur = 0
+    joins = 0
+    for k in range(1, len(pieces) + 1):
+        if k < len(pieces) and k not in junctions:
+            tail.append(f'[v{k}]')
+            tail_dur += pieces[k][2] + ext.get(k, 0)
+            continue
+        if tail:
+            joins += 1
+            if len(tail) == 1:
+                expr = f'{cur}{tail[0]}concat=n=2:v=1:a=0'
+            else:
+                expr = ''.join([cur] + tail) + f'concat=n={len(tail) + 1}:v=1:a=0'
+            parts.append(f'{expr}[vj{joins}]')
+            cur, cur_dur, tail, tail_dur = f'[vj{joins}]', cur_dur + tail_dur, [], 0
+        if k == len(pieces):
+            break
+        t, kind = junctions[k]
+        offset = cur_dur - t
+        parts.append(f'{cur}[v{k}]xfade=transition={kind}:duration={sec(t)}:offset={sec(offset)}[vx{k}]')
+        cur, cur_dur = f'[vx{k}]', offset + pieces[k][2] + ext.get(k, 0)
+    # Concat's microsecond time base cannot survive long edits; rebuild the
+    # exact frame grid like the plain path does.
+    parts.append(f'{cur}settb=expr=1/({fps}),setpts=N,fps={fps}[base]')
+    return parts
+
+
 def build_layout_graph(
     plan: ClipLayoutPlan,
     out_w: int,
@@ -610,11 +809,27 @@ def build_layout_graph(
     fps: str = "30",
     loudness_filter: Optional[str] = None,
     video_speed: float = 1.0,
+    audio_gain: float = 1.0,
+    speech_denoise: Optional[float] = None,
+    speech_enhance: Optional[float] = None,
+    music_index: Optional[int] = None,
+    music_gain: float = 1.0,
+    music_fade_in_ms: float = 0,
+    music_fade_out_ms: float = 0,
+    music_start_ms: float = 0,
+    voiceover_index: Optional[int] = None,
+    voiceover_gain: float = 1.0,
+    voiceover_start_ms: float = 0,
+    censor_mutes: Optional[list[tuple[float, float]]] = None,
+    censor_bleep: bool = False,
 ) -> str:
     """Filter graph from [0:v] (and [0:a]) to [base] (and [aout]).
 
     `fps` is the output frame rate (a number or rational like "30000/1001");
     `loudness_filter` replaces the default single-pass loudnorm.
+    `audio_gain` scales the clip's own audio and `music_index` mixes a looped
+    background input under it (input index in the same FFmpeg command) before
+    loudness normalization; both default to today's byte-identical graph.
 
     Video uses a single frame grid before trimming. Piece lengths are rounded
     on the cumulative output timeline, so rounding never accumulates at cuts.
@@ -625,6 +840,7 @@ def build_layout_graph(
     src_w, src_h = plan.source_width, plan.source_height
     window_end = plan.shots[-1].end_ms
     video_pieces = video_frame_pieces(plan, keeps, fps)
+    ext, junctions = _xfade_junctions(plan, video_pieces, fps)
     n = len(video_pieces)
     # Fill delayed/sparse video using its timestamps, without speeding it up.
     # Tail padding is bounded by the requested window and trimmed per piece.
@@ -637,15 +853,19 @@ def build_layout_graph(
     else:
         parts.append(f"[clocked]split={n}" + "".join(f"[s{k}]" for k in range(n)))
     for k, (i, start_frame, count) in enumerate(video_pieces):
-        parts.append(f"[s{k}]trim=start_frame={start_frame}:end_frame={start_frame + count}[t{k}]")
+        end_frame = start_frame + count + ext.get(k, 0)
+        parts.append(f"[s{k}]trim=start_frame={start_frame}:end_frame={end_frame}[t{k}]")
         chain = shot_chain(k, plan.shots[i], src_w, src_h, out_w, out_h, landscape, fps, start_frame)
         parts.append(chain[: chain.rindex(f"[v{k}]")] + f"[c{k}]")
         parts.append(f"[c{k}]setpts=PTS-STARTPTS[v{k}]")
 
-    inputs = "".join(f"[v{k}]" for k in range(n))
-    # Concat uses a microsecond time base; re-establish exact rational frame
-    # timestamps instead of propagating its rounding across long edits.
-    parts.append(f"{inputs}concat=n={n}:v=1:a=0,settb=expr=1/({fps}),setpts=N,fps={fps}[base]")
+    if junctions:
+        parts.extend(_xfade_join(video_pieces, ext, junctions, fps))
+    else:
+        inputs = "".join(f"[v{k}]" for k in range(n))
+        # Concat uses a microsecond time base; re-establish exact rational frame
+        # timestamps instead of propagating its rounding across long edits.
+        parts.append(f"{inputs}concat=n={n}:v=1:a=0,settb=expr=1/({fps}),setpts=N,fps={fps}[base]")
 
     if with_audio:
         audio_keeps = [(0, window_end)] if keeps is None else keeps
@@ -676,11 +896,60 @@ def build_layout_graph(
         # then encodes that jump as an overlong packet, delaying the tail.
         # Resetting timestamps here preserves all content and source silence;
         # doing it before AUDIO_SYNC would erase legitimate source offsets.
-        parts.append(
-            f"{inputs}concat=n={audio_n}:v=0:a=1,{loudness_filter or LOUDNESS_FILTER},"
-            f"{speed_audio_filter(video_speed, sum(end - start for start, end in audio_keeps))}"
-            "asettb=1/48000,asetpts=N[aout]"
-        )
+        tail = (f"{loudness_filter or LOUDNESS_FILTER},"
+                f"{speed_audio_filter(video_speed, sum(end - start for start, end in audio_keeps))}"
+                "asettb=1/48000,asetpts=N[aout]")
+        speech = f"{inputs}concat=n={audio_n}:v=0:a=1"
+        gain = audio_gain if type(audio_gain) in (int, float) else 1.0
+        if gain != 1.0:
+            speech += f",volume={gain:.6g}"
+        # Speech Enhancement rides on the speech only (never the music bed),
+        # before loudness normalization so the target loudness still holds.
+        enhancement = speech_enhancement_filter(speech_denoise, speech_enhance)
+        if enhancement:
+            speech += f",{enhancement}"
+        # Auto Censor mutes (and optionally bleeps) the speech — never the
+        # music bed — on the same pre-speed clock the captions use.
+        total_pre_s = sum(end - start for start, end in audio_keeps) / 1000
+        censor_suffix, censor_parts = censor_audio_layers(censor_mutes, censor_bleep, total_pre_s)
+        if censor_suffix:
+            speech += f",{censor_suffix}"
+            parts.extend(censor_parts)
+        # The AI voiceover is its own bed (never touched by audio_gain), delayed
+        # to its start_ms on the same pre-speed clock the timeline lanes show.
+        if voiceover_index is not None:
+            delay = int(voiceover_start_ms) if type(voiceover_start_ms) in (int, float) and voiceover_start_ms > 0 else 0
+            vo_chain = f"{AUDIO_FORMAT},volume={voiceover_gain:.6g}"
+            if delay > 0:
+                vo_chain += f",adelay={delay}:all=1"
+            parts.append(f"[{voiceover_index}:a:0]{vo_chain}[voiceover_bed]")
+        if music_index is None and voiceover_index is None:
+            parts.append(f"{speech},{tail}")
+        else:
+            # Background music rides under the speech (after the audio edit,
+            # before loudness): a looped input trimmed to the speech by
+            # amix's duration=first. Speed and clock rebuild apply to the mix.
+            parts.append(f"{speech}[speech_baked]")
+            # A start offset picks where in the track the bed begins (the input
+            # is looped, so atrim just slides the seam); fades stay anchored to
+            # the clip start.
+            skip = music_start_ms / 1000 if type(music_start_ms) in (int, float) and music_start_ms > 0 else 0
+            music_chain = (f"atrim=start={skip:.3f},asetpts=PTS-STARTPTS," if skip else "") + f"{AUDIO_FORMAT},volume={music_gain:.6g}"
+            # Fades live on the looping bed, scaled to the pre-speed clock so a
+            # "2s fade" on the output stays ~2s whatever the export speed is.
+            speed = video_speed if type(video_speed) in (int, float) and video_speed > 0 else 1.0
+            fade_in = music_fade_in_ms / 1000 if type(music_fade_in_ms) in (int, float) else 0
+            fade_out = music_fade_out_ms / 1000 if type(music_fade_out_ms) in (int, float) else 0
+            d_in = min(max(fade_in, 0), 5) / speed if total_pre_s > 0 else 0
+            d_out = min(max(fade_out, 0), 5) / speed if total_pre_s > 0 else 0
+            if d_in > 0 and total_pre_s > d_in:
+                music_chain += f",afade=t=in:st=0:d={d_in:.3f}"
+            if d_out > 0 and total_pre_s > d_out:
+                music_chain += f",afade=t=out:st={max(0.0, total_pre_s - d_out):.3f}:d={d_out:.3f}"
+            parts.append(f"[{music_index}:a:0]{music_chain}[music_bed]")
+            mix_inputs = "[speech_baked]" + ("[voiceover_bed]" if voiceover_index is not None else "") + ("[music_bed]" if music_index is not None else "")
+            parts.append(f"{mix_inputs}amix=inputs={len(mix_inputs.split(']['))}:duration=first:dropout_transition=0:normalize=0,"
+                         f"{tail}")
     return ";".join(parts)
 
 

@@ -2,6 +2,14 @@ import { parseRunDiagnostics } from './run-diagnostics'
 import { parseStages } from './job-progress'
 import { parseEditorialSummary, type EditorialSummary } from './editorial'
 
+export const ASPECT_RATIOS = ['9:16', '16:9', '1:1'] as const
+
+/** One extra rendered format of a clip for multi-format jobs. */
+export interface ClipVariant {
+  aspect_ratio: string
+  s3_url: string
+}
+
 export interface ClipArtifact {
   editorial?: EditorialSummary | null
   clip_index: number
@@ -15,6 +23,18 @@ export interface ClipArtifact {
   tags: string[]
   /** Set when smart framing failed and a letterbox fallback produced the clip. */
   render_fallback: string | null
+  /** Extra formats rendered for this clip; the primary stays in s3_url. */
+  variants?: ClipVariant[] | null
+}
+
+/** Live per-clip progress for a bulk export, pushed on clips:bulkExportProgress. */
+export interface BulkExportProgress {
+  total: number
+  /** Position in the submitted selection (matches the dialog's row order). */
+  index: number
+  name: string
+  percent: number
+  status: 'copying' | 'done' | 'failed'
 }
 
 export interface JobOutput {
@@ -57,6 +77,16 @@ function safeBox(value: unknown): number[] | null {
   return value as number[]
 }
 
+function safeVariants(value: unknown): ClipVariant[] | null {
+  if (!Array.isArray(value) || value.length > 3) return null
+  const variants = value.flatMap((item): ClipVariant[] =>
+    record(item) && typeof item.s3_url === 'string' && item.s3_url.trim() && item.s3_url.length <= 8192 &&
+    ASPECT_RATIOS.includes(item.aspect_ratio as typeof ASPECT_RATIOS[number])
+      ? [{ aspect_ratio: item.aspect_ratio as string, s3_url: item.s3_url }] : []
+  )
+  return variants.length ? variants : null
+}
+
 function safeShot(value: unknown): Record<string, unknown> | null {
   if (!record(value) || !nonNegative(value.start_ms) || !nonNegative(value.end_ms) ||
     value.end_ms < value.start_ms) return null
@@ -92,7 +122,11 @@ function safeMetrics(value: unknown): Record<string, unknown> | null {
       const model = boundedText(requested[field], 120)
       if (model !== null) safe[field] = model
     }
-    if (requested.aspect_ratio === '9:16' || requested.aspect_ratio === '16:9') safe.aspect_ratio = requested.aspect_ratio
+    if (ASPECT_RATIOS.includes(requested.aspect_ratio as typeof ASPECT_RATIOS[number])) safe.aspect_ratio = requested.aspect_ratio
+    if (Array.isArray(requested.aspect_ratios) && requested.aspect_ratios.length <= 3 &&
+      requested.aspect_ratios.every((ratio) => ASPECT_RATIOS.includes(ratio as typeof ASPECT_RATIOS[number]))) {
+      safe.aspect_ratios = requested.aspect_ratios
+    }
     if (['auto', 'fill', 'fit'].includes(requested.layout_style as string)) safe.layout_style = requested.layout_style
     if (typeof requested.layout_vision_enabled === 'boolean') safe.layout_vision_enabled = requested.layout_vision_enabled
     if (requested.pacing === 'tight' || requested.pacing === 'natural') safe.pacing = requested.pacing
@@ -181,7 +215,8 @@ export function parseJobOutput(value: unknown): JobOutput | null {
       layout_type: typeof item.layout_type === 'string' && ['talking_head', 'two_shot', 'screen_cam', 'screen', 'fit', 'center_crop'].includes(item.layout_type) ? item.layout_type : '',
       summary: boundedText(item.summary, 2048),
       tags: Array.isArray(item.tags) ? item.tags.filter((tag): tag is string => typeof tag === 'string').slice(0, 50).map((tag) => tag.slice(0, 64)) : [],
-      render_fallback: boundedText(item.render_fallback, 256)
+      render_fallback: boundedText(item.render_fallback, 256),
+      variants: safeVariants(item.variants)
     })
   }
   return {

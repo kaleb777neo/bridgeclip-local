@@ -141,6 +141,28 @@ class TestFallbackLadder:
             render(service, request_for(tmp_path))
         assert len(calls) == 3
 
+    def test_square_falls_back_on_the_square_canvas(self, service, monkeypatch, tmp_path):
+        # The 1:1 ladder mirrors vertical's (smart -> letterbox -> natural),
+        # and every step keeps the 1080x1080 target, not the landscape one.
+        calls: list = []
+        sizes: list = []
+
+        async def render_edit(request, plan, time_map, window_start_ms, window_ms,
+                              target_width, target_height, is_landscape, *_args):
+            calls.append((plan.is_letterbox_only, time_map.has_cuts))
+            sizes.append((target_width, target_height, is_landscape))
+            if len(calls) <= 1:
+                raise RenderingError("FFmpeg failed")
+            with open(request.output_path, "wb") as f:
+                f.write(b"\0" * 1024)
+
+        monkeypatch.setattr(service, "_render_edit", render_edit)
+        result = render(service, request_for(tmp_path, aspect_ratio="1:1"))
+        assert calls == [(False, True), (True, True)]
+        assert sizes == [(1080, 1080, False)] * 2
+        assert result.render_fallback == "letterbox"
+        assert (result.output_width, result.output_height) == (1080, 1080)
+
 
 class TestCaptionsOff:
     def test_pacing_still_cuts_without_captions(self, service, monkeypatch, tmp_path):
@@ -218,7 +240,7 @@ class TestPacingWithoutSmartFraming:
         monkeypatch.setattr(svc.layout_analyzer, "analyze", analyze)
         return calls
 
-    @pytest.mark.parametrize("style,aspect", [("fit", "9:16"), ("auto", "16:9")])
+    @pytest.mark.parametrize("style,aspect", [("fit", "9:16"), ("auto", "16:9"), ("fit", "1:1")])
     def test_talking_head_gets_the_talking_head_limit(self, plain_service, monkeypatch, tmp_path, style, aspect):
         calls = self.analyze_returning(monkeypatch, plain_service, lambda window_ms: ClipLayoutPlan(
             shots=[ShotLayout(0, window_ms, LayoutType.TALKING_HEAD, people=[Box(0.45, 0.2, 0.1, 0.25)])],

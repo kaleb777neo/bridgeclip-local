@@ -5,7 +5,7 @@ import type { ZernioAccount } from '../../shared/zernio'
 import { getApi } from '../lib/ipc'
 import { cn, errorMessage } from '../lib/utils'
 import {
-  addDays, chipTime, dayKey, layoutDayCards, minutesOfDay, monthGrid, monthTitle,
+  addDays, chipTime, dayKey, layoutDayCards, minutesOfDay, movedWhen, monthGrid, monthTitle,
   shiftDay, weekGrid, WEEKDAY_LABELS,
 } from '../lib/calendar'
 import { PlatformIcon, platformName } from './PlatformIcon'
@@ -63,12 +63,14 @@ function postTitle(post: CalendarPost): string {
  * external ones alike): a week time grid or a month grid, with a mini month
  * and the connected accounts beside it.
  */
-export function PostsCalendar({ mode, onModeChange, onNavigate, onSchedule, reloadSignal }: {
+export function PostsCalendar({ mode, onModeChange, onNavigate, onSchedule, onReschedule, reloadSignal }: {
   mode: CalendarMode
   onModeChange: (mode: CalendarMode) => void
   onNavigate: (page: Page) => void
   /** The Schedule Post dialog, opened by a "+" on a day or hour slot. */
   onSchedule: (slot: { key: string; hour: number }) => void
+  /** Drag & drop: move a scheduled post onto another day/hour. False = refused. */
+  onReschedule: (post: CalendarPost, whenIso: string) => Promise<boolean>
   /** Bumped after a post is made so the grid refetches. */
   reloadSignal: number
 }): React.JSX.Element {
@@ -86,6 +88,8 @@ export function PostsCalendar({ mode, onModeChange, onNavigate, onSchedule, relo
   const [error, setError] = useState<string | null>(null)
   const [selected, setSelected] = useState<CalendarPost | null>(null)
   const [editingPost, setEditingPost] = useState<CalendarPost | null>(null)
+  const [dragPost, setDragPost] = useState<CalendarPost | null>(null)
+  const [dropKey, setDropKey] = useState<string | null>(null)
   const localPosts = usePostsStore((s) => s.posts)
   const [accounts, setAccounts] = useState<ZernioAccount[]>([])
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -134,6 +138,17 @@ export function PostsCalendar({ mode, onModeChange, onNavigate, onSchedule, relo
   useEffect(() => {
     if (mode === 'week' && scrollRef.current) scrollRef.current.scrollTop = 7 * HOUR_PX
   }, [mode])
+
+  /** Only our own scheduled posts can move: published/failed/external are fixed. */
+  const movable = (post: CalendarPost): boolean => post.source === 'zernio' && post.status === 'scheduled'
+  const dropPost = async (post: CalendarPost | null, dayKey: string, minutes: number | null): Promise<void> => {
+    setDropKey(null)
+    setDragPost(null)
+    if (!post || !movable(post)) return
+    if (!(await onReschedule(post, movedWhen(post.when, dayKey, minutes ?? undefined)))) {
+      setError('That post could not be moved — check that the new time is in the future and inside the scheduling window.')
+    }
+  }
 
   const byDay = useMemo(() => {
     const days = new Map<string, CalendarPost[]>()
@@ -256,10 +271,13 @@ export function PostsCalendar({ mode, onModeChange, onNavigate, onSchedule, relo
           {mode === 'week' ? (
             <WeekGrid week={week} byDay={byDay} selectedId={selected?.id ?? null}
               onSelect={(post) => setSelected(selected?.id === post.id ? null : post)} scrollRef={scrollRef}
-              onSchedule={onSchedule} />
+              onSchedule={onSchedule} dragPost={dragPost} dropKey={dropKey}
+              onDragStart={setDragPost} onDropAt={(key, minutes) => { void dropPost(dragPost, key, minutes) }} setDropKey={setDropKey} />
           ) : (
             <MonthGrid month={month} byDay={byDay} selectedId={selected?.id ?? null}
-              onSelect={(post) => setSelected(selected?.id === post.id ? null : post)} onSchedule={onSchedule} />
+              onSelect={(post) => setSelected(selected?.id === post.id ? null : post)} onSchedule={onSchedule}
+              dragPost={dragPost} dropKey={dropKey} onDragStart={setDragPost}
+              onDropAt={(key) => { void dropPost(dragPost, key, null) }} setDropKey={setDropKey} />
           )}
         </Panel>
       </div>
@@ -295,13 +313,18 @@ function postHandle(account: ZernioAccount): string {
   return account.displayName ?? account.username ?? platformName(account.platform)
 }
 
-function WeekGrid({ week, byDay, selectedId, onSelect, scrollRef, onSchedule }: {
+function WeekGrid({ week, byDay, selectedId, onSelect, scrollRef, onSchedule, dragPost, dropKey, onDragStart, onDropAt, setDropKey }: {
   week: ReturnType<typeof weekGrid>
   byDay: Map<string, CalendarPost[]>
   selectedId: string | null
   onSelect: (post: CalendarPost) => void
   scrollRef: React.RefObject<HTMLDivElement | null>
   onSchedule: (slot: { key: string; hour: number }) => void
+  dragPost: CalendarPost | null
+  dropKey: string | null
+  onDragStart: (post: CalendarPost | null) => void
+  onDropAt: (dayKey: string, minutes: number | null) => void
+  setDropKey: (key: string | null) => void
 }): React.JSX.Element {
   return (
     <div>
@@ -328,7 +351,7 @@ function WeekGrid({ week, byDay, selectedId, onSelect, scrollRef, onSchedule }: 
             ))}
           </div>
           {week.cells.map((cell) => (
-            <DayColumn key={cell.key} cell={cell} posts={byDay.get(cell.key) ?? []}
+            <DayColumn key={cell.key} cell={cell} posts={byDay.get(cell.key) ?? []} dragPost={dragPost} dropKey={dropKey} onDragStart={onDragStart} onDropAt={onDropAt} setDropKey={setDropKey}
               selectedId={selectedId} onSelect={onSelect} onSchedule={onSchedule} />
           ))}
         </div>
@@ -337,17 +360,35 @@ function WeekGrid({ week, byDay, selectedId, onSelect, scrollRef, onSchedule }: 
   )
 }
 
-function DayColumn({ cell, posts, selectedId, onSelect, onSchedule }: {
+/** Only our own scheduled posts can move: published/failed/external are fixed. */
+const movable = (post: CalendarPost): boolean => post.source === 'zernio' && post.status === 'scheduled'
+
+function DayColumn({ cell, posts, selectedId, onSelect, onSchedule, dragPost, dropKey, onDragStart, onDropAt, setDropKey }: {
   cell: { key: string; isToday: boolean }
   posts: CalendarPost[]
   selectedId: string | null
   onSelect: (post: CalendarPost) => void
   onSchedule: (slot: { key: string; hour: number }) => void
+  dragPost: CalendarPost | null
+  dropKey: string | null
+  onDragStart: (post: CalendarPost | null) => void
+  onDropAt: (dayKey: string, minutes: number | null) => void
+  setDropKey: (key: string | null) => void
 }): React.JSX.Element {
   const { cards, more } = useMemo(() => layoutDayCards(
     posts.map((post) => ({ item: post, minutes: minutesOfDay(post.when) }))), [posts])
+  const dropHere = dropKey === cell.key
   return (
-    <div className={cn('relative min-w-0 flex-1 border-l border-white/[0.05]', cell.isToday && 'bg-white/[0.015]')}>
+    <div
+      className={cn('relative min-w-0 flex-1 border-l border-white/[0.05]', cell.isToday && 'bg-white/[0.015]', dropHere && 'ring-1 ring-inset ring-accent/60 bg-accent/[0.04]')}
+      onDragOver={(e) => { if (dragPost) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDropKey(cell.key) } }}
+      onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDropKey(null) }}
+      onDrop={(e) => {
+        e.preventDefault()
+        const top = e.currentTarget.getBoundingClientRect().top
+        const minutes = Math.round(((e.clientY - top) / HOUR_PX) * 60)
+        onDropAt(cell.key, Math.max(0, minutes))
+      }}>
       {Array.from({ length: 24 }, (_, hour) => (
         <span key={hour} aria-hidden className="absolute inset-x-0 border-t border-white/[0.04]" style={{ top: hour * HOUR_PX }} />
       ))}
@@ -363,7 +404,7 @@ function DayColumn({ cell, posts, selectedId, onSelect, onSchedule }: {
         </div>
       ))}
       {cards.map(({ item: post, minutes, lane }) => (
-        <button key={post.id} type="button" onClick={() => onSelect(post)}
+        <button key={post.id} type="button" draggable={movable(post)} onDragStart={(e) => { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', post.id); onDragStart(post) }} onDragEnd={() => onDragStart(null)} onClick={() => onSelect(post)}
           aria-label={`${chipTime(post.when)} ${statusLabel(post.status)}: ${postTitle(post)}`}
           title={`${chipTime(post.when)} · ${statusLabel(post.status)} · ${postTitle(post)}`}
           className={cn('absolute overflow-hidden rounded-xl border border-white/[0.07] bg-[#141417] px-2 py-1.5 text-left',
@@ -395,12 +436,17 @@ function DayColumn({ cell, posts, selectedId, onSelect, onSchedule }: {
   )
 }
 
-function MonthGrid({ month, byDay, selectedId, onSelect, onSchedule }: {
+function MonthGrid({ month, byDay, selectedId, onSelect, onSchedule, dragPost, dropKey, onDragStart, onDropAt, setDropKey }: {
   month: ReturnType<typeof monthGrid>
   byDay: Map<string, CalendarPost[]>
   selectedId: string | null
   onSelect: (post: CalendarPost) => void
   onSchedule: (slot: { key: string; hour: number }) => void
+  dragPost: CalendarPost | null
+  dropKey: string | null
+  onDragStart: (post: CalendarPost | null) => void
+  onDropAt: (dayKey: string, minutes: number | null) => void
+  setDropKey: (key: string | null) => void
 }): React.JSX.Element {
   return (
     <div>
@@ -417,7 +463,10 @@ function MonthGrid({ month, byDay, selectedId, onSelect, onSchedule }: {
           const slotHour = openSlotHour(cell.key)
           return (
             <div key={cell.key} role="gridcell" aria-label={cell.key}
-              className={cn('group relative min-h-[118px] rounded-2xl border border-white/[0.06] bg-white/[0.015] p-2', !cell.inMonth && 'opacity-40')}>
+              className={cn('group relative min-h-[118px] rounded-2xl border border-white/[0.06] bg-white/[0.015] p-2', !cell.inMonth && 'opacity-40', dropKey === cell.key && 'ring-1 ring-accent/60 bg-accent/[0.04]')}
+              onDragOver={(e) => { if (dragPost) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDropKey(cell.key) } }}
+              onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDropKey(null) }}
+              onDrop={(e) => { e.preventDefault(); onDropAt(cell.key, null) }}>
               <span className={cn('block text-center font-mono text-xs tabular', cell.isToday ? 'font-semibold text-accent' : 'text-ink-muted')}>
                 {cell.dayOfMonth}
               </span>
@@ -426,7 +475,7 @@ function MonthGrid({ month, byDay, selectedId, onSelect, onSchedule }: {
               )}
               <div className="mt-1.5 space-y-1.5">
                 {shown.map((post) => (
-                  <button key={post.id} type="button" onClick={() => onSelect(post)}
+                  <button key={post.id} type="button" draggable={movable(post)} onDragStart={(e) => { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', post.id); onDragStart(post) }} onDragEnd={() => onDragStart(null)} onClick={() => onSelect(post)}
                     aria-label={`${chipTime(post.when)} ${statusLabel(post.status)}: ${postTitle(post)}`}
                     title={`${chipTime(post.when)} · ${statusLabel(post.status)} · ${postTitle(post)}`}
                     className={cn('block w-full rounded-xl bg-[#141417] px-2 py-1.5 text-left shadow-[inset_0_0_0_1px_rgb(255_255_255/0.06)] transition-colors duration-100 hover:bg-[#1a1a1f]',

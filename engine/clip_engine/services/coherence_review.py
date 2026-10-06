@@ -4,6 +4,7 @@ A language model can propose an edit; only explicit, sufficient judgments admit
 it. Unknown cuts are restored and unverified clips are never rendered.
 """
 import asyncio
+from clip_engine import asyncio_compat  # Installs asyncio.timeout on Python 3.10
 import copy
 import json
 import math

@@ -88,6 +88,9 @@ class ClipPlanSegment:
     # timeline, and the SRT sidecar path.
     output_chapters: list[tuple[int, str]] = field(default_factory=list)
     subtitle_path: Optional[str] = None
+    # Filled in after rendering, for multi-format jobs: extra rendered formats
+    # as [{aspect_ratio, path}] next to the primary clip.
+    variants: list[dict] = field(default_factory=list)
     editorial: Optional[dict] = None
     moment: Optional[dict] = None
 

@@ -9,7 +9,7 @@ const { buildSync } = require('esbuild')
 
 const bundle = buildSync({
   stdin: {
-    contents: `export { addDays, addMonths, chipTime, dayKey, layoutDayCards, minutesOfDay, monthGrid, monthTitle, shiftDay, timezoneLabel, WEEKDAY_LABELS, weekGrid } from './src/renderer/lib/calendar';`,
+    contents: `export { addDays, addMonths, chipTime, dayKey, layoutDayCards, minutesOfDay, movedWhen, monthGrid, monthTitle, shiftDay, timezoneLabel, WEEKDAY_LABELS, weekGrid } from './src/renderer/lib/calendar';`,
     resolveDir: path.resolve(__dirname, '..'),
     loader: 'ts'
   },
@@ -20,7 +20,7 @@ const mod = { exports: {} }
 vm.runInNewContext(bundle, { module: mod, exports: mod.exports, require, Intl, Date })
 const {
   addDays, addMonths, chipTime, dayKey, layoutDayCards, minutesOfDay,
-  monthGrid, monthTitle, shiftDay, timezoneLabel, WEEKDAY_LABELS, weekGrid,
+  monthGrid, monthTitle, movedWhen, shiftDay, timezoneLabel, WEEKDAY_LABELS, weekGrid,
 } = mod.exports
 test('month grids start on Monday, keep six weeks and cover the whole month', () => {
   for (const [year, month] of [[2026, 9], [2026, 0], [2024, 1], [2025, 11]]) {
@@ -135,4 +135,19 @@ test('cards far apart do not stack', () => {
   const { cards, more } = layoutDayCards([{ item: 'a', minutes: 600 }, { item: 'b', minutes: 640 }])
   assert.equal(JSON.stringify(cards.map((c) => c.lane)), '[0,0]')
   assert.equal(more.length, 0)
+})
+
+test('drag & drop reschedule moves a post onto another day, keeping its time', () => {
+  // 2026-03-05 09:30 local → dropped on the Mar 8 cell keeps 09:30.
+  const when = new Date(2026, 2, 5, 9, 30).toISOString()
+  const moved = new Date(movedWhen(when, '2026-03-08'))
+  assert.equal([moved.getFullYear(), moved.getMonth(), moved.getDate()].join('-'), '2026-2-8')  // getMonth: March = 2
+  assert.equal(moved.getHours() * 60 + moved.getMinutes(), 9 * 60 + 30)
+  // Week grid: explicit minutes replace the time of day, clamped inside the day.
+  const at1430 = new Date(movedWhen(when, '2026-03-10', 14 * 60 + 30))
+  assert.equal(at1430.getHours() * 60 + at1430.getMinutes(), 14 * 60 + 30)
+  const clamped = new Date(movedWhen(when, '2026-03-10', 25 * 60))
+  assert.equal(clamped.getHours() * 60 + clamped.getMinutes(), 23 * 60 + 59)
+  // A broken input returns the original untouched.
+  assert.equal(movedWhen('not-a-date', '2026-03-10'), 'not-a-date')
 })

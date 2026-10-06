@@ -97,6 +97,37 @@ def rendering_graphs(tmp_path):
     yield composed
 
 
+def bake_graphs(tmp_path):
+    """Editor bake layers: brand overlays, caption base label, xfade overlap, music, b-rolls and text cards."""
+    from PIL import Image
+    from clip_engine.services.clip_editor import TimeMap
+    renderer = RenderingService.__new__(RenderingService)
+    renderer._fonts_dir = str(tmp_path)
+    logo_source = tmp_path / 'logo.png'
+    Image.new('RGBA', (8, 8), (255, 0, 0, 255)).save(logo_source)
+    request = type('R', (), {'video_speed': 2, 'output_path': str(tmp_path / 'clip.mp4'),
+                             'start_time_ms': 0, 'end_time_ms': 4000,
+                             'logo': {'path': str(logo_source), 'position': 'center', 'scale': .25, 'opacity': .5},
+                             'cta_badges': [{'kind': 'subscribe', 'position': 'bottom-right'},
+                                            {'kind': 'follow', 'position': 'top-left', 'start_ms': 500, 'end_ms': 3000}],
+                             'text_overlays': [{'text': 'Hi', 'start_ms': 0, 'end_ms': 3000,
+                                                'position': 'bottom-left'}]})()
+    time_map = TimeMap([(0, 4000)], 4000)
+    brand = renderer._brand_overlays(request, 1080, 1920, time_map, 0, 34)
+    composed, _ = RenderingService._compose_overlays('[0:v]null[base];[base]null[captioned]', brand,
+                                                     speed_video_filter(2, '30'))
+    yield composed
+    scenes = [{'at_ms': 0, 'layout': 'fill', 'crops': [[0, 0, .5, 1]]},
+              {'at_ms': 2000, 'layout': 'fill', 'crops': [[.5, 0, .5, 1]], 'transition_ms': 1000,
+               'transition_kind': 'dissolve'}]
+    yield build_layout_graph(manual(scenes, ranges=((0, 4000),)), 1080, 1920, None, True, fps='30',
+                             audio_gain=.5, music_index=4, music_gain=.3)
+    (tmp_path / 'b.png').write_bytes(b'')
+    stage, _ = renderer._bake_stage(request, [{'path': str(tmp_path / 'b.png'), 'start_ms': 500, 'end_ms': 1500}],
+                                    time_map, 0, 1080, 1920, '30', first_index=1 + len(brand))
+    yield '[captioned]setpts=0.5*PTS[pre_bake]' + stage
+
+
 def captured_commands(tmp_path, monkeypatch):
     """Command-line -vf/-af graphs of the editor preview and camera scan."""
     commands = []
@@ -139,10 +170,13 @@ def test_emitted_filters_are_in_the_shipped_lgpl_build(tmp_path, monkeypatch):
     allowed = allowlist()
     assert not allowed & GPL_ONLY
     emitted = set()
-    for graph in [*graphs(), *rendering_graphs(tmp_path), *captured_commands(tmp_path, monkeypatch)]:
+    for graph in [*graphs(), *rendering_graphs(tmp_path), *bake_graphs(tmp_path),
+                  *captured_commands(tmp_path, monkeypatch)]:
         emitted.update(filter_names(graph))
     # Guard the parser itself: these must be seen, or the check is vacuous.
     assert {'scale', 'crop', 'trim', 'concat', 'overlay', 'ass', 'loudnorm', 'atempo', 'select'} <= emitted
+    # Editor bake layers must be covered by this check, not just exist.
+    assert {'xfade', 'colorchannelmixer', 'amix', 'volume'} <= emitted
     assert emitted <= allowed, f'Not in the shipped LGPL FFmpeg: {sorted(emitted - allowed)}'
 
 

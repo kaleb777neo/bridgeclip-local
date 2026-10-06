@@ -54,6 +54,9 @@ class ClipArtifact:
     chapters: Optional[list[dict]] = None
     subtitle_url: Optional[str] = None
     editorial: Optional[dict] = None
+    # Multi-format jobs: extra rendered formats for this clip as
+    # [{aspect_ratio, s3_url}]; the primary stays in s3_url.
+    variants: Optional[list[dict]] = None
 
 
 @dataclass
