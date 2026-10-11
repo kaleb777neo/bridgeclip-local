@@ -136,13 +136,14 @@ test('raw worker output never reaches the renderer, and an oversized line stops 
   child.stdout.write(`{"type":"progress","status":"rendering","step":"Rendering https://evil.example/${SECRET}","percent":5}\n`)
   child.stdout.write(`{"type":"error","message":"Provider rejected key=${SECRET}","hint":"See /Users/private/x","code":"../x","stage":"/etc","http_status":"401"}\n`)
   await tick()
-  // Raw (non-JSON) lines are dropped; JSON fields with URLs, paths or key/token/secret markers are replaced.
+  // Raw (non-JSON) lines are dropped. JSON fields with links or absolute local paths are
+  // replaced whole; a credential inside an otherwise useful sentence is stripped in place.
   assert.ok(!JSON.stringify(sent).includes(SECRET))
   assert.ok(!JSON.stringify(sent).includes('/Users/private'))
   assert.equal(sent.find((event) => event.channel === 'job:progress').data.step, 'The clipping engine could not complete this step.')
   const errors = sent.filter((event) => event.channel === 'job:error')
   assert.equal(errors.length, 1)
-  assert.equal(errors[0].data.message, 'The clipping engine could not complete this step.')
+  assert.equal(errors[0].data.message, 'Provider rejected [redacted]')
   assert.equal(errors[0].data.hint, 'The clipping engine could not complete this step.')
   assert.equal(errors[0].data.failureCode, undefined)
   assert.equal(errors[0].data.failureStage, undefined)
@@ -159,6 +160,28 @@ test('raw worker output never reaches the renderer, and an oversized line stops 
   assert.equal(signals.length, 0)
   child.emit('close', 1, null)
   huge.emit('close', null, 'SIGKILL')
+})
+
+// The engine's own actionable hints name a settings page, a requirements file, or a
+// clip count with a slash. Dropping the whole sentence for one slash left the user
+// with no instruction to follow, so the shapes that are private are checked instead.
+test('a hint that names a settings page, a file, or a clip count reaches the user', () => {
+  const { runner } = startRunner({ child: fakeChild() })
+  const generic = 'The clipping engine could not complete this step.'
+  assert.equal(runner.safeBridgeText('Add credits at openrouter.ai/credits or raise the key\'s limit at openrouter.ai/keys.'),
+    'Add credits at openrouter.ai/credits or raise the key\'s limit at openrouter.ai/keys.')
+  assert.equal(runner.safeBridgeText('Install it with pip install -r engine/requirements-local.txt'), 'Install it with pip install -r engine/requirements-local.txt')
+  assert.equal(runner.safeBridgeText('Rendering clip 3/10'), 'Rendering clip 3/10')
+  assert.equal(runner.safeBridgeText('deepseek-ai/deepseek-v3.1 is not available'), 'deepseek-ai/deepseek-v3.1 is not available')
+  assert.equal(runner.safeBridgeText('the key: out of credits'), 'the key: out of credits')
+  assert.equal(runner.safeBridgeText('Provider rejected key=sk-or-v1-abcdefghijklmnop'), 'Provider rejected [redacted]')
+  assert.equal(runner.safeBridgeText('Connect again, Bearer ghp_aaaaaaaaaaaaaaaa was used.'), 'Connect again, [redacted] was used.')
+  assert.equal(runner.safeBridgeText('Sign in at https://evil.example/claim'), generic)
+  assert.equal(runner.safeBridgeText('Cannot read C:\\Users\\me\\video.mp4'), generic)
+  assert.equal(runner.safeBridgeText('Cannot read /var/run/bridgeclip'), generic)
+  assert.equal(runner.safeBridgeText(undefined), generic)
+  assert.equal(runner.safeBridgeText('   '), generic)
+  assert.ok(runner.safeBridgeText('x'.repeat(400)).length <= 300, 'long text is capped, not dropped')
 })
 
 test('a progress flood is treated as a hostile worker', async () => {

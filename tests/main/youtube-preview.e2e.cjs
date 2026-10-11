@@ -32,7 +32,7 @@ test('YouTube source card progressively loads metadata, tolerates failures and i
   await page.reload()
   await page.getByRole('radio', { name: 'Automatic', exact: true }).click()
   const add = async (url) => {
-    await page.getByPlaceholder('YouTube, Twitch VOD or direct video link').fill(url)
+    await page.getByPlaceholder(/or direct link/).fill(url)
     await page.getByRole('button', { name: 'Use link', exact: true }).click()
   }
   const card = page.getByRole('region', { name: 'YouTube video preview' })
@@ -44,7 +44,10 @@ test('YouTube source card progressively loads metadata, tolerates failures and i
   assert.equal(await card.getByText('10:34', { exact: true }).count(), 0, 'summary appears before slow details')
   await resolveDetails()
   await card.getByText('10:34', { exact: true }).waitFor()
-  await card.getByText('12.8M views', { exact: true }).waitFor()
+  // Counts use the renderer's locale, so compare with the same Intl call rather
+  // than a hard-coded en-US string (a Romanian desktop renders "12,8 mil. views").
+  const views = await page.evaluate(() => `${new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(12800000)} views`)
+  await card.getByText(views, { exact: true }).waitFor()
   await card.locator('time[datetime="2026-09-20"]').waitFor()
   assert.equal(await card.getByText('www.youtube.com/watch', { exact: true }).count(), 0)
   await card.getByRole('button', { name: 'View on YouTube' }).click()
@@ -69,7 +72,7 @@ test('YouTube source card progressively loads metadata, tolerates failures and i
   await card.getByRole('heading', { name: /Big Buck Bunny/ }).waitFor()
   await resolveDetails()
   await card.getByText('10:34', { exact: true }).waitFor()
-  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(720, 700))
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(720, 700))
   await page.waitForFunction(() => window.innerWidth === 720 && document.documentElement.scrollWidth <= window.innerWidth)
   if (artifacts) await card.screenshot({ path: path.join(artifacts, 'youtube-source-compact.png') })
   // Broken thumbnails retain the metadata and controls.

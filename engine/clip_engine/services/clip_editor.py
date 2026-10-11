@@ -148,16 +148,18 @@ def compute_keep_intervals(
     plan: Optional[ClipLayoutPlan] = None,
     protected: Optional[list[tuple[int, int]]] = None,
     longform: bool = False,
+    pause_ms: Optional[int] = None,
 ) -> list[tuple[int, int]]:
     """Intervals of the window to keep under tight pacing.
 
     `longform` keeps pauses up to LONGFORM_MIN_PAUSE_MS (fillers are still cut).
+    `pause_ms` forces one pause threshold instead of reading it from the plan.
     """
     protected = preserve_intervals([], protected or [], window_ms)
     keep_pause_ms = LONGFORM_KEEP_PAUSE_MS if longform else KEEP_PAUSE_MS
 
     def pause_limit(start_ms: int, end_ms: int) -> Optional[int]:
-        threshold = max_pause_over(plan, start_ms, end_ms)
+        threshold = pause_ms if pause_ms is not None else max_pause_over(plan, start_ms, end_ms)
         if longform and threshold is not None:
             return max(threshold, LONGFORM_MIN_PAUSE_MS)
         return threshold
@@ -245,6 +247,30 @@ def compute_keep_intervals(
     if len(merged) > 1 and merged[0][1] - merged[0][0] < MIN_PIECE_MS:
         merged[:2] = [(merged[0][0], merged[1][1])]
     return preserve_intervals(merged or [(0, window_ms)], protected, window_ms)
+
+
+# The most aggressive cut any layout gets, used when the real shot plan is not
+# known yet: promising a duration against a looser threshold than the render
+# may apply would ship a clip shorter than asked.
+STRICTEST_PAUSE_MS = min(pause for pause in MAX_PAUSE_MS.values() if pause is not None)
+
+
+def estimate_tight_kept_ms(
+    segments: list[TranscriptSegment],
+    window_start_ms: int,
+    window_ms: int,
+    longform: bool = False,
+) -> int:
+    """How much of the window survives tight pacing, before the shot plan exists.
+
+    A transcript without word timings cannot be estimated, so it reports the
+    whole window: nothing is cut that the renderer cannot see either.
+    """
+    words = window_words(segments, window_start_ms, window_ms)
+    keeps = compute_keep_intervals(
+        words, window_ms, longform=longform, pause_ms=STRICTEST_PAUSE_MS,
+    )
+    return sum(end - start for start, end in keeps)
 
 
 def subtract_intervals(

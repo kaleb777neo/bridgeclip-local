@@ -202,3 +202,19 @@ test('main copies picked intro/outro videos into the pack folder, one file per s
   assert.equal(saved.intro, undefined)
   assert.equal(saved.outro, 'picked-outro.mov')
 })
+
+test('a pack caption style round-trips and malformed ones never survive a save', (t) => {
+  const { store } = workspace(t)
+  const style = { primaryColor: '#101010', highlightColor: '#39FF6A', font: 'Anton', sizeScale: 1.25, uppercase: false }
+  const saved = store.saveTemplate(pack({ captionStyle: style }))
+  assert.deepEqual(saved.captionStyle, style)
+  assert.deepEqual(store.getTemplate('studio-pack').captionStyle, style)
+  // Packs without one stay valid and keep the field absent.
+  assert.equal(store.normalizeTemplates([{ version: 1, id: 'legacy', name: 'Legacy', captionPresetId: 'pop', formats: ['9:16'] }])[0].captionStyle, undefined)
+  for (const bad of [
+    { captionStyle: { ...style, font: 'Comic Sans' } },
+    { captionStyle: { ...style, primaryColor: 'red' } },
+    { captionStyle: { ...style, sizeScale: 3 } },
+    { captionStyle: 'bold' }
+  ]) assert.throws(() => store.saveTemplate(pack(bad)), /Invalid (brand template|caption style)/, JSON.stringify(bad))
+})

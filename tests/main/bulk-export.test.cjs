@@ -47,7 +47,7 @@ function setup(t, files, dialog) {
     './file-manager': {}, './output-storage': { measureOutputStorage: async (d) => ({ outputDirectory: d, bytes: 0 }) },
     './clip-editor': {}, './editor-ai': {}, './edit-inspector': { inspectEdits: async () => ({}) },
     './export-fcpxml': {}, './run-history': {}, './pipeline-runner': {}, './job-manager': { initJobManager() {} },
-    './logger': {}, './network-policy': {}, './validation': {}, './templates-store': {}, './template-resolve': {},
+    './logger': {}, './network-policy': {}, './validation': {}, './templates-store': {}, './caption-styles-store': {}, './template-resolve': {},
     './openrouter-models': {}, './youtube-preview': {}, './tools': {}, './local-ai': { modelsDir: () => '/tmp/m' },
     './zernio/service': {}, './zernio/posts': {}, './zernio/analytics': {},
     './automations': {}, './library-posting': {}, './library-management': {}

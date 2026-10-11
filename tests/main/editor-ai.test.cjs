@@ -202,7 +202,7 @@ test('editorAiChat falls back to OpenRouter only for cloud users with a key, and
   assert.equal(requests[0].url, 'https://openrouter.ai/api/v1/chat/completions')
   assert.equal(requests[0].init.headers.Authorization, 'Bearer or-key')
   await assert.rejects(main.editorAiChat({ ...cloud, openrouterApiKey: '' }, { messages: [], maxTokens: 1 }),
-    /No AI provider is ready.*Settings → AI/)
+    /No AI provider is ready.*Settings → Local AI/)
 })
 
 test('unreachable providers surface a friendly Settings → AI error instead of raw network text', async () => {

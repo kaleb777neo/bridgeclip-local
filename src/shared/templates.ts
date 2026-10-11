@@ -1,4 +1,4 @@
-import { overlayPositions, type OverlayPosition } from './clip-editor'
+import { overlayPositions, parseCaptionStyle, type CaptionStyleOverrides, type OverlayPosition } from './clip-editor'
 
 /** Output formats a brand pack can require; the same ids the job's aspect ratios use. */
 export type TemplateFormat = '9:16' | '16:9' | '1:1'
@@ -46,6 +46,8 @@ export interface BrandTemplate {
   /** Uploaded outro video's display name; the file is main-owned in the pack folder. */
   outro?: string
   captionPresetId: string
+  /** Caption customisation layered on the preset; absent = the plain preset. */
+  captionStyle?: CaptionStyleOverrides
   /** Every clip renders these formats; the primary is [0]. */
   formats: TemplateFormat[]
   /** Per-corner insets as a fraction of output width; overlays place inside them. */
@@ -96,6 +98,9 @@ export function parseBrandTemplate(value: unknown): BrandTemplate {
   const formats = arr(v.formats, 3).map((f) => { if (!templateFormats.includes(f as TemplateFormat)) fail(); return f as TemplateFormat })
   if (!formats.length || new Set(formats).size !== formats.length) fail()
   const next: BrandTemplate = { id, name: name.trim(), captionPresetId, formats, ...(v.version === 1 ? { version: 1 } : {}) }
+  if (v.captionStyle !== undefined) {
+    try { next.captionStyle = parseCaptionStyle(v.captionStyle) } catch { fail() }
+  }
   if (v.builtIn !== undefined) { if (v.builtIn !== true) fail(); next.builtIn = true }
   if (logo) next.logo = logo
   if (badge) next.badge = badge

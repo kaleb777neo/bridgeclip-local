@@ -164,7 +164,7 @@ test('Library mutations reject the root, outside folders, nested folders, symlin
     assert.equal(fs.existsSync(f.clip), true)
     f.active.clear()
     fs.unlinkSync(path.join(f.run, 'job_output.json'))
-    await assert.rejects(f.main.deleteLibraryRun(f.run), /completed run/)
+    await assert.rejects(f.main.deleteLibraryRun(f.run), /no longer in your Library/)
   } finally { f.cleanup() }
 })
 
@@ -349,7 +349,15 @@ test('overlapping deletions re-read current metadata and tolerate already missin
   const f = clipFixture()
   try {
     fs.unlinkSync(path.join(f.run, 'clip_02.mp4'))
-    await Promise.all([f.main.deleteClipArtifacts(f.run, [2]), f.main.deleteClipArtifacts(f.run, [9])])
+    // An unknown clip index is a no-op, unless this call loses the race to the
+    // first one's folder rename. Then it must refuse with a message that says the
+    // run is gone (not that something failed mid-write), and a retry must succeed.
+    const [deleted, second] = await Promise.allSettled([f.main.deleteClipArtifacts(f.run, [2]), f.main.deleteClipArtifacts(f.run, [9])])
+    assert.equal(deleted.status, 'fulfilled')
+    if (second.status === 'rejected') {
+      assert.match(second.reason.message, /^This run is no longer in your Library/)
+      await f.main.deleteClipArtifacts(f.run, [9])
+    }
     assert.deepEqual((await f.main.files.getJobOutput(f.run)).clips.map(c => c.clip_index), [0])
     await assert.rejects(f.main.deleteClipArtifacts(f.run, [2]), /no longer/)
   } finally { f.cleanup() }

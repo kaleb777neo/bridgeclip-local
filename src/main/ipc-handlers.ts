@@ -27,6 +27,7 @@ import { assertAbsolutePath, assertMediaPath, assertTrustedSender, authorizeMedi
 import { assertPublicWebUrl } from './network-policy'
 import { validateJobConfig } from './validation'
 import { deleteTemplate, listTemplates, saveTemplate } from './templates-store'
+import { deleteCaptionStyle, listCaptionStyles, saveCaptionStyle } from './caption-styles-store'
 import { applyTemplateSnapshot } from './template-resolve'
 import { getModelCatalog, resolveAdvancedModels } from './openrouter-models'
 import { cancelLocalAiSetup, ensureOllamaRunning, getLocalAiStatus, setupLocalAi } from './local-ai'
@@ -117,6 +118,11 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
   handle('templates:list', () => listTemplates())
   handle('templates:save', (_event, template: unknown, logoPath: unknown = null, introPath: unknown = null, outroPath: unknown = null) => saveTemplate(template, logoPath, introPath, outroPath))
   handle('templates:delete', (_event, id: unknown) => deleteTemplate(id))
+
+  // Saved caption styles: named customisation over an engine preset.
+  handle('captionStyles:list', () => listCaptionStyles())
+  handle('captionStyles:save', (_event, style: unknown) => saveCaptionStyle(style))
+  handle('captionStyles:delete', (_event, id: unknown) => deleteCaptionStyle(id))
 
   handle('settings:replaceApiKey', (_event, key: ApiKeyName, value: string) => {
     const previousZernioKey = key === 'zernioApiKey' ? loadSettings().zernioApiKey : null
@@ -384,7 +390,8 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
   })
 
   handle('editor:open', (_event, path: unknown) => openEditor(path))
-  handle('editor:createProject', (_event, path: unknown, mediaPath?: unknown, focusClipIndex?: unknown) => createEditorProject(path, mediaPath, focusClipIndex))
+  handle('editor:createProject', (_event, path: unknown, mediaPath?: unknown, focusClipIndex?: unknown, allowDownload?: unknown) =>
+    createEditorProject(path, mediaPath, focusClipIndex, allowDownload))
   handle('editor:save', (_event, path: unknown, revision: unknown, edits: unknown, speakerNames: unknown) => saveEditor(path, revision, edits, speakerNames))
   handle('editor:addAsset', async (_event, path: unknown, kind: unknown) => {
     const window = getMainWindow()

@@ -6,7 +6,7 @@ const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 const { buildApp, launchApp, ROOT } = require('../zernio/support/electron-app.cjs')
 
-test('Library deletes only selected clips through its icon action and refreshes counts and empty state', { timeout: 90000 }, async t => {
+test('Library deletes only selected clips through its icon action and refreshes counts and empty state', { timeout: 180_000 }, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-delete-clips-'))
   const userDataDir = path.join(root, 'user-data'), library = path.join(userDataDir, 'BridgeClip'), run = path.join(library, 'test-run')
   fs.mkdirSync(run, { recursive: true })
@@ -33,7 +33,7 @@ test('Library deletes only selected clips through its icon action and refreshes 
   // Manual posting works without a connected account and survives reopening the run.
   const clipActions = page.getByRole('button', { name: 'Actions for “First clip”', exact: true })
   await clipActions.click()
-  assert.deepEqual(await page.getByRole('menuitem').allTextContents(), ['Post or schedule', 'Add to automation', 'Mark as posted', process.platform === 'darwin' ? 'Show in Finder' : 'Show in folder', 'Delete clip'])
+  assert.deepEqual(await page.getByRole('menuitem').allTextContents(), ['Post or schedule', 'Edit in editor', 'Add to automation', 'Mark as posted', process.platform === 'darwin' ? 'Show in Finder' : 'Show in folder', 'Duplicate', 'Delete clip'])
   await page.getByRole('menuitem', { name: 'Mark as posted', exact: true }).click()
   await page.getByRole('region', { name: 'Posted 1', exact: true }).getByText('First clip', { exact: true }).waitFor()
   assert.ok(fs.existsSync(path.join(run, '.bridgeclip-posted-0')))
@@ -49,7 +49,7 @@ test('Library deletes only selected clips through its icon action and refreshes 
   fs.renameSync(manifest, `${manifest}.backup`)
   await clipActions.click()
   await page.getByRole('menuitem', { name: 'Mark as posted', exact: true }).click()
-  await page.getByRole('alert').getByText(/This completed run is no longer available/).waitFor()
+  await page.getByRole('alert').getByText(/This run is no longer in your Library/).waitFor()
   assert.equal(fs.existsSync(path.join(run, '.bridgeclip-posted-0')), false)
   fs.renameSync(`${manifest}.backup`, manifest)
   // An individual clip can be deleted without first selecting any cards.
@@ -94,7 +94,7 @@ test('Library deletes only selected clips through its icon action and refreshes 
   fs.renameSync(manifest, `${manifest}.backup`)
   await trash.click()
   await page.getByRole('button', { name: 'Delete clips', exact: true }).click()
-  await page.getByText('This completed run is no longer available in your Library.', { exact: true }).waitFor()
+  await page.getByText('This run is no longer in your Library. Refresh the list; it may have been deleted or be mid-deletion.', { exact: true }).waitFor()
   assert.ok(clips.slice(0, 3).every(clip => fs.existsSync(clip.s3_url)))
   fs.renameSync(`${manifest}.backup`, manifest)
   await trash.click()

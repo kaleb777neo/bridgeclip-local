@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState, type RefObject } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type RefObject } from 'react'
 import type { CandidateEdit, EditorProject } from '../../shared/clip-editor'
 import { captionAnchor } from '../lib/caption-preview'
-import { captionPreviewPreset, textShadow } from './CaptionPresetPicker'
+import { activeCaptionAt, captionGroups, effectiveCaptionWords } from '../lib/caption-text'
+import { applyCaptionStyleOverrides, captionPreviewPreset, textShadow } from './CaptionPresetPicker'
 
 // Preset sizes in the export's 1080×1920 coordinate system. Browser font metrics
 // differ from libass; this is a placement guide, not a pixel-exact render.
@@ -26,10 +27,18 @@ export function EditorCaptionPreview({ canvas, project, candidate, time, disable
     observer.observe(element); observer.observe(parent); measure()
     return () => observer.disconnect()
   }, [canvas, project.aspect_ratio])
-  const preset = captionPreviewPreset(candidate.caption_preset), landscape = project.aspect_ratio === '16:9'
+  const base = captionPreviewPreset(candidate.caption_preset), landscape = project.aspect_ratio === '16:9'
+  const preset = candidate.caption_style ? applyCaptionStyleOverrides(base, candidate.caption_style) : base
+  // The burned captions, grouped exactly as the engine groups them; only the
+  // search for the on-screen group runs per frame.
+  const groups = useMemo(
+    () => captionGroups(effectiveCaptionWords(project, candidate), base.maxWords ?? 3),
+    [project, candidate, base.maxWords]
+  )
+  const active = activeCaptionAt(groups, time)
   const anchor = captionAnchor(project, candidate, time)
   const scale = bounds.width / (landscape ? 1920 : 1080)
-  const size = (SIZES[preset.id] ?? 84) * (landscape ? .65 : 1) * scale * .8
+  const size = (SIZES[base.id] ?? 84) * (candidate.caption_style?.sizeScale ?? 1) * (landscape ? .65 : 1) * scale * .8
   const shadow = textShadow(preset, scale * 3)
   if (!candidate.captions || !bounds.width) return null
   return <div className="editor-caption-overlay" style={bounds}>
@@ -65,10 +74,26 @@ export function EditorCaptionPreview({ canvas, project, candidate, time, disable
         return onMove(Math.max(.1, Math.min(.9, anchor.x + step)), center, true)
       }}>
       <span className="editor-caption-words" style={{ background: preset.plate }}>
-        {['Captions', 'go', 'here'].map((word, i) => <span key={i} style={{ color: i === 1 ? preset.highlight : preset.primary,
-          background: i === 1 ? preset.pill : undefined,
-          padding: preset.pill ? '0 .15em' : undefined, borderRadius: '.15em',
-          textShadow: i === 1 && preset.glow ? `${shadow}, 0 0 ${size / 3}px ${preset.glow}` : undefined }}>{word}</span>)}
+        {active
+          ? active.group.words.map((word, i) => {
+            const state = active.states[i]
+            const style: CSSProperties = {
+              visibility: state === 'future' && preset.future === 'hide' ? 'hidden' : undefined,
+              opacity: state === 'future' && preset.future === 'dim' ? preset.dimOpacity ?? .6 : 1,
+              padding: preset.pill ? '0 .15em' : undefined,
+              borderRadius: '.15em',
+              color: preset.karaoke && state === 'past' ? preset.highlight
+                : state === 'active' ? preset.highlight : preset.primary,
+              background: state === 'active' && preset.pill ? preset.pill : undefined,
+              textShadow: state === 'active' && preset.pill ? 'none'
+                : state === 'active' && preset.glow ? `${shadow}, 0 0 ${size / 3}px ${preset.glow}` : undefined
+            }
+            return <span key={i} style={style}>{word.text}</span>
+          })
+          : ['Captions', 'go', 'here'].map((word, i) => <span key={i} style={{ color: i === 1 ? preset.highlight : preset.primary,
+            background: i === 1 ? preset.pill : undefined,
+            padding: preset.pill ? '0 .15em' : undefined, borderRadius: '.15em',
+            textShadow: i === 1 && preset.glow ? `${shadow}, 0 0 ${size / 3}px ${preset.glow}` : undefined }}>{word}</span>)}
       </span>
     </button>
   </div>

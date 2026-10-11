@@ -84,6 +84,8 @@ export interface EditorReview {
 export interface CandidateEdit {
   id: string; title: string; ranges: EditorRange[]; scenes: EditorScene[]
   captions: boolean; caption_preset: string; video_speed: number
+  /** Per-clip caption customisation layered on top of the picked preset. */
+  caption_style?: CaptionStyleOverrides
   status: 'refining' | 'ready' | 'baked' | 'discarded'
   caption_edits: { segment: number; text: string }[]
   /** Source-time intervals where our burned-in captions are hidden. */
@@ -120,6 +122,21 @@ export interface CandidateEdit {
 }
 /** How censored words are processed: caption masking style and speech handling. */
 export interface CensorConfig { words: string[]; captions: 'asterisk' | 'first' | 'off'; audio: 'mute' | 'bleep' | 'off' }
+/** Caption font faces shipped in engine/assets/fonts, by their engine names. */
+export const CAPTION_FONT_FACES = ['Montserrat Black', 'Montserrat ExtraBold', 'Poppins Black', 'Poppins ExtraBold', 'Anton', 'Archivo Black', 'Instrument Serif Italic', 'Plus Jakarta Sans'] as const
+export type CaptionFontFace = (typeof CAPTION_FONT_FACES)[number]
+/** Editor caption customisation: two colour wells, font, size and case. */
+export interface CaptionStyleOverrides {
+  /** Text fill, #rrggbb. */
+  primaryColor: string
+  /** Active-word accent fill, #rrggbb. */
+  highlightColor: string
+  /** One of CAPTION_FONT_FACES. */
+  font: string
+  /** Font size multiplier on the preset's base size, 0.5–2. */
+  sizeScale: number
+  uppercase?: boolean
+}
 export interface EditorCandidate extends CandidateEdit {
   camera_scan?: CameraScan
   /** Engine-owned: 'tracked' = analyzed speaker tracking, 'centered' = analysis unavailable. */
@@ -150,7 +167,9 @@ export interface EditorProject {
 }
 export interface EditorProgress { phase: 'scan' | 'preview' | 'audio' | 'motion'; percent: number
   /** Download phase only: bytes moved so far, the expected total and the current rate. */
-  downloadedBytes?: number; totalBytes?: number; bytesPerSecond?: number }
+  downloadedBytes?: number; totalBytes?: number; bytesPerSecond?: number
+  /** Scan phase only: the video came from the Library's own copy, not the network. */
+  local?: boolean }
 export type EditorOperation = 'save' | 'review' | 'export' | 'export-all' | 'replace-source' | 'scan-cameras' | 'auto-frame' | 'create-project' | 'build-preview' | 'import-audio' | 'motion-render' | 'voice-voices' | 'voice-preview'
 export interface EditorBatch { completed: number; total: number; failed?: number }
 export interface EditorSession {
@@ -176,6 +195,17 @@ export interface EditorProgressSummary {
 export const EDITOR_REVISION_CONFLICT = 'This project changed. Reopen it before saving.'
 /** Main throws this when an automatic run's source is not a re-downloadable URL; the renderer then asks for the file. */
 export const EDITOR_NEEDS_SOURCE = '__editor_needs_source__'
+/** Main throws this when the original video is nowhere on this PC; the renderer asks before any download. */
+export const EDITOR_NEEDS_MATERIAL = '__editor_needs_material__'
+
+/**
+ * The ask that replaces a silent multi-gigabyte download. It names the video and its
+ * length, so the choice is about his file and not about a spinner.
+ */
+export function editorNeedsMaterial(title: string, durationSeconds: number): string {
+  const minutes = Math.max(1, Math.round(durationSeconds / 60))
+  return `Editing works on the full original video, not on the finished reel. "${title}" (${minutes} min) is no longer in your Library, so BridgeClip can't open it from disk.`
+}
 /** Fixed worker failure codes (see bridge/editor_runner.py); no tool output crosses the bridge. */
 export const editorErrorCodes = ['duration', 'geometry', 'audio', 'invalid', 'project_changed', 'invalid_edit', 'not_ready',
   'source_missing', 'source_incompatible', 'render_failed', 'scan_too_long', 'review_unavailable', 'engine_unavailable',
@@ -417,7 +447,7 @@ const byteText = (n: number): string => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB`
 export function editorImportStatus(progress?: EditorProgress | null): { label: string; percent: number | null } {
   if (!progress) return { label: 'Preparing an editable copy from the original video…', percent: null }
   if (progress.phase === 'preview') return { label: `Preparing the editable preview · ${progress.percent}%`, percent: progress.percent }
-  const parts = ['Downloading the original video']
+  const parts = [progress.local ? 'Restoring the original video from your Library' : 'Downloading the original video']
   let percent: number | null = progress.percent
   if (progress.downloadedBytes != null && progress.totalBytes) {
     parts.push(`${byteText(progress.downloadedBytes)} of ${byteText(progress.totalBytes)}`)
@@ -427,10 +457,31 @@ export function editorImportStatus(progress?: EditorProgress | null): { label: s
   return { label: parts.join(' · '), percent }
 }
 
+/**
+ * Cancelling an import can land after minutes of downloading, so say how far the
+ * original video actually got instead of leaving a bare "cancelled".
+ */
+export function importCancelledMessage(progress?: EditorProgress | null): string {
+  const cancelled = editorFailureMessage('create-project', 'cancelled')
+  const { downloadedBytes, totalBytes } = progress ?? {}
+  if (downloadedBytes == null || !totalBytes) return cancelled
+  return `${cancelled} ${byteText(downloadedBytes)} of ${byteText(totalBytes)} of the original video were downloaded before it stopped.`
+}
+
 const fail = (): never => { throw new Error('Invalid editor project') }
 const record = (x: unknown): Record<string, unknown> => x && typeof x === 'object' && !Array.isArray(x) ? x as Record<string, unknown> : fail()
 const num = (x: unknown, lo: number, hi: number): number => typeof x === 'number' && Number.isFinite(x) && x >= lo && x <= hi ? x : fail()
 const str = (x: unknown, max: number): string => typeof x === 'string' && x.length <= max ? x : fail()
+const hexColor = (x: unknown): string => typeof x === 'string' && /^#[0-9a-fA-F]{6}$/.test(x) ? x : fail()
+/** Strict caption style overrides; rejects anything the engine would not render. */
+export function parseCaptionStyle(v: unknown): CaptionStyleOverrides {
+  const o = record(v)
+  const primaryColor = hexColor(o.primaryColor), highlightColor = hexColor(o.highlightColor)
+  if (!(CAPTION_FONT_FACES as readonly string[]).includes(o.font as string)) fail()
+  const sizeScale = num(o.sizeScale, .5, 2)
+  const uppercase = o.uppercase === undefined ? undefined : typeof o.uppercase === 'boolean' ? o.uppercase : fail()
+  return { primaryColor, highlightColor, font: o.font as string, sizeScale, ...(uppercase === undefined ? {} : { uppercase }) }
+}
 /** Display text: clamp to `max` UTF-16 units without splitting a surrogate pair, never reject for length. */
 export function clampText(x: unknown, max: number): string {
   if (typeof x !== 'string') return fail()
@@ -490,6 +541,7 @@ export function parseCandidateEdit(value: unknown, duration: number, transcriptC
   const id = str(v.id, 64); if (!/^[a-zA-Z0-9_-]+$/.test(id)) fail()
   const title = clampText(v.title, 200); if (!title.trim()) fail()
   const caption_preset = str(v.caption_preset, 64); if (!/^[a-z0-9_-]+$/i.test(caption_preset)) fail()
+  const caption_style = v.caption_style === undefined ? undefined : parseCaptionStyle(v.caption_style)
   if (typeof v.captions !== 'boolean') fail()
   const status = v.status === undefined ? 'refining' : v.status
   if (!['refining', 'ready', 'baked', 'discarded'].includes(status as string)) fail()
@@ -582,6 +634,7 @@ export function parseCandidateEdit(value: unknown, duration: number, transcriptC
     })
   }
   return { id, title, ranges, scenes, captions: v.captions as boolean, caption_preset, video_speed: num(v.video_speed, 1, 2),
+    ...(caption_style ? { caption_style } : {}),
     status: status as CandidateEdit['status'], caption_edits, caption_suppression_ranges,
     caption_y: v.caption_y == null ? null : num(v.caption_y, .1, .9),
     caption_x: v.caption_x == null ? null : num(v.caption_x, .1, .9),
@@ -694,9 +747,9 @@ export function assetRefs(project: EditorProject): string[] {
   return [...refs]
 }
 export function candidateEdit(c: CandidateEdit): CandidateEdit {
-  const { id, title, ranges, scenes, captions, caption_preset, video_speed, status, caption_edits, caption_suppression_ranges = [], dismissed_camera_markers,
+  const { id, title, ranges, scenes, captions, caption_preset, caption_style, video_speed, status, caption_edits, caption_suppression_ranges = [], dismissed_camera_markers,
     logo, intro_asset, outro_asset, music, brolls, text_overlays, motion_refs, range_edits, voiceover, cta_badges, audio_gain, speech_denoise, speech_enhance, censor } = c
-  return { id, title, ranges, scenes, captions, caption_preset, video_speed, status, caption_edits, caption_suppression_ranges, caption_y: c.caption_y ?? null, caption_x: c.caption_x ?? null, ...(c.auto_reframe === undefined ? {} : { auto_reframe: c.auto_reframe }), ...(dismissed_camera_markers ? { dismissed_camera_markers } : {}),
+  return { id, title, ranges, scenes, captions, caption_preset, ...(caption_style ? { caption_style } : {}), video_speed, status, caption_edits, caption_suppression_ranges, caption_y: c.caption_y ?? null, caption_x: c.caption_x ?? null, ...(c.auto_reframe === undefined ? {} : { auto_reframe: c.auto_reframe }), ...(dismissed_camera_markers ? { dismissed_camera_markers } : {}),
     ...(logo ? { logo } : {}), ...(intro_asset ? { intro_asset } : {}), ...(outro_asset ? { outro_asset } : {}), ...(music ? { music } : {}), ...(brolls ? { brolls } : {}),
     ...(text_overlays ? { text_overlays } : {}), ...(motion_refs ? { motion_refs } : {}), ...(cta_badges?.length ? { cta_badges } : {}), ...(audio_gain === undefined ? {} : { audio_gain }),
     ...(speech_denoise === undefined ? {} : { speech_denoise }), ...(speech_enhance === undefined ? {} : { speech_enhance }),

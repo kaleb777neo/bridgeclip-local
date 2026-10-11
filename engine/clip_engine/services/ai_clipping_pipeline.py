@@ -14,6 +14,7 @@ import asyncio
 import errno
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -34,11 +35,14 @@ from clip_engine.services.coherence_review import CoherenceReviewer, CoherenceRe
 from clip_engine.services.editorial_context import analyze_reactions, empty_report, repair_context_boundaries
 from clip_engine.services.editorial_vision import EditorialVision
 from clip_engine.services.editorial_review import protect_acknowledgments, review_duplicate_candidates, editorial_summary
+from clip_engine.services.clip_editor import Pacing, estimate_tight_kept_ms
+from clip_engine.services import source_cache
 from clip_engine.services.intelligence_planner import (
     MAX_CLIP_REQUEST_CHARS,
     ClipPlanResponse,
     ClipPlanSegment,
     IntelligencePlannerService,
+    coverage_clip_count,
 )
 from clip_engine.services.memory_monitor import (
     force_gc,
@@ -95,6 +99,15 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
+# Silence before the next sentence that means "different scene" (ad read, jingle,
+# segment change). Measured on broadcast talk shows: within-moment pauses stay
+# under ~2.6 s, while breaks run 4 s and up.
+FLOOR_BREAK_GAP_MS = 4000
+# Widening past this multiple of the planned window means the moment simply was
+# not as long as requested, so it is left short and logged instead of stretched.
+FLOOR_MAX_GROWTH = 2.0
+
+
 SRT_TIME = re.compile(r'(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})\s*--> \s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})')
 SRT_TAGS = re.compile(r'</?[^>]+>')
 
@@ -134,6 +147,58 @@ def _parse_srt(text: str) -> list['TranscriptSegment']:
     return segments
 
 
+def uncovered_gaps(
+    range_start_ms: int,
+    range_end_ms: int,
+    intervals: list[tuple[int, int]],
+    min_gap_ms: int,
+) -> list[tuple[int, int]]:
+    """Intervals of the range that no clip covers, each long enough for one more.
+
+    Coverage planning re-plans exactly these; anything shorter cannot host a
+    minimum-length clip, so it is settlement between neighbours, not a miss.
+    """
+    covered = sorted(
+        (max(range_start_ms, start), min(range_end_ms, end))
+        for start, end in intervals
+        if end > range_start_ms and start < range_end_ms
+    )
+    gaps: list[tuple[int, int]] = []
+    cursor = range_start_ms
+    for start, end in covered:
+        if start > cursor:
+            gaps.append((cursor, start))
+        cursor = max(cursor, end)
+    if range_end_ms > cursor:
+        gaps.append((cursor, range_end_ms))
+    return [(start, end) for start, end in gaps if end - start >= min_gap_ms]
+
+
+def format_duration_estimate(seconds: float) -> str:
+    """A short, honest human estimate: 'under a minute', '4 min', '1 h 20 min'."""
+    if seconds < 45:
+        return "under a minute"
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, remaining = divmod(minutes, 60)
+    return f"{hours} h {remaining:02d} min" if remaining else f"{hours} h"
+
+
+def pace_eta_seconds(started_at: float, finished: int, total: int) -> Optional[float]:
+    """Seconds left at the observed wall-clock pace; None before data or at the end.
+
+    Throughput-based (finished / elapsed) rather than per-clip averages, so the
+    estimate stays correct no matter how many renders run in parallel.
+    """
+    if finished <= 0 or finished >= total or total <= 1:
+        return None
+    elapsed = time.monotonic() - started_at
+    if elapsed <= 0:
+        return None
+    return elapsed / finished * (total - finished)
+
+
 @dataclass
 class ClippingJobRequest:
     """Request to process a video for AI clipping."""
@@ -144,6 +209,9 @@ class ClippingJobRequest:
     owner_user_id: Optional[str] = None
     max_clips: Optional[int] = None
     auto_clip_count: bool = True
+    # Full-coverage extraction: every self-contained moment in the range, not
+    # only the highest-scoring ones; duplicates still drop.
+    coverage: bool = False
     # Explicit bounds; selected duration_ranges take precedence and the
     # planner falls back to 15-90 s (see resolve_clip_duration_bounds).
     min_clip_duration_seconds: Optional[int] = None
@@ -298,6 +366,7 @@ class AIClippingPipeline:
         editorial_service = JevService.from_settings(self.settings, required=request.workflow == 'review')
         coherence_service = JevService(self.settings.openrouter_api_key if jev_enabled else '', max_requests=256, token_budget=1536000)
         work_dir = os.path.join(self.settings.temp_directory, job_id)
+        download_result = None
         stage_timings: dict[str, float] = {}
         stage_memory_mb: dict[str, float] = {}
         clip_render_durations_seconds: list[float] = []
@@ -485,10 +554,20 @@ class AIClippingPipeline:
 
             # Step 3: Plan clips using AI
             current_stage = "planning"
-            self._update_progress(
-                job_id, JobStatus.PLANNING, 30,
-                "Finding complete ideas near your preferred range..." if jev_enabled else "Planning viral clips...",
-            )
+            planning_message = "Finding complete ideas near your preferred range..." if jev_enabled else "Planning viral clips..."
+            if request.coverage and request.workflow != 'captions-only':
+                # Scope up front: the tiling math says what full coverage means here.
+                coverage_seconds = ((effective_end_time if effective_end_time is not None else video_duration)
+                                    - (request.start_time_seconds or 0))
+                expected = coverage_clip_count(
+                    coverage_seconds, request.duration_ranges, request.max_clips,
+                    self.settings.coverage_max_clips, self.settings.min_clips,
+                )
+                planning_message = (
+                    f"Planning full coverage: about {expected} clip{'s' if expected != 1 else ''} "
+                    f"from {format_duration_estimate(coverage_seconds)} of material..."
+                )
+            self._update_progress(job_id, JobStatus.PLANNING, 30, planning_message)
             stage_start = time.perf_counter()
             edit_audit = {'version': 1, 'title': download_result.metadata.title,
                 'source_context': source_context,
@@ -520,6 +599,7 @@ class AIClippingPipeline:
                 aspect_ratio=request.aspect_ratio,
                 jev_enabled=jev_enabled,
                 clip_request=request.clip_request,
+                coverage=request.coverage,
             )
             clip_plan = await self.intelligence_planner.plan_clips(**planning_args) if request.workflow != 'captions-only' else None
             if clip_plan is None:
@@ -536,6 +616,14 @@ class AIClippingPipeline:
                 logger.info('Captions-only: one whole-range segment, planning skipped')
             edit_audit['planner'] = getattr(self.intelligence_planner, 'audit', {'requests': []})
             stage_timings["planning"] = time.perf_counter() - stage_start
+            if request.coverage and clip_plan.segments and request.workflow != 'captions-only':
+                # Full coverage: fill what the first pass missed before selection.
+                preferred_end_ms = round(
+                    (effective_end_time if effective_end_time is not None else video_duration) * 1000)
+                clip_plan.segments = await self._coverage_top_up(
+                    clip_plan.segments, planning_args, request, transcription_result,
+                    round(video_duration * 1000), preferred_end_ms, job_id)
+                clip_plan.total_clips = len(clip_plan.segments)
             logger.info(f"Planned {len(clip_plan.segments)} clips")
             if not clip_plan.segments:
                 edit_audit['outcome'] = 'no_candidates'
@@ -573,7 +661,14 @@ class AIClippingPipeline:
                 return ClippingJobResult(job_id=job_id, status=JobStatus.COMPLETED, output=output,
                     processing_time_seconds=time.time() - start_time)
             accepted = []
-            limit = getattr(self.intelligence_planner, 'discovery_limit', None) or request.max_clips or self.settings.max_clips_absolute
+            # Full coverage sizes itself by tiling; only best-moments keeps the tight cap.
+            clip_ceiling = self.settings.coverage_max_clips if request.coverage else self.settings.max_clips_absolute
+            if request.coverage:
+                # The gap top-up already enforced this ceiling while filling;
+                # the planner's last sub-request count is not the job's limit.
+                limit = request.max_clips or clip_ceiling
+            else:
+                limit = getattr(self.intelligence_planner, 'discovery_limit', None) or request.max_clips or clip_ceiling
             pending = clip_plan.segments
             if request.workflow == 'captions-only':
                 # The single whole-range segment renders as planned.
@@ -664,6 +759,18 @@ class AIClippingPipeline:
                 save_edit_audit()
                 raise CoherenceRejected(no_approved_clips_message([entry['report'] for entry in edit_audit['candidates']]))
 
+            # Widening happens before the plan is written so plan.json, the
+            # render and the editor all agree on the clip windows.
+            floor_bounds = resolve_clip_duration_bounds(
+                request.duration_ranges, request.min_clip_duration_seconds, request.max_clip_duration_seconds,
+            )
+            self._hold_pacing_floor(
+                clip_plan.segments, transcription_result.segments, request,
+                floor_bounds[0], floor_bounds[1],
+                is_longform(request.aspect_ratio, floor_bounds[0]),
+                round(video_duration * 1000),
+            )
+
             plan_data = {
                 "segments": [asdict(s) for s in clip_plan.segments],
                 "total_clips": clip_plan.total_clips,
@@ -708,6 +815,12 @@ class AIClippingPipeline:
             render_fractions = {}
             finished_renders = set()
             last_render_update = [0.0]
+            render_started_at = time.monotonic()
+
+            def render_eta_suffix() -> str:
+                eta = pace_eta_seconds(render_started_at, clips_finished, total_clips)
+                return f" — about {format_duration_estimate(eta)} left" if eta is not None else ""
+
             def render_progress(i, detail, percent):
                 def report():
                     if i in finished_renders: return
@@ -718,7 +831,7 @@ class AIClippingPipeline:
                     last_render_update[0] = now
                     fraction = (clips_finished + sum(render_fractions.values())) / total_clips
                     self._update_progress(job_id, JobStatus.RENDERING, 50 + 40 * fraction,
-                        f'Clip {i + 1} of {total_clips}: {detail}', clips_finished, total_clips,
+                        f'Clip {i + 1} of {total_clips}: {detail}{render_eta_suffix()}', clips_finished, total_clips,
                         stage_percent=100 * fraction, completed=clips_finished, total=total_clips, unit='clips')
                 loop.call_soon_threadsafe(report)
 
@@ -735,7 +848,7 @@ class AIClippingPipeline:
                     render_fractions.pop(i, None)
                     self._update_progress(
                         job_id, JobStatus.RENDERING, 50 + 40 * clips_finished / total_clips,
-                        f"Rendered {clips_finished} of {total_clips} clip{'s' if total_clips != 1 else ''}",
+                        f"Rendered {clips_finished} of {total_clips} clip{'s' if total_clips != 1 else ''}{render_eta_suffix()}",
                         clips_completed=clips_finished, total_clips=total_clips,
                         stage_percent=100 * clips_finished / total_clips, completed=clips_finished, total=total_clips, unit='clips',
                     )
@@ -1285,6 +1398,13 @@ class AIClippingPipeline:
             # Completed local clips and JSON have already been copied to the
             # output directory. The work directory can contain a downloaded
             # source and intermediate audio/video, so remove it in both modes.
+            # The download itself moves to the Library's source cache first, so
+            # "Edit this" restores the video from disk instead of fetching it again.
+            if download_result is not None and source_cache.is_remote_url(request.video_url):
+                try:
+                    source_cache.retain(self.settings.local_output_dir, request.video_url, download_result.video_path)
+                except Exception as e:
+                    logger.warning(f"Could not keep the source video for editing: {e}")
             if os.path.isdir(work_dir):
                 try:
                     shutil.rmtree(work_dir)
@@ -1296,6 +1416,107 @@ class AIClippingPipeline:
             self._current_external_job_id = None
             self._current_owner_user_id = None
 
+    # Full coverage stops after this many gap-filling passes, and plans at most
+    # this many gaps per pass, so a weak model cannot turn one job into a loop.
+    MAX_COVERAGE_PASSES = 3
+    COVERAGE_GAPS_PER_PASS = 3
+
+    async def _coverage_top_up(
+        self,
+        kept: list[ClipPlanSegment],
+        planning_args: dict,
+        request: ClippingJobRequest,
+        transcription_result: TranscriptionResult,
+        video_end_ms: int,
+        preferred_end_ms: int,
+        job_id: str,
+    ) -> list[ClipPlanSegment]:
+        """Fill the moments the first planning pass missed.
+
+        One model answer rarely tiles a whole episode, so each uncovered gap
+        that could still host a minimum-length clip is planned directly from
+        the transcript it contains — a far smaller ask that even local models
+        answer well. New clips enter only when they overlap nothing kept, and
+        the loop ends when a pass adds nothing, the gaps run out or the pass
+        budget does.
+        """
+        min_duration, max_duration = resolve_clip_duration_bounds(
+            request.duration_ranges,
+            request.min_clip_duration_seconds,
+            request.max_clip_duration_seconds,
+        )
+        target = (min_duration + max_duration) / 2
+        range_start_ms = int((request.start_time_seconds or 0) * 1000)
+        range_end_ms = int(min(preferred_end_ms, video_end_ms))
+        limit = request.max_clips or (
+            self.settings.coverage_max_clips if request.coverage else self.settings.max_clips_absolute)
+        segments = transcription_result.segments
+        for pass_index in range(self.MAX_COVERAGE_PASSES):
+            if len(kept) >= limit:
+                break
+            gaps = uncovered_gaps(
+                range_start_ms, range_end_ms,
+                [(c.start_time_ms, c.end_time_ms) for c in kept],
+                min_duration * 1000 + 2000,
+            )
+            if not gaps:
+                break
+            self._update_progress(job_id, JobStatus.PLANNING, 30,
+                f"Covering missed moments (pass {pass_index + 1} of {self.MAX_COVERAGE_PASSES})...",
+                stage_id="planning")
+            added = False
+            biggest_first = sorted(gaps, key=lambda gap: gap[1] - gap[0], reverse=True)
+            for gap_start, gap_end in biggest_first[:self.COVERAGE_GAPS_PER_PASS]:
+                if len(kept) >= limit:
+                    break
+                window = [s for s in segments
+                          if s.end_time_ms > gap_start and s.start_time_ms < gap_end]
+                if not window:
+                    continue
+                wanted = max(1, math.ceil((gap_end - gap_start) / 1000 / target))
+                logger.info(
+                    "Coverage top-up: planning gap %.1fs-%.1fs for up to %d clip(s)",
+                    gap_start / 1000, gap_end / 1000, wanted,
+                )
+                # A gap sub-request must not rewrite the job's clip ceiling:
+                # plan_clips stores its per-request count as discovery_limit,
+                # and the last small gap ("up to 1 clip") would become the
+                # job's selection limit otherwise.
+                saved_ceiling = getattr(self.intelligence_planner, 'discovery_limit', None)
+                try:
+                    extra = await self.intelligence_planner.plan_clips(**{
+                        **planning_args,
+                        'transcript_result': TranscriptionResult(
+                            segments=window,
+                            full_text=" ".join(s.text for s in window),
+                            language=getattr(transcription_result, 'language', None),
+                            duration_seconds=(gap_end - gap_start) / 1000,
+                            provider=getattr(transcription_result, 'provider', 'local'),
+                        ),
+                        'start_time_seconds': gap_start / 1000,
+                        'end_time_seconds': gap_end / 1000,
+                        'max_clips': min(wanted, limit - len(kept)),
+                        'auto_clip_count': False,
+                        # Gap filling is plain planning; review applies downstream.
+                        'jev_enabled': False,
+                        'coverage': True,
+                    })
+                except Exception as error:  # One weak gap must not sink the job.
+                    logger.warning("Coverage top-up pass failed on a gap: %s", error)
+                    continue
+                finally:
+                    self.intelligence_planner.discovery_limit = saved_ceiling
+                for candidate in extra.segments:
+                    if any(overlaps([candidate.start_time_ms, candidate.end_time_ms],
+                                    [c.start_time_ms, c.end_time_ms]) for c in kept):
+                        continue
+                    kept.append(candidate)
+                    added = True
+            if not added:
+                break
+        kept.sort(key=lambda c: c.start_time_ms)
+        logger.info("Coverage planning complete: %d clip(s) after top-up", len(kept))
+        return kept[:limit]
 
     def _get_local_output_dir(self, job_id: str) -> str:
         """Get the local output directory for a job, creating it if needed."""
@@ -1443,6 +1664,87 @@ class AIClippingPipeline:
                 continue
             filtered.append(seg)
         return filtered
+
+    def _hold_pacing_floor(
+        self,
+        segments: list[ClipPlanSegment],
+        transcript,
+        request: ClippingJobRequest,
+        min_seconds: int,
+        max_seconds: int,
+        longform: bool,
+        video_duration_ms: int,
+    ) -> None:
+        """Grow windows that tight pacing would drop under the requested minimum.
+
+        The planner sizes the raw window, but pacing then removes the dead air
+        inside it, so a 31 s plan can ship 23 s. Extending sentence by sentence
+        keeps the length promise without touching any cut. It stops at the
+        requested maximum, the next clip, the end of the video, twice the planned
+        window, or a scene break - and a clip still short of the floor is logged
+        rather than stretched into someone else's segment.
+        """
+        if request.pacing != Pacing.TIGHT or min_seconds <= 0 or not transcript:
+            return
+        ordered = sorted(transcript, key=lambda seg: seg.start_time_ms)
+        # Speeding the clip up shortens the output, so the content has to be
+        # that much longer to still land on the floor.
+        floor_ms = min_seconds * 1000 * max(1.0, request.video_speed)
+        # Log in the order the clips are numbered in the job, not in window order.
+        clip_numbers = {id(segment): number for number, segment in enumerate(segments)}
+        for segment in sorted(segments, key=lambda s: s.start_time_ms):
+            index = clip_numbers[id(segment)]
+            start_ms = segment.start_time_ms
+            planned_ms = segment.end_time_ms - start_ms
+            next_clip_ms = min(
+                (other.start_time_ms for other in segments
+                 if other is not segment and other.start_time_ms > segment.end_time_ms),
+                default=video_duration_ms,
+            )
+            # A moment that needs doubling to reach the floor was never a moment
+            # of that length, so growth also stops at twice the planned window.
+            ceiling_ms = min(
+                segment.start_time_ms + max_seconds * 1000,
+                segment.start_time_ms + planned_ms * FLOOR_MAX_GROWTH,
+                next_clip_ms, video_duration_ms,
+            )
+            window = self._filter_transcript_for_clip(ordered, start_ms, segment.end_time_ms)
+            kept = estimate_tight_kept_ms(window, start_ms, segment.end_time_ms - start_ms, longform)
+            grew_to = segment.end_time_ms
+            cursor = 0
+            stopped_at_break = False
+            while kept < floor_ms and ceiling_ms - grew_to > 250:
+                while cursor < len(ordered) and ordered[cursor].end_time_ms <= grew_to + 50:
+                    cursor += 1
+                if cursor >= len(ordered):
+                    break
+                candidate = ordered[cursor]
+                if cursor and candidate.start_time_ms > grew_to and \
+                        candidate.start_time_ms - ordered[cursor - 1].end_time_ms >= FLOOR_BREAK_GAP_MS:
+                    # Silence this long is a scene break (ad read, jingle, next
+                    # segment), not more of the same moment.
+                    stopped_at_break = True
+                    break
+                grew_to = min(candidate.end_time_ms, ceiling_ms)
+                window = self._filter_transcript_for_clip(ordered, start_ms, grew_to)
+                kept = estimate_tight_kept_ms(window, start_ms, grew_to - start_ms, longform)
+                if grew_to >= ceiling_ms:
+                    break
+            if grew_to > segment.end_time_ms:
+                logger.info(
+                    "Clip %d window widened %.1fs -> %.1fs so tight pacing still delivers the %ds minimum "
+                    "(estimated output %.1fs)",
+                    index + 1, (segment.end_time_ms - start_ms) / 1000, (grew_to - start_ms) / 1000,
+                    min_seconds, kept / 1000,
+                )
+                segment.end_time_ms = grew_to
+            elif kept < floor_ms:
+                logger.warning(
+                    "Clip %d stays under the %ds minimum after pacing (%.1fs estimated): %s",
+                    index + 1, min_seconds, kept / 1000,
+                    "the next speech starts after a scene break" if stopped_at_break
+                    else f"no more speech before the {max_seconds}s ceiling",
+                )
 
     async def _diagnostic_heartbeat(self):
         from dataclasses import replace

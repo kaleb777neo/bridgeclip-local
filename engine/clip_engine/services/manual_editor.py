@@ -18,6 +18,7 @@ from clip_engine.services.jev_service import JevService
 from clip_engine.services.layout_analyzer import Box, ClipLayoutPlan, ShotLayout, LayoutType, compact_focus_path
 from clip_engine.services.layout_renderer import shot_views
 from clip_engine.services.rendering_service import RenderRequest, RenderingService, preview_duration_ok
+from clip_engine.services import source_cache
 from clip_engine.services.transcription_service import TranscriptSegment, TranscriptWord
 from clip_engine.services.media_process import MEDIA_INPUT_OPTIONS, PROBE_TIMEOUT_SECONDS, run_media, validate_video_dimensions
 
@@ -88,6 +89,37 @@ def source_info(path):
                 'audio': any(s['codec_type'] == 'audio' for s in data['streams'])}
     except Exception as error:
         raise SourceReplacementError('invalid') from error
+
+
+def reuse_local_source(library, url, destination, report=None):
+    """Take the source from disk instead of the network when it is already here.
+
+    Looks at this run's own completed import first, then the copy the job kept in the
+    Library's cache, then a sibling run that imported the same video. A candidate that
+    doesn't probe is dropped, so a truncated file can never pass as the video.
+    """
+    if destination.is_symlink():
+        return False
+    candidates = (destination, source_cache.entry_path(library, url), source_cache.library_copy(library, url))
+    for path in candidates:
+        if path is None or not source_cache.is_usable(path):
+            continue
+        try:
+            source_info(path)
+        except Exception:
+            if path == destination:
+                try:
+                    os.remove(str(destination))
+                except OSError:
+                    pass
+            continue
+        if path != destination and not source_cache.copy_into(path, destination,
+                lambda copied, size: report and report('scan', 100 * copied / max(1, size), local=True)):
+            continue
+        if report:
+            report('scan', 100, local=True)
+        return True
+    return False
 
 
 async def replace_source(run, project, source_id):
@@ -431,10 +463,12 @@ def transcript_row(segment, duration):
 async def create_project(run, config, progress):
     """Reconnect an automatic run's original video and rebuild it as an editable project.
 
-    Automatic runs render clips then delete the downloaded source, so the editor has
-    nothing to reframe or re-caption. This writes the same three artifacts a review run
-    produces (editor-source.mp4, editor-preview.mp4, editor-project.json) and marks each
-    finished clip as already baked, so "Edit this clip" focuses its candidate.
+    Automatic runs render clips and keep their download in the Library's source cache,
+    and an imported run keeps the whole original, so this normally restores the material
+    from disk; only a run whose video was never kept, and is not in the Library anywhere,
+    re-fetches it. It writes the same three artifacts a review run produces
+    (editor-source.mp4, editor-preview.mp4, editor-project.json) and marks each finished
+    clip as already baked, so "Edit this clip" focuses its candidate.
 
     With `focus_clip` (a clip index) the preview covers only that reel's window plus
     padding — minutes of full-source transcoding become seconds. The window is recorded
@@ -456,33 +490,40 @@ async def create_project(run, config, progress):
     source = config.get('source') or {}
     kind = source.get('kind')
     if kind == 'url':
-        # A stray source from an interrupted import is overwritten by the download.
         if destination.is_symlink():
             raise EditorError('invalid', 'The editor source is not a regular file')
-        from clip_engine.services.video_downloader import VideoDownloaderService
-        downloader = VideoDownloaderService()
-        last = {'at': None, 'bytes': 0}
+        library = config.get('library')
+        # The bytes are usually already here: this run's own finished import, or the
+        # copy the job that made these clips downloaded and used to throw away.
+        if not await asyncio.to_thread(reuse_local_source, library, source.get('url'), destination, report):
+            if not config.get('allow_download'):
+                # Nothing local, and nobody agreed to a download. "Edit this" must not
+                # quietly pull gigabytes; main asks the user and asks again with consent.
+                raise EditorError('source_missing', 'The original video is not in the Library')
+            from clip_engine.services.video_downloader import VideoDownloaderService
+            downloader = VideoDownloaderService()
+            last = {'at': None, 'bytes': 0}
 
-        def download_progress(detail, percent, downloaded=None, total=None):
-            # Bytes and rate feed the import waiting screen's progress bar.
-            extra = {}
-            now = time.monotonic()
-            if downloaded is not None:
-                extra['downloaded_bytes'] = int(downloaded)
-                if last['at'] is not None and downloaded >= last['bytes'] and now - last['at'] > .02:
-                    extra['speed'] = int((downloaded - last['bytes']) / (now - last['at']))
-                last.update(at=now, bytes=downloaded)
-            if total:
-                extra['total_bytes'] = int(total)
-            report('scan', percent if percent is not None else 0, **extra)
+            def download_progress(detail, percent, downloaded=None, total=None):
+                # Bytes and rate feed the import waiting screen's progress bar.
+                extra = {}
+                now = time.monotonic()
+                if downloaded is not None:
+                    extra['downloaded_bytes'] = int(downloaded)
+                    if last['at'] is not None and downloaded >= last['bytes'] and now - last['at'] > .02:
+                        extra['speed'] = int((downloaded - last['bytes']) / (now - last['at']))
+                    last.update(at=now, bytes=downloaded)
+                if total:
+                    extra['total_bytes'] = int(total)
+                report('scan', percent if percent is not None else 0, **extra)
 
-        downloader.progress_callback = download_progress
-        try:
-            await downloader.download_video(url=source['url'], output_dir=str(run), output_filename='editor-source.mp4')
-        except Exception as error:
-            raise EditorError('source_missing', 'Could not re-download the original video') from error
-        if not destination.is_file():
-            raise EditorError('source_missing', 'The original video download produced no file')
+            downloader.progress_callback = download_progress
+            try:
+                await downloader.download_video(url=source['url'], output_dir=str(run), output_filename='editor-source.mp4')
+            except Exception as error:
+                raise EditorError('source_missing', 'Could not re-download the original video') from error
+            if not destination.is_file():
+                raise EditorError('source_missing', 'The original video download produced no file')
     elif kind == 'file':
         # Main already streamed the chosen video into editor-source.mp4 under the run lock.
         if not destination.is_file() or destination.is_symlink():
@@ -1142,6 +1183,10 @@ def validate_candidate(c, duration, transcript_count=100000):
         raise ValueError('Invalid caption position')
     if c.get('caption_x') is not None and not number(c['caption_x'], .1, .9):
         raise ValueError('Invalid caption position')
+    # Caption style overrides: applying them onto a scratch style validates every value.
+    if c.get('caption_style') is not None:
+        from clip_engine.config import CaptionStyle, apply_caption_style_overrides
+        apply_caption_style_overrides(CaptionStyle(), c['caption_style'])
     if c.get('status', 'refining') not in ('refining', 'ready', 'baked', 'discarded'):
         raise ValueError('Invalid clip status')
     suppressed = c.get('caption_suppression_ranges', [])
@@ -1632,8 +1677,11 @@ def editor_bake_layers(run, c):
 
 async def export_clip(run, project, c, output, source, transcript):
     """Render one ready candidate and append it to the library's job output."""
-    from clip_engine.config import get_caption_preset
+    from clip_engine.config import apply_caption_style_overrides, get_caption_preset
     render_transcript = caption_transcript(transcript, c.get('caption_edits', []))
+    caption_style = get_caption_preset(c['caption_preset'])
+    if c.get('caption_style'):
+        caption_style = apply_caption_style_overrides(caption_style, c['caption_style'])
     next_index = output.get('next_clip_index', 0)
     if type(next_index) is not int or not 0 <= next_index <= 1000:
         raise EditorError('invalid_edit', 'Invalid export sequence')
@@ -1652,7 +1700,7 @@ async def export_clip(run, project, c, output, source, transcript):
     with tempfile.TemporaryDirectory(prefix='.editor-export-', dir=run) as work, failure_code('render_failed'):
         result = await renderer.render_clip(RenderRequest(video_path=source, output_path=str(Path(work) / 'clip.mp4'),
             start_time_ms=a, end_time_ms=b, source_width=project['width'], source_height=project['height'],
-            transcript_segments=render_transcript, include_captions=c['captions'], caption_style=get_caption_preset(c['caption_preset']),
+            transcript_segments=render_transcript, include_captions=c['captions'], caption_style=caption_style,
             caption_suppression_ranges_ms=[tuple(interval) for interval in c.get('caption_suppression_ranges', [])],
             caption_y=c.get('caption_y'),
             caption_x=c.get('caption_x'),

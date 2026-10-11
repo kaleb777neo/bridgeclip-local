@@ -181,7 +181,7 @@ export function SettingsPage({ showUpdates = 0 }: { showUpdates?: number }): Rea
                   onRemove={() => void keys.remove('nvidiaApiKey')}
                   onBlur={() => void keys.persist()}
                   placeholder="nvapi-…"
-                  description="Free clip planning on build.nvidia.com (~1000 credits, 40 requests per minute). Pick the NVIDIA provider in the AI provider section above to use it."
+                  description="Free clip planning on build.nvidia.com (~1000 credits, 40 requests per minute). Pick the NVIDIA provider in the Local AI section above to use it."
                   getKeyUrl={PROVIDER_LINKS.nvidia}
                 />
               </KeyRow>
@@ -207,8 +207,8 @@ export function SettingsPage({ showUpdates = 0 }: { showUpdates?: number }): Rea
           <Section id="vocabulary">
             <PanelHeader
               icon={<IconTile><BookA /></IconTile>}
-              title="Custom vocabulary"
-              description="Names, products and jargon that transcription should spell exactly, one per line. Used for captions and generated post metadata."
+              title="Brand vocabulary"
+              description="Names, products and jargon that transcription should spell exactly. Used for captions and generated post metadata."
               action={vocabularyTerms > 0 && <Badge className="font-mono tabular">{vocabularyTerms} term{vocabularyTerms === 1 ? '' : 's'}</Badge>}
             />
             <VocabularyField value={customVocabulary} onCommit={(value) => commit({ customVocabulary: value })} />
@@ -454,12 +454,29 @@ function OutputFolder({ value, onCommit }: { value: string; onCommit: (dir: stri
   )
 }
 
+/** Why a saved term is never sent to the transcriber (settings-store.ts drops it silently). */
+function unusableTerm(term: string, index: number): string | null {
+  if (index >= 200) return 'Only the first 200 terms are sent to the transcriber.'
+  if (term.split(' ').length > 5) return 'More than five words, so the transcriber never receives it.'
+  if (/[<>{}[\]\\]/.test(term)) return 'It contains a character the transcriber cannot take.'
+  if (term.includes(',')) return 'The comma makes the transcriber read this as two separate terms.'
+  return null
+}
+
 function VocabularyField({ value, onCommit }: { value: string; onCommit: (value: string) => void }): React.JSX.Element {
   const terms = value.split('\n').map((term) => term.trim()).filter(Boolean)
   const [draft, setDraft] = useState('')
+  const [rejected, setRejected] = useState<string | null>(null)
+  // The clipping engine drops a term it cannot use, and the field had already
+  // reported Saved. The same limits are enforced here, with the reason shown.
   const add = (): void => {
     const term = draft.replace(/\s+/g, ' ').trim().slice(0, 49)
     if (!term) return
+    if (term.split(' ').length > 5) { setRejected(`“${term}” is more than five words. Use a word or a short name.`); return }
+    if (/[<>{}[\]\\]/.test(term)) { setRejected(`“${term}” cannot contain < > { } [ ] or a backslash.`); return }
+    if (term.includes(',')) { setRejected(`“${term}” would be saved as two separate terms. Remove the comma.`); return }
+    if (terms.length >= 200) { setRejected('The transcriber uses the first 200 terms. Remove one before adding this.'); return }
+    setRejected(null)
     setDraft('')
     if (terms.some((kept) => kept.toLocaleLowerCase() === term.toLocaleLowerCase())) return
     onCommit([...terms, term].join('\n'))
@@ -469,12 +486,13 @@ function VocabularyField({ value, onCommit }: { value: string; onCommit: (value:
     <div className="mt-4">
       {terms.length > 0 && (
         <div className="mb-2 flex flex-wrap gap-2" aria-label="Brand vocabulary terms">
-          {terms.map((term, index) => (
-            <span key={`${term}-${index}`} className="inline-flex items-center gap-1 rounded-full border border-white/15 bg-white/5 px-3 py-1 text-xs">
+          {terms.map((term, index) => {
+            const unusable = unusableTerm(term, index)
+            return <span key={`${term}-${index}`} title={unusable ?? undefined} className={cn('inline-flex items-center gap-1 rounded-full border border-white/15 bg-white/5 px-3 py-1 text-xs', unusable && 'border-danger/60 text-danger')}>
               {term}
               <button type="button" aria-label={`Remove ${term}`} className="text-ink-subtle hover:text-ink" onClick={() => remove(index)}>×</button>
             </span>
-          ))}
+          })}
         </div>
       )}
       <div className="flex gap-2">
@@ -484,11 +502,12 @@ function VocabularyField({ value, onCommit }: { value: string; onCommit: (value:
           aria-label="Add proper noun to the Brand Vocabulary"
           value={draft}
           maxLength={49}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => { setDraft(e.target.value); setRejected(null) }}
           onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add() } }}
         />
         <button type="button" className="rounded-md border border-white/15 px-3 py-2 text-sm hover:bg-white/10" onClick={add}>Add to Brand Vocabulary</button>
       </div>
+      {rejected && <p role="alert" className="mt-2 px-1 text-xs text-danger">{rejected}</p>}
       <p className="mt-2 px-1 text-xs text-ink-subtle">{terms.length} term{terms.length === 1 ? '' : 's'} · up to five words each. Applies to new transcriptions; generated metadata uses it right away.</p>
     </div>
   )

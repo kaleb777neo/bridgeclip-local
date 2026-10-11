@@ -6,6 +6,8 @@ for consistency and simplicity.
 """
 
 import os
+import re
+from copy import copy
 from functools import lru_cache
 from typing import List, Literal, Optional
 
@@ -312,6 +314,63 @@ def get_caption_preset(preset_id: str) -> CaptionStyle:
         raise ValueError(f"Unknown caption preset: {preset_id}. Valid presets: {valid_presets}")
 
     return builder()
+
+
+# Font faces the editor may switch captions to; every name ships in assets/fonts.
+CAPTION_STYLE_FONTS = frozenset({
+    "Montserrat Black", "Montserrat ExtraBold", "Poppins Black", "Poppins ExtraBold",
+    "Anton", "Archivo Black", "Instrument Serif Italic", "Plus Jakarta Sans",
+})
+
+_HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
+
+
+def apply_caption_style_overrides(style: CaptionStyle, overrides: dict) -> CaptionStyle:
+    """Validate editor caption overrides and return ``style`` with them applied.
+
+    The accent colour lands on the active word and, when the preset carries its
+    accent as a pill, glow or emphasis colour, on that carrier too — except the
+    pill, whose word keeps the text colour so it stays readable. Raises
+    ``ValueError`` on anything the renderer could not safely consume.
+    """
+    if not isinstance(overrides, dict):
+        raise ValueError("Invalid caption style")
+
+    def color(value: object, field: str) -> str:
+        if not isinstance(value, str) or _HEX_COLOR.fullmatch(value) is None:
+            raise ValueError(f"Invalid caption style {field}")
+        return value
+
+    primary = color(overrides.get("primaryColor"), "colour")
+    highlight = color(overrides.get("highlightColor"), "colour")
+    font = overrides.get("font")
+    if not isinstance(font, str) or font not in CAPTION_STYLE_FONTS:
+        raise ValueError("Invalid caption style font")
+    scale = overrides.get("sizeScale")
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not 0.5 <= scale <= 2:
+        raise ValueError("Invalid caption style size")
+    uppercase = overrides.get("uppercase")
+    if uppercase is not None and not isinstance(uppercase, bool):
+        raise ValueError("Invalid caption style case")
+
+    out = copy(style)
+    out.primary_color = primary
+    out.font_name = font
+    # The italic-only serif face carries its slant; every other bundled face is upright.
+    out.italic = font == "Instrument Serif Italic"
+    out.font_size = max(24, min(220, round(style.font_size * scale)))
+    if uppercase is not None:
+        out.uppercase = uppercase
+    if style.highlight_box_color is not None:
+        out.highlight_box_color = highlight
+        out.highlight_color = primary
+    else:
+        out.highlight_color = highlight
+    if style.glow_color is not None:
+        out.glow_color = highlight
+    if style.emphasis_color is not None:
+        out.emphasis_color = highlight
+    return out
 
 
 def get_available_presets() -> list[dict]:
@@ -1248,6 +1307,13 @@ class Settings(BaseSettings):
     def max_clips_absolute(self) -> int:
         """Hard cap on maximum clips to prevent excessive processing."""
         return 100
+
+    @property
+    def coverage_max_clips(self) -> int:
+        """Full-coverage ceiling. The tiling math (duration / target length)
+        sizes the request, so multi-hour sources are not artificially cut;
+        this only guards against pathological values."""
+        return 1000
 
     # Sentence boundary snapping configuration
     @property

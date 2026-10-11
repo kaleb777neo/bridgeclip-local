@@ -314,7 +314,7 @@ async def run(config: dict) -> bool:
         emit({"type": "error", "message": "The bundled clipping engine is incompatible with this BridgeClip version."})
         return False
 
-    from clip_engine.config import get_settings, get_caption_preset
+    from clip_engine.config import get_settings, get_caption_preset, apply_caption_style_overrides
     from clip_engine.services.ai_clipping_pipeline import (
         AIClippingPipeline,
         ClippingJobRequest,
@@ -352,6 +352,11 @@ async def run(config: dict) -> bool:
                 caption_style = get_caption_preset("pop")
             except ValueError:
                 pass
+        if caption_style is not None and isinstance(config.get("caption_style"), dict):
+            try:
+                caption_style = apply_caption_style_overrides(caption_style, config["caption_style"])
+            except ValueError:
+                pass
 
     duration_ranges = config.get("duration_ranges")
 
@@ -366,6 +371,7 @@ async def run(config: dict) -> bool:
         job_id=config.get("job_id"),
         max_clips=config.get("max_clips"),
         auto_clip_count=config.get("auto_clip_count", True),
+        coverage=config.get("coverage", False),
         duration_ranges=duration_ranges,
         aspect_ratio=config.get("aspect_ratio", "9:16"),
         aspect_ratios=config.get("aspect_ratios"),
@@ -382,7 +388,6 @@ async def run(config: dict) -> bool:
         banner_channel_url=config.get("banner_channel_url"),
         keyterms=config.get("keyterms") or None,
         srt_path=config.get("srt_path"),
-        subject=config.get("subject"),
         clip_request=config.get("clip_request"),
         logo=config.get("logo"),
         intro=config.get("intro"),

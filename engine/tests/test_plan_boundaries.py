@@ -8,6 +8,7 @@ complete excerpts instead (TestJevParseBoundaries). No network calls.
 
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +16,8 @@ import pytest
 from clip_engine.config import Settings, resolve_clip_duration_bounds
 from clip_engine.services import ai_clipping_pipeline as pipeline_module
 from clip_engine.services.ai_clipping_pipeline import AIClippingPipeline, ClippingJobRequest, JobStatus
-from clip_engine.services.intelligence_planner import IntelligencePlannerService
+from clip_engine.services.clip_editor import Pacing, estimate_tight_kept_ms
+from clip_engine.services.intelligence_planner import ClipPlanSegment, IntelligencePlannerService
 from clip_engine.services.rendering_service import RenderingService
 from clip_engine.services.transcription_service import (
     TranscriptSegment,
@@ -531,3 +533,120 @@ class TestJevOffPipeline:
         # The cued pause just before the clip pulls its setup line back in.
         assert request.start_time_ms == tr[31].start_time_ms
         assert request.editorial_context["protected_source"]
+
+
+def _floor(pipeline, segments, transcript, *, min_seconds=30, max_seconds=300, request=None, video_ms=None):
+    """Run the pacing floor the way process_video does, on plain data."""
+    pipeline._hold_pacing_floor(
+        segments,
+        transcript,
+        request or ClippingJobRequest(video_url="fixture.mp4", job_id="floor"),
+        min_seconds,
+        max_seconds,
+        False,
+        video_ms or transcript[-1].end_time_ms,
+    )
+
+
+class TestPacingDurationFloor:
+    """Tight pacing trims the dead air inside a planned window, so a window
+    planned at the minimum renders under it. The pipeline grows those windows
+    to the next sentence end before plan.json is written."""
+
+    def test_grows_a_window_that_would_render_under_the_minimum(self, monkeypatch, tmp_path):
+        pipeline, tr, *_ = _pipeline_fixture(monkeypatch, tmp_path, jev_enabled=False)
+        segment = ClipPlanSegment(tr[0].start_time_ms, 31_000, 0.9)
+        paced = estimate_tight_kept_ms(tr, segment.start_time_ms, 31_000 - segment.start_time_ms)
+        assert paced < 30_000  # a 31 s plan ships under the 30 s floor
+
+        _floor(pipeline, [segment], tr)
+
+        assert segment.end_time_ms > 31_000
+        assert segment.end_time_ms in {s.end_time_ms for s in tr}  # stops on a sentence, not mid-word
+        assert estimate_tight_kept_ms(
+            tr, segment.start_time_ms, segment.end_time_ms - segment.start_time_ms) >= 30_000
+
+    def test_does_not_pull_a_scene_break_into_the_clip(self, monkeypatch, tmp_path, caplog):
+        # An ad read or a jingle follows a long silence; extending into it would
+        # lengthen the clip but not the moment.
+        pipeline, _, *_ = _pipeline_fixture(monkeypatch, tmp_path, jev_enabled=False)
+        paused = make_transcript(12, pause_ms=6000)
+        segment = ClipPlanSegment(paused[0].start_time_ms, 31_000, 0.9)
+        assert estimate_tight_kept_ms(paused, 1_000, 30_000) < 30_000
+        with caplog.at_level(logging.INFO):
+            _floor(pipeline, [segment], paused, video_ms=paused[-1].end_time_ms)
+        assert segment.end_time_ms == 31_000
+        assert "scene break" in caplog.text
+
+    def test_growth_stops_at_twice_the_planned_window(self, monkeypatch, tmp_path):
+        pipeline, tr, *_ = _pipeline_fixture(monkeypatch, tmp_path, jev_enabled=False)
+        segment = ClipPlanSegment(tr[0].start_time_ms, tr[0].start_time_ms + 15_000, 0.9)
+        _floor(pipeline, [segment], tr, max_seconds=600)
+        assert segment.end_time_ms == tr[0].start_time_ms + 30_000
+
+    def test_never_grows_past_the_maximum(self, monkeypatch, tmp_path):
+        pipeline, tr, *_ = _pipeline_fixture(monkeypatch, tmp_path, jev_enabled=False)
+        segment = ClipPlanSegment(tr[0].start_time_ms, 31_000, 0.9)
+        _floor(pipeline, [segment], tr, max_seconds=31)
+        # It grew, then stopped flush on the ceiling instead of taking the
+        # whole next sentence.
+        assert segment.end_time_ms == tr[0].start_time_ms + 31_000
+
+    def test_stops_before_the_next_clip(self, monkeypatch, tmp_path):
+        pipeline, tr, *_ = _pipeline_fixture(monkeypatch, tmp_path, jev_enabled=False)
+        first = ClipPlanSegment(tr[0].start_time_ms, 31_000, 0.9)
+        second = ClipPlanSegment(tr[7].start_time_ms, tr[9].end_time_ms, 0.8)
+        _floor(pipeline, [first, second], tr)
+        assert first.end_time_ms > 31_000
+        assert first.end_time_ms <= second.start_time_ms
+
+    def test_ships_short_when_the_source_has_nothing_left(self, monkeypatch, tmp_path, caplog):
+        pipeline, tr, *_ = _pipeline_fixture(monkeypatch, tmp_path, jev_enabled=False)
+        source = tr[:4]  # about 22 s of speech exists
+        segment = ClipPlanSegment(source[0].start_time_ms, source[-1].end_time_ms, 0.9)
+        with caplog.at_level(logging.INFO):
+            _floor(pipeline, [segment], source, video_ms=source[-1].end_time_ms)
+        assert segment.end_time_ms == source[-1].end_time_ms
+        assert "stays under" in caplog.text
+
+    def test_natural_pacing_keeps_the_planned_window(self, monkeypatch, tmp_path):
+        pipeline, tr, *_ = _pipeline_fixture(monkeypatch, tmp_path, jev_enabled=False)
+        segment = ClipPlanSegment(tr[0].start_time_ms, 31_000, 0.9)
+        request = ClippingJobRequest(video_url="fixture.mp4", job_id="floor", pacing=Pacing.NATURAL)
+        _floor(pipeline, [segment], tr, request=request)
+        assert segment.end_time_ms == 31_000
+
+    def test_no_word_timings_cannot_be_estimated(self, monkeypatch, tmp_path):
+        # A user-supplied .srt has no word timings, so nothing gets cut and the
+        # plan stays as the planner wrote it.
+        pipeline, tr, *_ = _pipeline_fixture(monkeypatch, tmp_path, jev_enabled=False)
+        plain = [TranscriptSegment(s.start_time_ms, s.end_time_ms, s.text, "S1", []) for s in tr[:8]]
+        segment = ClipPlanSegment(tr[0].start_time_ms, 31_000, 0.9)
+        _floor(pipeline, [segment], plain)
+        assert segment.end_time_ms == 31_000
+
+    def test_faster_playback_needs_more_content(self, monkeypatch, tmp_path):
+        pipeline, tr, *_ = _pipeline_fixture(monkeypatch, tmp_path, jev_enabled=False)
+        slow = ClipPlanSegment(tr[0].start_time_ms, 31_000, 0.9)
+        fast = ClipPlanSegment(tr[0].start_time_ms, 31_000, 0.9)
+        request = ClippingJobRequest(video_url="fixture.mp4", job_id="floor", video_speed=2.0)
+        _floor(pipeline, [slow], tr)
+        _floor(pipeline, [fast], tr, request=request)
+        assert fast.end_time_ms > slow.end_time_ms
+
+    def test_widened_window_reaches_the_plan_and_the_render(self, monkeypatch, tmp_path):
+        from unittest.mock import AsyncMock
+        from clip_engine.services.intelligence_planner import ClipPlanResponse
+        pipeline, tr, _, _, rendered = _pipeline_fixture(monkeypatch, tmp_path, jev_enabled=False)
+        plan = ClipPlanResponse(
+            segments=[ClipPlanSegment(tr[0].start_time_ms, 31_000, 0.9, summary="Titlu")], total_clips=1)
+        monkeypatch.setattr(pipeline.intelligence_planner, "plan_clips", AsyncMock(return_value=plan))
+        result = asyncio.run(pipeline.process_video(ClippingJobRequest(
+            video_url="fixture.mp4", job_id="floor-e2e", max_clips=1, auto_clip_count=False,
+            duration_ranges=["short"])))
+        assert result.status == JobStatus.COMPLETED, result.error
+
+        planned = json.loads((tmp_path / "out" / "floor-e2e" / "plan.json").read_text())["segments"][0]
+        assert planned["end_time_ms"] > 31_000
+        assert planned["end_time_ms"] <= 61_000  # still inside the 30-60 s preset
+        assert rendered[0].end_time_ms == planned["end_time_ms"]

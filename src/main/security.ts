@@ -25,9 +25,18 @@ export function isTrustedExternalUrl(value: unknown): value is string {
   return isWebUrl(value) && (externalLinks.has(value) || /^https:\/\/www\.youtube\.com\/watch\?v=[\w-]{11}$/.test(value))
 }
 
+/** Windows names one file with several spellings (8.3 aliases, drive-letter case) and the
+ *  engine expands them when writing clip paths, so comparisons must resolve the same way. */
+export function canonicalMediaPath(path: string): string {
+  if (process.platform === 'win32') {
+    try { return realpathSync.native(path) } catch { /* Fall back to the syntax-only resolve. */ }
+  }
+  return realpathSync(path)
+}
+
 export function isWithinDirectory(path: string, directory: string): boolean {
   try {
-    const rel = relative(realpathSync(directory), realpathSync(path))
+    const rel = relative(canonicalMediaPath(directory), canonicalMediaPath(path))
     return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`))
   } catch { return false }
 }
@@ -35,7 +44,7 @@ export function isWithinDirectory(path: string, directory: string): boolean {
 const mediaExtensions = new Set(['.mp4', '.m4v', '.mkv', '.webm', '.avi', '.mov', '.flv', '.jpg', '.jpeg', '.png', '.webp', '.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac'])
 const selectedMedia = new Map<string, { dev: number; ino: number }>()
 export function authorizeMedia(path: string): string {
-  const canonical = realpathSync(path)
+  const canonical = canonicalMediaPath(path)
   const file = statSync(canonical)
   if (!mediaExtensions.has(extname(canonical).toLowerCase()) || !file.isFile()) {
     throw new Error('Choose a supported media file')
@@ -47,7 +56,7 @@ export function assertMediaPath(path: unknown, outputDirectory: string): asserts
   if (typeof path !== 'string' || !isAbsolute(path) || !mediaExtensions.has(extname(path).toLowerCase())) {
     throw new Error('Invalid media path')
   }
-  const canonical = realpathSync(path)
+  const canonical = canonicalMediaPath(path)
   const file = statSync(canonical)
   const selected = selectedMedia.get(canonical)
   const isSelectedFile = selected?.dev === file.dev && selected.ino === file.ino
@@ -59,11 +68,11 @@ export function assertMediaPath(path: unknown, outputDirectory: string): asserts
 /** Open the authorized inode once so a later path replacement cannot change the bytes we read. */
 export async function openAuthorizedMedia(path: string, outputDirectory: string): Promise<{ handle: FileHandle; size: number; canonical: string }> {
   assertMediaPath(path, outputDirectory)
-  const canonical = realpathSync(path)
+  const canonical = canonicalMediaPath(path)
   const handle = await open(canonical, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
   try {
     const opened = await handle.stat()
-    const currentPath = realpathSync(canonical)
+    const currentPath = canonicalMediaPath(canonical)
     const current = statSync(currentPath)
     assertMediaPath(currentPath, outputDirectory)
     if (!opened.isFile() || currentPath !== canonical || opened.dev !== current.dev || opened.ino !== current.ino) {

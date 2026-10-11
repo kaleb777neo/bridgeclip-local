@@ -55,6 +55,119 @@ LOCAL_TRANSCRIPT_WINDOW_CHARS = 24000
 # truncated plan that fails to parse and is then retried identically.
 LOCAL_MAX_CLIPS_PER_REQUEST = 8
 
+# The title card is drawn from `summary` and keeps only its first seven words
+# (see rendering_service._build_title_card), so a longer planner title appears
+# on screen cut off mid-sentence.
+MAX_TITLE_WORDS = 7
+
+# Small models answer the title rule with an English description of the clip
+# ("The speaker criticizes the current government's actions, particularly…")
+# instead of a title in the language actually spoken. Only that direction is
+# checked: a terse English title has no stopwords either, and punishing it
+# would spend a repair call on every clip of an English video.
+ENGLISH_STOPWORDS = frozenset({
+    'a', 'an', 'the', 'and', 'or', 'of', 'to', 'in', 'is', 'are', 'was', 'were',
+    'be', 'being', 'been', 'for', 'on', 'with', 'as', 'by', 'that', 'this',
+    'these', 'those', 'it', 'its', 'he', 'him', 'his', 'she', 'her', 'they',
+    'them', 'their', 'we', 'our', 'you', 'your', 'i', 'my', 'not', 'but', 'so',
+    'if', 'then', 'than', 'from', 'at', 'has', 'have', 'had', 'do', 'does',
+    'did', 'will', 'would', 'can', 'could', 'should', 'about', 'what', 'who',
+    'how', 'why', 'when', 'while', 'because', 'which', 'there', 'all',
+})
+
+
+def _is_english(text: str) -> bool:
+    # Unicode word chars, so a Romanian "și" stays one token instead of "i".
+    tokens = re.findall(r"[^\W\d_]+", text.lower(), re.UNICODE)
+    if len(tokens) < 3:
+        return False
+    hits = sum(1 for token in tokens if token in ENGLISH_STOPWORDS)
+    return hits >= 2 and hits / len(tokens) >= 0.2
+
+
+def _spoken_vocabulary(transcript: list["TranscriptSegment"]) -> set[str]:
+    """Words the video actually says, used as the evidence for "spoken language".
+
+    A short clip of speech gives a thin vocabulary, and then any invented word
+    looks foreign, so callers ignore the set below a few hundred distinct words.
+    """
+    vocabulary: set[str] = set()
+    for segment in transcript:
+        vocabulary.update(re.findall(r"[^\W\d_]+", (segment.text or '').lower(), re.UNICODE))
+    return vocabulary
+
+
+def _title_is_foreign(title: str, vocabulary: set[str]) -> bool:
+    """True when the title's words are mostly words the speaker never used.
+
+    Terse English headlines ("Media Censorship and Public Reaction") carry no
+    English stopword pattern for _is_english to see, but a small model writing
+    them still reaches for vocabulary outside the transcript, while a title in
+    the spoken language is built from words it just heard.
+    """
+    tokens = re.findall(r"[^\W\d_]+", (title or '').lower(), re.UNICODE)
+    if len(tokens) < 3 or len(vocabulary) < 200:
+        return False
+    missing = sum(1 for token in tokens if token not in vocabulary)
+    return missing >= 2 and missing * 3 >= len(tokens)
+
+
+def _title_is_usable(
+    title: Optional[str], language: Optional[str], vocabulary: Optional[set[str]] = None,
+) -> bool:
+    """A card title fits the seven words the renderer keeps and speaks the video's language."""
+    words = (title or '').split()
+    if not 2 <= len(words) <= MAX_TITLE_WORDS:
+        return False
+    if not language or language.lower().startswith('en'):
+        return True
+    joined = ' '.join(words)
+    return not _is_english(joined) and not (vocabulary and _title_is_foreign(joined, vocabulary))
+
+
+def _title_needs_repair(
+    summary: Optional[str], language: Optional[str], vocabulary: Optional[set[str]] = None,
+) -> bool:
+    """True for a written title that would render as a truncated or foreign card.
+
+    A missing title is left alone: nothing was cut off, and inventing one is
+    not the repair pass's job.
+    """
+    return bool((summary or '').strip()) and not _title_is_usable(summary, language, vocabulary)
+
+
+def _trimmed_title(summary: Optional[str]) -> Optional[str]:
+    """First clause of a runaway description that still fits the seven-word card."""
+    text = ' '.join((summary or '').split())
+    if not text:
+        return None
+    for separator in ('. ', '! ', '? ', '; ', ': ', ', '):
+        head = text.split(separator)[0].strip()
+        if 2 <= len(head.split()) <= MAX_TITLE_WORDS:
+            return head
+    return ' '.join(text.split()[:MAX_TITLE_WORDS]).rstrip(' ,;:-')
+
+
+TITLE_REPAIR_SCHEMA: dict[str, Any] = {
+    'type': 'object',
+    'properties': {
+        'titles': {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'index': {'type': 'integer'},
+                    'title': {'type': 'string', 'description': '2-7 words, in the language of the excerpt.'},
+                },
+                'required': ['index', 'title'],
+                'additionalProperties': False,
+            },
+        },
+    },
+    'required': ['titles'],
+    'additionalProperties': False,
+}
+
 
 def _window_overlap_ratio(a: "ClipPlanSegment", b: "ClipPlanSegment") -> float:
     """Intersection over the shorter clip; > 0.5 marks a duplicate moment."""
@@ -63,6 +176,28 @@ def _window_overlap_ratio(a: "ClipPlanSegment", b: "ClipPlanSegment") -> float:
         return 0.0
     shorter = min(a.end_time_ms - a.start_time_ms, b.end_time_ms - b.start_time_ms)
     return intersection / max(1, shorter)
+
+
+def coverage_clip_count(
+    duration_seconds: float,
+    duration_ranges: Optional[list[str]],
+    user_max_clips: Optional[int],
+    absolute_cap: int,
+    min_clips: int,
+) -> int:
+    """Clips needed to tile a range with clips of the target length.
+
+    Full-coverage extraction replaces the virality-scaled curve with simple
+    arithmetic: one clip per target-length slot, so the count tracks how much
+    material there is to cover. An explicit user maximum still caps it.
+    """
+    min_duration, max_duration = resolve_clip_duration_bounds(duration_ranges, None, None)
+    target = max(min_duration, (min_duration + max_duration) / 2)
+    by_tiling = max(min_clips, math.ceil(max(0.0, duration_seconds) / target)) if target > 0 else min_clips
+    count = min(by_tiling, absolute_cap)
+    if user_max_clips is not None:
+        count = min(count, max(1, user_max_clips))
+    return count
 
 
 @dataclass
@@ -437,6 +572,7 @@ class IntelligencePlannerService:
         aspect_ratio: str,
         source_context: Optional[dict],
         clip_request: Optional[str],
+        coverage: bool = False,
     ) -> Optional[ClipPlanResponse]:
         """Plan long transcripts in char-bounded windows for the local model.
 
@@ -446,6 +582,10 @@ class IntelligencePlannerService:
         total_chars = sum(len(segment.text) for segment in transcript)
         if total_chars <= LOCAL_TRANSCRIPT_WINDOW_CHARS:
             return None
+        # Each window pays the per-request clip cap; the job keeps up to what was
+        # asked for across all of them. Plan_clips returns here for the outer call,
+        # so this is where the job's ceiling has to be recorded.
+        self.discovery_limit = max_clips
 
         windows: list[list[TranscriptSegment]] = []
         current: list[TranscriptSegment] = []
@@ -497,6 +637,7 @@ class IntelligencePlannerService:
                     source_context=source_context,
                     jev_enabled=False,
                     clip_request=clip_request,
+                    coverage=coverage,
                 )
                 merged.extend(result.segments)
                 if result.insights:
@@ -507,6 +648,9 @@ class IntelligencePlannerService:
         deduped = self._merge_windowed_clips(merged, max_clips)
         logger.info("Local windowed planning merged %d -> %d clips", len(merged), len(deduped))
         combined_insights = " | ".join(dict.fromkeys(i for i in insights if i)) or None
+        await self._repair_local_titles(
+            deduped, transcript, getattr(transcript_result, 'language', None),
+        )
         return ClipPlanResponse(
             segments=deduped,
             total_clips=len(deduped),
@@ -529,6 +673,86 @@ class IntelligencePlannerService:
                 break
         kept.sort(key=lambda c: c.start_time_ms)
         return kept
+
+    async def _repair_local_titles(
+        self,
+        segments: list[ClipPlanSegment],
+        transcript: list[TranscriptSegment],
+        language: Optional[str],
+    ) -> None:
+        """Rewrite titles the local planner wrote as English descriptions.
+
+        The 2-7 word title rule is one a small model routinely ignores, and the
+        title card then truncates the result mid-sentence. One batched call
+        retitles every offender in the spoken language; a title that still
+        breaks the rule keeps its first clause instead of a chopped sentence.
+        """
+        vocabulary = _spoken_vocabulary(transcript)
+        offenders = [
+            (index, segment) for index, segment in enumerate(segments)
+            if _title_needs_repair(segment.summary, language, vocabulary)
+        ]
+        if not offenders:
+            return
+        target = f'in {language}' if language else 'in the language spoken in the excerpt'
+        items = [{
+            'index': index,
+            'excerpt': ' '.join(
+                segment.text for segment in transcript
+                if segment.end_time_ms > clip.start_time_ms and segment.start_time_ms < clip.end_time_ms
+            )[:1200],
+            'rejected_title': clip.summary or '',
+        } for index, clip in offenders]
+        titles: dict[int, str] = {}
+        try:
+            payload = sanitize_payload({
+                'model': self.settings.planner_model,
+                'messages': [
+                    {'role': 'system', 'content': (
+                        'You write the short title shown on screen over a vertical video clip. '
+                        f'For each item return one title of 2-{MAX_TITLE_WORDS} words {target} - the language of '
+                        'its excerpt, never translated into English unless that excerpt is English. '
+                        'A title names one concrete idea the speaker actually says in the excerpt, in their own '
+                        'register. No trailing punctuation, no emoji. Return every index exactly once.'
+                    )},
+                    {'role': 'user', 'content': json.dumps({'clips': items}, ensure_ascii=False)},
+                ],
+                'max_tokens': 600,
+                'temperature': 0.2,
+                'response_format': json_schema_format('clip_titles', TITLE_REPAIR_SCHEMA),
+            }, getattr(self.settings, 'llm_provider', 'openrouter'))
+            response, _ = await local_llm.ollama_chat(self.settings, payload)
+            content, _ = message_text(response)
+            for entry in (json.loads(content).get('titles') or []):
+                index = entry.get('index')
+                title = ' '.join(str(entry.get('title') or '').split())[:120]
+                if isinstance(index, int) and 0 <= index < len(segments) \
+                        and _title_is_usable(title, language, vocabulary):
+                    titles[index] = title
+        except Exception as error:
+            # A failed repair must never fail the job: the card still renders.
+            logger.warning('Local title repair failed (%s); trimming the runaway titles instead',
+                           type(error).__name__)
+        for index, clip in offenders:
+            repaired = titles.get(index)
+            if repaired:
+                logger.info('Local planner title repaired: %r -> %r', (clip.summary or '')[:60], repaired)
+                clip.summary = repaired
+                continue
+            trimmed = _trimmed_title(clip.summary)
+            if trimmed and trimmed != clip.summary:
+                logger.info('Local planner title trimmed: %r -> %r', (clip.summary or '')[:60], trimmed)
+                clip.summary = trimmed
+
+    def _local_title_language_rule(self) -> str:
+        """The title constraint small models need; cloud models already follow it."""
+        if not is_local_backend(self.settings):
+            return ''
+        language = getattr(self, '_current_language', None)
+        target = f'in {language}' if language else 'in the language actually spoken in the transcript'
+        return (f'\n- Write every title {target}, never in English unless the transcript is English.\n'
+                f'- "summary" is an on-screen title, not a description of the clip. '
+                f'2-{MAX_TITLE_WORDS} words; anything longer is cut off on screen.')
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create the HTTP client for the active chat provider."""
@@ -565,6 +789,7 @@ class IntelligencePlannerService:
         source_context: Optional[dict] = None,
         jev_enabled: bool = False,
         clip_request: Optional[str] = None,
+        coverage: bool = False,
     ) -> ClipPlanResponse:
         """
         Plan viral clips from video content.
@@ -598,6 +823,7 @@ class IntelligencePlannerService:
         """
         transcript = transcript_result.segments if transcript_result else []
         frames = frames or []
+        self._coverage = bool(coverage)
 
         if not transcript and not frames:
             logger.warning("No transcript or frames provided for clip planning")
@@ -664,6 +890,7 @@ class IntelligencePlannerService:
                 aspect_ratio=aspect_ratio,
                 source_context=source_context,
                 clip_request=clip_request,
+                coverage=coverage,
             )
             if windowed is not None:
                 return windowed
@@ -683,12 +910,26 @@ class IntelligencePlannerService:
         
         # Apply clip count scaling algorithm
         user_max_clips = max_clips or self.settings.max_suggested_clips
-        clip_count = self.calculate_optimal_clip_count(
-            effective_duration_seconds,
-            user_max_clips,
-            auto_clip_count=auto_clip_count,
-            words_per_minute=words_per_minute,
-        )
+        if coverage:
+            # Full coverage: the count tiles the range instead of scaling with virality.
+            clip_count = coverage_clip_count(
+                effective_duration_seconds,
+                duration_ranges,
+                max_clips,
+                self.settings.coverage_max_clips,
+                self.settings.min_clips,
+            )
+            logger.info(
+                "Coverage planning: tiling %.1f minutes -> requesting %d clips",
+                effective_duration_seconds / 60, clip_count,
+            )
+        else:
+            clip_count = self.calculate_optimal_clip_count(
+                effective_duration_seconds,
+                user_max_clips,
+                auto_clip_count=auto_clip_count,
+                words_per_minute=words_per_minute,
+            )
 
         wpm_label = f"{words_per_minute:.1f}" if words_per_minute is not None else "n/a"
         logger.info(
@@ -717,6 +958,13 @@ class IntelligencePlannerService:
                 clip_count = max_fit
         if discovery_feedback is not None:
             clip_count = min(clip_count, 8)
+        # The ceiling on clips the job may keep: everything below this line only
+        # limits one request. A long transcript is planned in several windows, and
+        # each window pays the per-request cap on top of this one. The windowed
+        # sub-requests must not rewrite it, or their 8 becomes the job's ceiling
+        # and the back half of a long video is planned and then thrown away.
+        if not getattr(self, '_in_windowed_call', False):
+            self.discovery_limit = clip_count
         if ((is_local_backend(self.settings) or is_nvidia_backend(self.settings))
                 and clip_count > LOCAL_MAX_CLIPS_PER_REQUEST):
             logger.info(
@@ -725,7 +973,6 @@ class IntelligencePlannerService:
                 "cannot hold a longer plan without truncating"
             )
             clip_count = LOCAL_MAX_CLIPS_PER_REQUEST
-        self.discovery_limit = clip_count
         longform = bool(transcript) and is_longform(aspect_ratio, min_duration_seconds)
         self._current_longform = longform
         if longform:
@@ -747,6 +994,7 @@ class IntelligencePlannerService:
         self._current_max_duration = max_duration_seconds
         self._current_duration_ranges = duration_ranges
         self._current_transcript = transcript
+        self._current_language = getattr(transcript_result, 'language', None)
         metadata_duration = getattr(video_metadata, "duration_seconds", None)
         self._current_video_duration = float(metadata_duration) if metadata_duration is not None else None
         
@@ -902,7 +1150,8 @@ class IntelligencePlannerService:
                     # A truncated plan won't parse no matter how often the
                     # identical request is repeated; ask for fewer clips.
                     clip_count = max(1, clip_count // 2)
-                    self.discovery_limit = clip_count
+                    if not getattr(self, '_in_windowed_call', False):
+                        self.discovery_limit = clip_count
                     messages = _planner_messages(clip_count)
                     logger.warning(
                         f"Retrying local planning with {clip_count} clips "
@@ -941,6 +1190,12 @@ class IntelligencePlannerService:
                 f"model={served_by}, source={'reported' if cost_reported else 'estimate'} "
                 f"via {cost_provider})"
             )
+            # The windowed pass repairs once over all its merged clips, so only
+            # the outer, single-shot plan pays for a repair call here.
+            if is_local_backend(self.settings) and not getattr(self, '_in_windowed_call', False):
+                await self._repair_local_titles(
+                    result.segments, transcript, getattr(transcript_result, 'language', None),
+                )
             return result
 
     def _build_system_prompt(
@@ -988,36 +1243,83 @@ class IntelligencePlannerService:
 - Prefer coherent ideas over hook scores. Return an empty clips array when necessary.
 - Order candidates best first. Every candidate will undergo independent Jev review."""
         else:
-            role = (
-                "You are AI-Clipping-Agent, an elite virality analyst who identifies the most engaging, "
-                "scroll-stopping segments from long-form videos for short-form content (TikTok, Reels, Shorts)."
-            )
-            overlap_rule = (
-                "- NO OVERLAP: No two clips should share more than 5 seconds of content. "
-                "If two great moments are adjacent, pick the stronger one."
-            )
-            title_rules = """- Use curiosity gaps: "Why Most Developers Get This Wrong", "The Truth About AI Coding"
-- Use power words when appropriate: "brutal", "insane", "secret", "truth", "nobody", "actual"
-- Match the speaker's energy — if they are calm and analytical, do NOT use hyperbolic clickbait
+            if getattr(self, "_coverage", False):
+                role = (
+                    "You are an exhaustive clipping editor: you segment the ENTIRE video into every "
+                    "self-contained, publishable moment for short-form content (TikTok, Reels, Shorts). "
+                    "Coverage comes first — virality only ranks what gets extracted."
+                )
+                overlap_rule = (
+                    "- NO OVERLAP: No two clips may share more than 5 seconds of content. "
+                    "Cover the material edge-to-edge with adjacent, non-overlapping clips."
+                )
+                title_rules = """- Titles state the specific idea of the moment in plain, accurate words.
+- Do not invent scandal, causation or certainty to sound exciting.
 - NEVER use generic titles: "Great Advice", "Important Point", "Good Tip", "Interesting Thought"
-- Each title across all clips must be unique — no repeated words or patterns
-- Think: would this title make someone stop scrolling on TikTok?"""
-            output_count = (
-                f"Return up to {clip_count} clips that match the user clip request as JSON:"
-                if getattr(self, "_clip_request", None) else
-                f"Return exactly {clip_count} clips as JSON:"
-            )
-            duration_guidance = ""
-            selected_ranges = [DURATION_RANGES[r][2] for r in duration_ranges or [] if r in DURATION_RANGES]
-            if selected_ranges:
-                duration_guidance = f"""
+- Each title across all clips must be unique — no repeated words or patterns"""
+                output_count = (
+                    f"Return exactly {clip_count} clips as JSON — the full set that covers the material:"
+                )
+                duration_guidance = ""
+                selected_ranges = [DURATION_RANGES[r][2] for r in duration_ranges or [] if r in DURATION_RANGES]
+                if selected_ranges:
+                    duration_guidance = f"""
 CRITICAL DURATION REQUIREMENTS:
 The user has selected specific clip lengths. You MUST follow these EXACTLY:
 {chr(10).join(f'- {r}' for r in selected_ranges)}
 
 Each clip MUST be {strict_bounds_text}. Clips outside this range will be REJECTED.
 Do NOT generate clips shorter than {min_duration} seconds or longer than {max_duration} seconds."""
-            rules = f"""## STRICT RULES
+                rules = f"""## STRICT RULES
+
+- COVERAGE: Extract EVERY distinct, complete moment — every story, answer, argument, joke or
+  demonstration that stands on its own. Work through the transcript chronologically and do not
+  skip material. Omit ONLY true non-content: channel intros, outro/subscribe plugs, sponsor
+  reads, and filler with no complete thought.
+- DURATION: Each clip MUST be {strict_bounds_text}. This is NON-NEGOTIABLE.
+- Verify: (end_time - start_time) >= {min_duration} AND (end_time - start_time) <= {max_duration}
+- Return times in SECONDS (not milliseconds), taken from the transcript timestamps
+- Start each clip at the beginning of a transcript line and end it at the end of one
+- Clips that violate the duration requirements will be REJECTED
+- Return clips in chronological order"""
+                if is_local_backend(self.settings):
+                    # Small models park on the lower bound and gap trimming then drops
+                    # the render under it. Cloud models already plan with headroom.
+                    rules += (
+                        f"\n- Aim for the middle of the length you pick, never its lower edge: silent gaps are "
+                        f"trimmed after planning, so a clip planned at {min_duration}s renders under {min_duration}s."
+                    )
+            else:
+                role = (
+                    "You are AI-Clipping-Agent, an elite virality analyst who identifies the most engaging, "
+                    "scroll-stopping segments from long-form videos for short-form content (TikTok, Reels, Shorts)."
+                )
+                overlap_rule = (
+                    "- NO OVERLAP: No two clips should share more than 5 seconds of content. "
+                    "If two great moments are adjacent, pick the stronger one."
+                )
+                title_rules = """- Use curiosity gaps: "Why Most Developers Get This Wrong", "The Truth About AI Coding"
+- Use power words when appropriate: "brutal", "insane", "secret", "truth", "nobody", "actual"
+- Match the speaker's energy — if they are calm and analytical, do NOT use hyperbolic clickbait
+- NEVER use generic titles: "Great Advice", "Important Point", "Good Tip", "Interesting Thought"
+- Each title across all clips must be unique — no repeated words or patterns
+- Think: would this title make someone stop scrolling on TikTok?"""
+                output_count = (
+                    f"Return up to {clip_count} clips that match the user clip request as JSON:"
+                    if getattr(self, "_clip_request", None) else
+                    f"Return exactly {clip_count} clips as JSON:"
+                )
+                duration_guidance = ""
+                selected_ranges = [DURATION_RANGES[r][2] for r in duration_ranges or [] if r in DURATION_RANGES]
+                if selected_ranges:
+                    duration_guidance = f"""
+CRITICAL DURATION REQUIREMENTS:
+The user has selected specific clip lengths. You MUST follow these EXACTLY:
+{chr(10).join(f'- {r}' for r in selected_ranges)}
+
+Each clip MUST be {strict_bounds_text}. Clips outside this range will be REJECTED.
+Do NOT generate clips shorter than {min_duration} seconds or longer than {max_duration} seconds."""
+                rules = f"""## STRICT RULES
 
 - DURATION: Each clip MUST be {strict_bounds_text}. This is NON-NEGOTIABLE.
 - Verify: (end_time - start_time) >= {min_duration} AND (end_time - start_time) <= {max_duration}
@@ -1025,7 +1327,15 @@ Do NOT generate clips shorter than {min_duration} seconds or longer than {max_du
 - Start each clip at the beginning of a transcript line and end it at the end of one
 - Clips that violate the duration requirements will be REJECTED
 - Order clips best first"""
+                if is_local_backend(self.settings):
+                    # Small models park on the lower bound and gap trimming then drops
+                    # the render under it. Cloud models already plan with headroom.
+                    rules += (
+                        f"\n- Aim for the middle of the length you pick, never its lower edge: silent gaps are "
+                        f"trimmed after planning, so a clip planned at {min_duration}s renders under {min_duration}s."
+                    )
 
+        title_language_rule = self._local_title_language_rule()
         return f"""## YOUR ROLE
 
 {role}
@@ -1091,7 +1401,7 @@ Prioritize clips whose opening matches one of these proven hook patterns:
 The "summary" field is the title displayed on screen. It must be 2-7 words.
 
 Rules:
-{title_rules}
+{title_rules}{title_language_rule}
 
 ## CAPTION EMPHASIS
 
@@ -1135,6 +1445,7 @@ For each clip, list 2-5 single words, exactly as spoken inside the clip, that ca
                 f"and (end_time - start_time) must be at most {max_duration} seconds."
             )
             duration_rule = f"Clips outside {min_duration}-{max_duration} seconds are REJECTED."
+        title_language_rule = self._local_title_language_rule()
         return f"""## YOUR ROLE
 
 You are a senior YouTube editor. From the transcript of a long video, cut up to {clip_count} standalone horizontal episodes of {min_duration // 60}-{max_duration // 60} minutes each ({min_duration}-{max_duration} seconds). Each episode is published on its own as a longform YouTube video, so it must hold a viewer from the first second to the last with no knowledge of the rest of the source.
@@ -1178,7 +1489,7 @@ Score each episode 0-10 on these keys (be calibrated; reserve 8-10 for exception
 
 ## TITLES, DESCRIPTION, TAGS
 
-- "summary": a 2-7 word YouTube title that promises exactly what the episode delivers. Curiosity is good; clickbait the episode doesn't pay off is not. Match the speaker's tone. Each title unique.
+- "summary": a 2-7 word YouTube title that promises exactly what the episode delivers. Curiosity is good; clickbait the episode doesn't pay off is not. Match the speaker's tone. Each title unique.{title_language_rule}
 - "description": 2-4 plain sentences describing what the viewer will learn or see, for the upload description.
 - "tags": 3-8 topical keywords.
 - "emphasis": 2-5 single key words spoken in the episode (names, numbers, key terms).
@@ -1497,8 +1808,19 @@ Do not overlap clips by more than 5 seconds."""
         snapping = self.settings.sentence_snapping_enabled and bool(transcript)
 
         # Pre-process clips (filter invalid ones and enforce duration bounds)
-        valid_clips_data = []
+        # Raw sibling slots, for extensions that must not walk into a neighbour.
+        sibling_bounds: list[tuple[float, float]] = []
         for clip in clips_data:
+            s = clip.get("start_time", clip.get("startTime", clip.get("start", 0)))
+            e = clip.get("end_time", clip.get("endTime", clip.get("end", 0)))
+            if s > 100000:
+                s = s / 1000
+            if e > 100000:
+                e = e / 1000
+            sibling_bounds.append((s, e))
+        neighbour_margin = MAX_CLIP_OVERLAP_MS / 1000
+        valid_clips_data = []
+        for i, clip in enumerate(clips_data):
             start = clip.get("start_time", clip.get("startTime", clip.get("start", 0)))
             end = clip.get("end_time", clip.get("endTime", clip.get("end", 0)))
 
@@ -1551,8 +1873,17 @@ Do not overlap clips by more than 5 seconds."""
                 # Respect end time limit if set
                 if end_time_limit is not None and new_end > end_time_limit:
                     new_end = end_time_limit
-                # Check if extension is sufficient
-                if new_end - start >= min_duration:
+                # Extending into the next clip's slot manufactures the overlap that
+                # dedup then drops. Prefer the side that still has room.
+                next_boundary = min(
+                    (s for j, (s, _e) in enumerate(sibling_bounds) if j != i and s >= end),
+                    default=None,
+                )
+                end_fits = (
+                    new_end - start >= min_duration
+                    and not (next_boundary is not None and new_end > next_boundary - neighbour_margin)
+                )
+                if end_fits:
                     logger.info(
                         f"Extended short clip ({original_duration:.1f}s -> {new_end - start:.1f}s) "
                         f"to meet minimum duration {min_duration}s"
@@ -1561,11 +1892,37 @@ Do not overlap clips by more than 5 seconds."""
                     duration = end - start
                     adjusted = True
                 else:
-                    logger.warning(
-                        f"Filtering clip ({original_duration:.1f}s) - too short and cannot extend "
-                        f"to minimum {min_duration}s"
+                    new_start = start - extension_needed
+                    prev_boundary = max(
+                        (e for j, (_s, e) in enumerate(sibling_bounds) if j != i and e <= start),
+                        default=None,
                     )
-                    continue
+                    lower = max(
+                        start_time_limit if start_time_limit is not None else 0.0,
+                        (prev_boundary + neighbour_margin) if prev_boundary is not None else 0.0,
+                    )
+                    if new_start >= lower and end - new_start >= min_duration:
+                        logger.info(
+                            f"Extended short clip backward ({original_duration:.1f}s -> {end - new_start:.1f}s) "
+                            f"to meet minimum duration {min_duration}s; the next clip starts at {next_boundary}s"
+                        )
+                        start = new_start
+                        duration = end - start
+                        adjusted = True
+                    elif new_end - start >= min_duration:
+                        logger.info(
+                            f"Extended short clip ({original_duration:.1f}s -> {new_end - start:.1f}s) "
+                            f"to meet minimum duration {min_duration}s"
+                        )
+                        end = new_end
+                        duration = end - start
+                        adjusted = True
+                    else:
+                        logger.warning(
+                            f"Filtering clip ({original_duration:.1f}s) - too short and cannot extend "
+                            f"to minimum {min_duration}s"
+                        )
+                        continue
 
             # If clip is too long, end it on the last sentence that fits
             # (falling back to a hard cut only when none ends in range)

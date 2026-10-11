@@ -62,7 +62,7 @@ test('Details keeps navigation visible and makes nested JSON readable without ch
       start_time_ms: 2300, end_time_ms: 13500, virality_score: .8, summary: 'Recorded framing' },
       { clip_index: 1, s3_url: path.join(run, 'clip_01.mp4'), duration_ms: 5000,
         start_time_ms: 0, end_time_ms: 5000, virality_score: .7, summary: 'No framing recorded' }] }))
-  const session = await launchApp({ appDir: buildApp(path.join(root, 'app')), userDataDir })
+  const session = await launchApp({ appDir: buildApp(path.join(root, 'app')), userDataDir, show: true })
   t.after(async () => { await session.close(); fs.rmSync(root, { recursive: true, force: true }) })
   const { page, app } = session
   page.setDefaultTimeout(10000)

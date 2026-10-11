@@ -187,3 +187,36 @@ def test_slide_presets_fly_in_via_move_and_pop_keeps_scale(tmp_path):
     assert kinds_for('slideup') == {'move'}
     assert kinds_for('popline') == {'pos'}
     assert kinds_for('scale') == {'pos'}
+
+
+class TestHyphenSplitMerging:
+    def test_split_clitics_rejoin_into_one_word(self):
+        from clip_engine.services.caption_generator import merge_hyphen_splits
+        # Romanian clitics come out of Whisper as two tokens.
+        merged = merge_hyphen_splits([
+            TranscriptWord('eu', 0, 300), TranscriptWord('m', 300, 420), TranscriptWord('-aș', 420, 700),
+            TranscriptWord('gândit', 800, 1200), TranscriptWord('așa', 1200, 1500),
+        ])
+        assert [w.word for w in merged] == ['eu', 'm-aș', 'gândit', 'așa']
+        assert (merged[1].start_time_ms, merged[1].end_time_ms) == (300, 700)
+
+    def test_trailing_hyphen_halves_and_chains_also_rejoin(self):
+        from clip_engine.services.caption_generator import merge_hyphen_splits
+        merged = merge_hyphen_splits([
+            TranscriptWord('du', 0, 200), TranscriptWord('-', 200, 260), TranscriptWord('te', 260, 500),
+        ])
+        assert [w.word for w in merged] == ['du-te']
+        assert (merged[0].start_time_ms, merged[0].end_time_ms) == (0, 500)
+
+    def test_parts_across_a_pause_never_rejoin(self):
+        from clip_engine.services.caption_generator import merge_hyphen_splits
+        # A real pause means "-" started a new utterance (or a list dash), not a clitic.
+        merged = merge_hyphen_splits([
+            TranscriptWord('vorbeam', 0, 400), TranscriptWord('-abia', 2000, 2400),
+        ])
+        assert [w.word for w in merged] == ['vorbeam', '-abia']
+
+    def test_plain_words_pass_through_untouched(self):
+        from clip_engine.services.caption_generator import merge_hyphen_splits
+        words = [TranscriptWord('un', 0, 100), TranscriptWord('test', 100, 400)]
+        assert [w.word for w in merge_hyphen_splits(words)] == ['un', 'test']

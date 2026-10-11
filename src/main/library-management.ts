@@ -30,7 +30,7 @@ async function checkedRun(raw: unknown): Promise<{ check: () => string; output: 
   }
   check()
   const output = await getJobOutput(path, library)
-  if (!output) throw new Error('This completed run is no longer available in your Library.')
+  if (!output) throw new Error('This run is no longer in your Library. Refresh the list; it may have been deleted or be mid-deletion.')
   check()
   return { check, output, library, identity: { dev: original.dev, ino: original.ino } }
 }

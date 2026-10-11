@@ -8,7 +8,7 @@ const { buildApp, launchApp } = require('../zernio/support/electron-app.cjs')
 test('caption styles preview word progression, support transport controls and respect reduced motion', { timeout: 90000 }, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-caption-preview-'))
   const appDir = buildApp(path.join(root, 'app'))
-  const session = await launchApp({ appDir, userDataDir: path.join(root, 'user-data') })
+  const session = await launchApp({ appDir, userDataDir: path.join(root, 'user-data'), show: true })
   t.after(async () => { await session.close(); fs.rmSync(root, { recursive: true, force: true }) })
   const { app, page } = session
   // The test window stays hidden. Simulate a visible tab without raising it over the user's app.
@@ -17,7 +17,7 @@ test('caption styles preview word progression, support transport controls and re
   const errors = []
   page.on('pageerror', (error) => errors.push(error.message))
   await page.emulateMedia({ reducedMotion: 'no-preference' })
-  await page.getByPlaceholder('YouTube, Twitch VOD or direct video link').fill('https://example.com/video.mp4')
+  await page.getByPlaceholder(/or direct link/).fill('https://example.com/video.mp4')
   await page.getByRole('button', { name: 'Use link', exact: true }).click()
   await page.getByRole('radio', { name: 'Automatic', exact: true }).click()
   const steps = page.getByRole('navigation', { name: 'Create steps' })
@@ -83,11 +83,12 @@ test('caption styles preview word progression, support transport controls and re
   assert.ok(Number(await slider.inputValue()) < 600)
   await preview.getByRole('button', { name: 'Pause caption preview' }).waitFor()
   await page.getByRole('switch', { name: 'Captions', exact: true }).click()
-  assert.equal(await slider.isDisabled(), true)
-  const disabled = await slider.inputValue()
+  // Turning captions off unmounts the preview rather than leaving a frozen slider.
+  assert.equal(await preview.count(), 0)
   await page.waitForTimeout(200)
-  assert.equal(await slider.inputValue(), disabled)
+  assert.equal(await preview.count(), 0)
   await page.getByRole('switch', { name: 'Captions', exact: true }).click()
+  await slider.waitFor()
   await page.emulateMedia({ reducedMotion: 'reduce' })
   await preview.getByRole('button', { name: 'Play caption preview', exact: true }).waitFor()
   await presets.getByRole('radio', { name: 'Pop', exact: true }).click()

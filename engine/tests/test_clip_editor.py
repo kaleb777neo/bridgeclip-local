@@ -17,13 +17,17 @@ import pytest
 
 from clip_engine.services.clip_editor import (
     KEEP_PAUSE_MS,
+    MAX_PAUSE_MS,
     MIN_PIECE_MS,
+    STRICTEST_PAUSE_MS,
     TimeMap,
     WindowWord,
     compute_keep_intervals,
+    estimate_tight_kept_ms,
     is_filler,
     reaction_intervals,
     remap_segments,
+    window_words,
 )
 from clip_engine.services.layout_analyzer import ClipLayoutPlan, LayoutType, ShotLayout
 from clip_engine.services.layout_renderer import build_layout_graph
@@ -145,6 +149,53 @@ class TestFillers:
     @pytest.mark.parametrize("word", ["so", "like", "ah", "umbrella", "her"])
     def test_real_words(self, word):
         assert not is_filler(word)
+
+
+def sentences(count, words=4, speech_ms=1900, pause_ms=1600):
+    """`count` sentences of `words` equal words, `pause_ms` of silence between them."""
+    step = speech_ms + pause_ms
+    result = []
+    for i in range(count):
+        start = i * step
+        span = speech_ms / words
+        ws = [
+            TranscriptWord(f"w{i}_{j}", int(start + j * span), int(start + (j + 1) * span))
+            for j in range(words)
+        ]
+        result.append(TranscriptSegment(ws[0].start_time_ms, ws[-1].end_time_ms,
+                                        " ".join(w.word for w in ws), "S1", ws))
+    return result
+
+
+class TestKeptEstimate:
+    def test_assumes_the_strictest_layout(self):
+        # A 1200 ms pause is dead air on a talking head but normal on a screen
+        # recording. Before the shot plan exists, the estimate must assume the
+        # cut: promising the loose threshold would ship a clip under the floor.
+        segs = sentences(2, pause_ms=1200)
+        window = segs[-1].end_time_ms
+        screen = plan_of((0, window, LayoutType.SCREEN_CAM))
+        keeps = compute_keep_intervals(window_words(segs, 0, window), window, plan=screen)
+        assert sum(end - start for start, end in keeps) == pytest.approx(window, abs=30)
+        assert estimate_tight_kept_ms(segs, 0, window) == pytest.approx(window - 940, abs=30)
+
+    def test_uses_the_tightest_pause_threshold(self):
+        assert STRICTEST_PAUSE_MS == MAX_PAUSE_MS[LayoutType.TALKING_HEAD]
+
+    def test_without_word_timings_nothing_is_cut(self):
+        # The renderer cannot cut what it cannot see, so the window survives.
+        segs = [TranscriptSegment(0, 30_000, "no timings here", "S1", [])]
+        assert estimate_tight_kept_ms(segs, 0, 30_000) == 30_000
+
+    def test_short_pauses_are_left_alone(self):
+        segs = sentences(3, pause_ms=400)
+        assert estimate_tight_kept_ms(segs, 0, segs[-1].end_time_ms) == segs[-1].end_time_ms
+
+    def test_longform_breathes_more_than_shorts(self):
+        segs = sentences(3, pause_ms=1000)
+        window = segs[-1].end_time_ms
+        assert estimate_tight_kept_ms(segs, 0, window, longform=True) > \
+            estimate_tight_kept_ms(segs, 0, window)
 
 
 class TestTimeMap:

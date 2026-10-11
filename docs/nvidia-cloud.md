@@ -1,13 +1,13 @@
 # NVIDIA free cloud mode
 
 BridgeClip can plan clips on NVIDIA's hosted models **for free**, while
-transcription stays on your machine. One switch in **Settings → AI provider**
+transcription stays on your machine. One switch in **Settings → Local AI**
 moves clip planning from your paid OpenRouter key to the
 [build.nvidia.com](https://build.nvidia.com) free tier; transcripts never
 leave the machine, and only the planning prompt goes to NVIDIA.
 
 ```
-Settings → AI provider → NVIDIA (free cloud) → "Prepare free transcription"
+Settings → Local AI → NVIDIA (free cloud) → "Prepare free transcription"
 ```
 
 You need a free NVIDIA key (`nvapi-…`), generated at

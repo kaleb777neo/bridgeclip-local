@@ -45,7 +45,7 @@ function buildApp(appDir = process.env.BRIDGECLIP_E2E_APP_DIR || path.join(os.tm
  * @param {{ appDir: string, userDataDir: string, mock?: { apiUrl: string, browserUrl: string }, apiUrl?: string, env?: object }} options
  * @returns {Promise<{ app: import('playwright-core').ElectronApplication, page: import('playwright-core').Page, close: () => Promise<void> }>}
  */
-async function launchApp({ appDir, userDataDir, mock, apiUrl, env = {} }) {
+async function launchApp({ appDir, userDataDir, mock, apiUrl, env = {}, show = false }) {
   // Settings migrate (and delete) pre-rename files under the real appData and
   // home. Only a build whose isolation hook also moves those may be launched.
   const main = fs.readFileSync(path.join(appDir, 'out/main/index.js'), 'utf8')
@@ -88,16 +88,16 @@ async function launchApp({ appDir, userDataDir, mock, apiUrl, env = {} }) {
     throw new Error(`The test app is not isolated from ${userDataDir}: ${outside.join(', ')}`)
   }
   const page = await app.firstWindow()
-  if (process.platform === 'linux' && process.env.GITHUB_ACTIONS === 'true') {
-    // Linux CI runs inside Xvfb. Map the window onto that virtual display so
-    // Chromium advances media, requestAnimationFrame and CSS animations.
-    // Local test runs still stay hidden on the developer's desktop.
-    await app.evaluate(({ BrowserWindow }) => {
-      const window = BrowserWindow.getAllWindows()[0]
-      window.webContents.setBackgroundThrottling(false)
-      window.show()
-    })
-  }
+  // A hidden Windows window stalls media and animation clocks, so clock-sensitive tests ask for a painted one.
+  const painted = show || process.env.BRIDGECLIP_E2E_SHOW === '1' ||
+    (process.platform === 'linux' && process.env.GITHUB_ACTIONS === 'true')
+  await app.evaluate(({ BrowserWindow }, visible) => {
+    const window = BrowserWindow.getAllWindows()[0]
+    // Background throttling slows timers, requestAnimationFrame and media clocks in
+    // a hidden window, which makes tests that measure them race their own timeouts.
+    window.webContents.setBackgroundThrottling(false)
+    if (visible) window.show()
+  }, painted)
   await page.waitForLoadState('domcontentloaded')
   const settings = await page.evaluate(() => window.bridgeclip.settings.load())
   if (!real(settings.outputDirectory).startsWith(root) && !path.resolve(settings.outputDirectory).startsWith(path.resolve(userDataDir))) {

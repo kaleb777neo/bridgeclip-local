@@ -3,7 +3,7 @@ import { constants, closeSync, createReadStream, createWriteStream, fstatSync, l
 import { pipeline } from 'stream/promises'
 import { delimiter, dirname, extname, join, basename } from 'path'
 import { createHash, randomUUID } from 'crypto'
-import { EDITOR_NEEDS_SOURCE, EDITOR_REVISION_CONFLICT, editorFailureMessage, editorProgress, isEditorErrorCode, parseCandidateEdit, parseEditorProject, parseVoiceoverConfig, parseMotionPlan, parseSpeakerNames, previewWindow, renderEditKey, assetRefs, type AudioTrack, type CandidateEdit, type EditorBatch, type EditorErrorCode, type EditorProgress, type EditorProgressSummary, type EditorProject, type EditorSession } from '../shared/clip-editor'
+import { EDITOR_NEEDS_MATERIAL, EDITOR_NEEDS_SOURCE, EDITOR_REVISION_CONFLICT, editorFailureMessage, importCancelledMessage, editorProgress, isEditorErrorCode, parseCandidateEdit, parseEditorProject, parseVoiceoverConfig, parseMotionPlan, parseSpeakerNames, previewWindow, renderEditKey, assetRefs, type AudioTrack, type CandidateEdit, type EditorBatch, type EditorErrorCode, type EditorProgress, type EditorProgressSummary, type EditorProject, type EditorSession } from '../shared/clip-editor'
 import { addToAudioLibrary, audioTrackFile, getAudioTrack } from './audio-library'
 import { loadSettings, getSettingsForBridge, vocabularyTerms } from './settings-store'
 import { assertAbsolutePath, assertMediaPath, isWebUrl, isWithinDirectory, openAuthorizedMedia } from './security'
@@ -73,6 +73,8 @@ function sweepEditorFiles(run: string, project?: EditorProject): void {
   let removed = 0
   for (const entry of entries) {
     const temporary = entry.name.startsWith('.editor-')
+    // yt-dlp's `.part` and `.ytdl` from a killed import are deliberately left alone: they
+    // hold bytes the user already paid for, and a later download overwrites them anyway.
     if (!temporary && !(keep && EDITOR_MEDIA.test(entry.name) && !keep.has(entry.name) && (entry.isFile() || entry.isSymbolicLink()))) continue
     try { rmSync(join(run, entry.name), { recursive: temporary && entry.isDirectory(), force: true }); removed++ } catch { /* A playing preview can stay open on Windows; retry next time. */ }
   }
@@ -489,9 +491,10 @@ export async function runEditor(path: unknown, revision: unknown, candidateId: u
  * `focusClipIndex` (the reel's clip index) limits the preview to that reel's window, so
  * "Edit this" on one reel of a long show does not wait on a full-source transcode.
  */
-export async function createEditorProject(path: unknown, mediaPath?: unknown, focusClipIndex?: unknown): Promise<EditorSession> {
+export async function createEditorProject(path: unknown, mediaPath?: unknown, focusClipIndex?: unknown, allowDownload?: unknown): Promise<EditorSession> {
   const run = runPath(path), settings = loadSettings()
   if (mediaPath !== undefined && mediaPath !== null) assertAbsolutePath(mediaPath)
+  const wantsDownload = allowDownload === true
   if (focusClipIndex !== undefined && focusClipIndex !== null &&
     !(typeof focusClipIndex === 'number' && Number.isSafeInteger(focusClipIndex) && focusClipIndex >= 0 && focusClipIndex <= 999)) throw new Error('Invalid clip for this edit')
   const output = await getJobOutput(run, settings.outputDirectory)
@@ -530,6 +533,7 @@ export async function createEditorProject(path: unknown, mediaPath?: unknown, fo
     const python = resolvePythonPath(engine, settings.pythonPath)
     // Long sources re-download over the network; give the import a generous bound.
     const request = { run, library: realpathSync(settings.outputDirectory), action: 'create-project', source,
+      ...(wantsDownload ? { allow_download: true } : {}),
       ...(focusClipIndex !== undefined && focusClipIndex !== null ? { focus_clip: focusClipIndex } : {}) }
     if (source.kind === 'url') {
       try { await runWorker(run, operation, 'create-project', env, python, 60 * 60 * 1000, request) }
@@ -537,7 +541,14 @@ export async function createEditorProject(path: unknown, mediaPath?: unknown, fo
         // A failed re-download falls back to picking the file, unless the user
         // cancelled, it timed out, or the engine itself could not start.
         const code = (error as { editorCode?: EditorErrorCode }).editorCode
+        const progress = operation.progress
+        // The Cancel can land after minutes of downloading; name the lost progress.
+        if (operation.cancelled && progress?.downloadedBytes != null && progress.totalBytes) {
+          throw new Error(importCancelledMessage(progress))
+        }
         if (operation.cancelled || code === undefined || code === 'cancelled' || code === 'timeout' || code === 'engine_unavailable') throw error
+        // No local copy and no consent yet: ask him, instead of downloading on his behalf.
+        if (!wantsDownload && code === 'source_missing') throw new Error(EDITOR_NEEDS_MATERIAL)
         throw new Error(EDITOR_NEEDS_SOURCE)
       }
     } else {
@@ -596,6 +607,7 @@ function runWorker(run: string, operation: EditorOperation, action: WorkerAction
               const bytes = (x: unknown): number | undefined => typeof x === 'number' && Number.isFinite(x) && x >= 0 ? x : undefined
               const downloadedBytes = bytes(value.downloaded_bytes), totalBytes = bytes(value.total_bytes), bytesPerSecond = bytes(value.speed)
               operation.progress = { phase: value.phase, percent: Math.floor(value.percent),
+                ...(value.local === true ? { local: true } : {}),
                 ...(downloadedBytes !== undefined ? { downloadedBytes } : {}),
                 ...(totalBytes !== undefined ? { totalBytes } : {}),
                 ...(bytesPerSecond !== undefined ? { bytesPerSecond } : {}) }

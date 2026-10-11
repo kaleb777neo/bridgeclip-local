@@ -184,6 +184,43 @@ def test_invalid_caption_edits_and_states_are_rejected(patch):
     with pytest.raises(ValueError): validate_candidate({**candidate(), **patch}, 12000, 4)
 
 
+@pytest.mark.parametrize('style', [
+    {'primaryColor': '#FFFFFF', 'highlightColor': 'red', 'font': 'Anton', 'sizeScale': 1},
+    {'primaryColor': '#FFF', 'highlightColor': '#FF0000', 'font': 'Anton', 'sizeScale': 1},
+    {'primaryColor': '#FFFFFF', 'highlightColor': '#FF0000', 'font': 'Comic Sans', 'sizeScale': 1},
+    {'primaryColor': '#FFFFFF', 'highlightColor': '#FF0000', 'font': 'Anton', 'sizeScale': 2.5},
+    {'primaryColor': '#FFFFFF', 'highlightColor': '#FF0000', 'font': 'Anton', 'sizeScale': True},
+    {'primaryColor': '#FFFFFF', 'highlightColor': '#FF0000', 'font': 'Anton', 'sizeScale': 1, 'uppercase': 'yes'},
+    'not-a-dict',
+])
+def test_invalid_caption_styles_fail_before_rendering(style):
+    with pytest.raises(ValueError): validate_candidate({**candidate(), 'caption_style': style}, 12000)
+
+
+def test_caption_style_overrides_apply_accent_font_and_case():
+    from clip_engine.config import apply_caption_style_overrides, get_caption_preset
+    overrides = {'primaryColor': '#101010', 'highlightColor': '#39FF6A', 'font': 'Anton', 'sizeScale': 1.5, 'uppercase': False}
+    styled = apply_caption_style_overrides(get_caption_preset('pop'), overrides)
+    assert styled.primary_color == '#101010'
+    assert styled.highlight_color == '#39FF6A'
+    assert styled.font_name == 'Anton'
+    assert styled.italic is False
+    assert styled.font_size == round(get_caption_preset('pop').font_size * 1.5)
+    assert styled.uppercase is False
+    # A pill preset keeps its word readable: the accent lands on the pill, the text colour on the word.
+    pill = apply_caption_style_overrides(get_caption_preset('spotlight'), overrides)
+    assert pill.highlight_box_color == '#39FF6A'
+    assert pill.highlight_color == '#101010'
+    # A glow preset carries the accent on its bloom too.
+    glow = apply_caption_style_overrides(get_caption_preset('glow'), overrides)
+    assert glow.glow_color == '#39FF6A'
+    # The italic-only serif face carries its slant.
+    serif = apply_caption_style_overrides(get_caption_preset('pop'), {**overrides, 'font': 'Instrument Serif Italic'})
+    assert serif.italic is True
+    # Absent uppercase keeps the preset's own case.
+    assert apply_caption_style_overrides(get_caption_preset('editorial'), {k: v for k, v in overrides.items() if k != 'uppercase'}).uppercase is False
+
+
 def test_caption_corrections_preserve_word_timing_without_mutating_source():
     source = [TranscriptSegment(0, 2000, 'The event happened.', words=[
         TranscriptWord('The', 100, 400), TranscriptWord('event', 500, 1000), TranscriptWord('happened.', 1200, 1900)

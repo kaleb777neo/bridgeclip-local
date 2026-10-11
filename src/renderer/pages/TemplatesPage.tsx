@@ -5,8 +5,9 @@ import { getApi } from '../lib/ipc'
 import { useSettingsStore } from '../store/use-settings-store'
 import { uniqueTemplateId } from '../lib/template-id'
 import { templateBannerPlatforms, templateFramingStyles, templateFormats, templatePacingStyles, type BrandTemplate, type TemplateBannerPlatform, type TemplateFramingStyle, type TemplateFormat, type TemplatePacing } from '../../shared/templates'
-import { type OverlayPosition } from '../../shared/clip-editor'
-import { CaptionPresetPicker, CAPTION_PRESET_NAMES, captionPreviewPreset, textShadow } from '../components/CaptionPresetPicker'
+import { type OverlayPosition, type CaptionStyleOverrides } from '../../shared/clip-editor'
+import type { SavedCaptionStyle } from '../../shared/caption-styles'
+import { CaptionPresetPicker, CAPTION_PRESET_NAMES, applyCaptionStyleOverrides, captionPreviewPreset, textShadow } from '../components/CaptionPresetPicker'
 import { Page } from '../components/ui/Page'
 import { PageHeader } from '../components/ui/PageHeader'
 import { Panel, PanelHeader } from '../components/ui/Panel'
@@ -39,6 +40,8 @@ interface TemplateFormState {
   id: string | null
   name: string
   captionPresetId: string
+  /** Customisation layered on the preset; null = the plain preset. */
+  captionStyle: CaptionStyleOverrides | null
   /** Ordered, primary first; the click order is the render order. */
   formats: TemplateFormat[]
   logo: LogoDraft | null
@@ -68,6 +71,7 @@ const emptyForm = (): TemplateFormState => ({
   id: null,
   name: '',
   captionPresetId: 'pop',
+  captionStyle: null,
   formats: ['9:16'],
   logo: null,
   logoPath: null,
@@ -91,6 +95,7 @@ const formFromTemplate = (template: BrandTemplate, duplicate: boolean): Template
     id: duplicate ? null : template.id,
     name: duplicate ? `${template.name} copy` : template.name,
     captionPresetId: template.captionPresetId,
+    captionStyle: template.captionStyle ?? null,
     formats: [...template.formats],
     logo: template.logo ? { ...template.logo } : null,
     logoPath: null,
@@ -111,7 +116,7 @@ const formFromTemplate = (template: BrandTemplate, duplicate: boolean): Template
 
 function templateToForm(template: BrandTemplate): Omit<TemplateFormState, 'id' | 'logoPath' | 'introPath' | 'outroPath'> {
   const form = formFromTemplate(template, true)
-  return { name: form.name, captionPresetId: form.captionPresetId, formats: form.formats, logo: form.logo, intro: form.intro, outro: form.outro, badge: form.badge, badgePosition: form.badgePosition, safeZonePct: form.safeZonePct, pacing: form.pacing, layoutStyle: form.layoutStyle, includeTitle: form.includeTitle, bannerPlatform: form.bannerPlatform, bannerUrl: form.bannerUrl }
+  return { name: form.name, captionPresetId: form.captionPresetId, captionStyle: form.captionStyle, formats: form.formats, logo: form.logo, intro: form.intro, outro: form.outro, badge: form.badge, badgePosition: form.badgePosition, safeZonePct: form.safeZonePct, pacing: form.pacing, layoutStyle: form.layoutStyle, includeTitle: form.includeTitle, bannerPlatform: form.bannerPlatform, bannerUrl: form.bannerUrl }
 }
 
 export function TemplatesPage(): React.JSX.Element {
@@ -121,7 +126,20 @@ export function TemplatesPage(): React.JSX.Element {
   const [reload, setReload] = useState(0)
   const [form, setForm] = useState<TemplateFormState | null>(null)
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null)
+  /** Saved caption styles, offered in the form's picker. */
+  const [captionStyles, setCaptionStyles] = useState<SavedCaptionStyle[]>([])
   const closeConfirm = useCallback(() => setConfirm(null), [])
+
+  useEffect(() => {
+    let active = true
+    // A renderer hot-reloaded over an older preload has no caption-styles bridge.
+    void getApi().captionStyles?.list().then((list) => { if (active) setCaptionStyles(list) }).catch(() => {})
+    return () => { active = false }
+  }, [reload])
+
+  const refreshCaptionStyles = (): void => {
+    void getApi().captionStyles?.list().then(setCaptionStyles).catch(() => {})
+  }
 
   useEffect(() => {
     let active = true
@@ -180,6 +198,8 @@ export function TemplatesPage(): React.JSX.Element {
             onCancel={() => setForm(null)}
             onSaved={() => { setForm(null); refresh() }}
             takenIds={templates.map((t) => t.id)}
+            captionStyles={captionStyles}
+            onDeleteCaptionStyle={(id) => { void getApi().captionStyles?.delete(id).then(setCaptionStyles).catch(() => {}); refreshCaptionStyles() }}
           />
         ) : (
           <>
@@ -235,7 +255,7 @@ export function TemplatesPage(): React.JSX.Element {
 /** One pack tile: a small phone-frame preview plus the pack summary. */
 function TemplateCard({ template, children, defaultId }: { template: BrandTemplate; children: ReactNode; defaultId: string }): React.JSX.Element {
   const summary: string[] = [
-    CAPTION_PRESET_NAMES[template.captionPresetId] ?? template.captionPresetId,
+    `${CAPTION_PRESET_NAMES[template.captionPresetId] ?? template.captionPresetId}${template.captionStyle ? ' (customized)' : ''}`,
     template.formats.join(' + '),
     template.logo ? `Logo ${positionLabels[template.logo.position].toLowerCase()}` : 'No logo',
     template.intro && template.outro ? 'Intro + outro' : template.intro ? 'Intro video' : template.outro ? 'Outro video' : null,
@@ -263,6 +283,7 @@ function TemplateCard({ template, children, defaultId }: { template: BrandTempla
 interface PreviewProps {
   name?: string
   captionPresetId: string
+  captionStyle?: CaptionStyleOverrides | null
   formats: TemplateFormat[]
   logo: LogoDraft | null
   badge: 'none' | 'subscribe' | 'follow'
@@ -287,7 +308,8 @@ function PreviewFrame({ preview, logoPath, storedLogo, className }: {
   storedLogo: boolean
   className?: string
 }): React.JSX.Element {
-  const preset = captionPreviewPreset(preview.captionPresetId)
+  const base = captionPreviewPreset(preview.captionPresetId)
+  const preset = preview.captionStyle ? applyCaptionStyleOverrides(base, preview.captionStyle) : base
   const captionStyle: CSSProperties = {
     color: preset.primary,
     fontFamily: preset.font,
@@ -317,12 +339,15 @@ function PreviewFrame({ preview, logoPath, storedLogo, className }: {
   )
 }
 
-function TemplateFormPanel({ form, onChange, onCancel, onSaved, takenIds }: {
+function TemplateFormPanel({ form, onChange, onCancel, onSaved, takenIds, captionStyles = [], onDeleteCaptionStyle }: {
   form: TemplateFormState
   onChange: (form: TemplateFormState) => void
   onCancel: () => void
   onSaved: () => void
   takenIds: string[]
+  /** Saved caption styles, offered as picker tiles next to the built-ins. */
+  captionStyles?: SavedCaptionStyle[]
+  onDeleteCaptionStyle?: (id: string) => void
 }): React.JSX.Element {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -365,6 +390,7 @@ function TemplateFormPanel({ form, onChange, onCancel, onSaved, takenIds }: {
       captionPresetId: form.captionPresetId,
       formats: form.formats,
       includeTitle: form.includeTitle,
+      ...(form.captionStyle ? { captionStyle: form.captionStyle } : {}),
       ...(form.logo ? { logo: form.logo } : {}),
       ...(form.intro ? { intro: form.intro } : {}),
       ...(form.outro ? { outro: form.outro } : {}),
@@ -450,7 +476,10 @@ function TemplateFormPanel({ form, onChange, onCancel, onSaved, takenIds }: {
           </Section>
 
           <Section title="Captions">
-            <CaptionPresetPicker value={form.captionPresetId} onChange={(captionPresetId) => set({ captionPresetId })} />
+            <CaptionPresetPicker value={form.captionPresetId} onChange={(captionPresetId) => set({ captionPresetId, captionStyle: null })}
+              customStyles={captionStyles} styleValue={form.captionStyle}
+              onSelectCustom={(saved) => set({ captionPresetId: saved.preset, captionStyle: saved.style })}
+              onDeleteCustom={onDeleteCaptionStyle} />
           </Section>
 
           <Section title="Format">

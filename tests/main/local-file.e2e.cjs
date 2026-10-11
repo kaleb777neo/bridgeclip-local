@@ -13,7 +13,6 @@ test('Electron authorizes local media and supports ranges, playback and seeking'
   const tools = editorTools(t)
   if (!tools) return
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-media-e2e-'))
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const userDataDir = path.join(root, 'user-data')
   const library = path.join(userDataDir, 'BridgeClip')
   fs.mkdirSync(library, { recursive: true })
@@ -35,7 +34,8 @@ test('Electron authorizes local media and supports ranges, playback and seeking'
   assert.ok(fs.statSync(video).size > 4 * 1024 * 1024)
   const appDir = buildApp(path.join(root, 'app'))
   const session = await launchApp({ appDir, userDataDir })
-  t.after(() => session.close())
+  // Closing first: an Electron process holding the folder makes rmSync fail on Windows.
+  t.after(async () => { await session.close(); fs.rmSync(root, { recursive: true, force: true }) })
   const request = (file, range) => session.app.evaluate(async ({ net }, { file, range }) => {
     const headers = range ? { Range: range } : {}
     const response = await net.fetch(`local-file://media/${encodeURIComponent(file)}`, { headers })

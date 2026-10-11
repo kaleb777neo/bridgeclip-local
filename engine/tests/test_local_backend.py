@@ -3,10 +3,12 @@
 All offline: no Ollama server, no model weights, no cloud credentials.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
+from clip_engine.services import local_llm
 from clip_engine.services.local_llm import (
     is_local_backend,
     normalize_payload,
@@ -20,8 +22,15 @@ from clip_engine.services.intelligence_planner import (
     IntelligencePlannerService,
     ClipPlanResponse,
     ClipPlanSegment,
+    MAX_TITLE_WORDS,
+    _title_is_usable,
+    _title_needs_repair,
+    _title_is_foreign,
+    _spoken_vocabulary,
+    _trimmed_title,
     _window_overlap_ratio,
     LOCAL_TRANSCRIPT_WINDOW_CHARS,
+    LOCAL_MAX_CLIPS_PER_REQUEST,
 )
 from clip_engine.services.transcription_service import TranscriptionResult
 from clip_engine.services import model_fetch
@@ -394,6 +403,31 @@ async def test_windowed_planning_splits_and_covers_everything(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_windowed_plan_repairs_the_merged_titles_once(monkeypatch):
+    planner = _RecordingPlanner()
+    repaired = []
+
+    async def spy(segments, transcript, language):
+        repaired.append((len(segments), len(transcript), language))
+
+    monkeypatch.setattr(planner, "_repair_local_titles", spy)
+    segments = [segment(i * 1000, i * 1000 + 900, "cuvinte românești " * 4) for i in range(600)]
+    result = TranscriptionResult(
+        segments=segments, full_text="x", language="ro",
+        duration_seconds=600.0, provider="local",
+    )
+    out = await planner._plan_local_windowed(
+        transcript_result=result, transcript=segments,
+        video_metadata=None, max_clips=5, auto_clip_count=True,
+        min_duration_seconds=5, max_duration_seconds=60,
+        duration_ranges=None, target_platform="tiktok",
+        aspect_ratio="9:16", source_context=None, clip_request=None,
+    )
+    # One repair over the merged clips, judged against the whole transcript.
+    assert repaired == [(len(out.segments), len(segments), "ro")]
+
+
+@pytest.mark.asyncio
 async def test_windowed_planning_returns_none_below_budget():
     planner = _RecordingPlanner()
     small = [segment(0, 900, "scurt")]
@@ -483,6 +517,34 @@ async def test_local_plan_caps_clips_at_output_budget(monkeypatch):
     assert f"Return exactly {LOCAL_MAX_CLIPS_PER_REQUEST} clips" in captured[0]
     assert "Return exactly 13 clips" not in captured[0]
     assert "Return exactly 24 clips" not in captured[0]
+    # The per-request cap is not the job's ceiling: windowed planning pays it once
+    # per window and the job keeps everything the range and the request allow.
+    assert planner.discovery_limit == 13
+
+
+@pytest.mark.asyncio
+async def test_windowed_plan_keeps_every_window_beyond_the_per_request_cap(monkeypatch):
+    planner, captured, result = _budget_planner(
+        monkeypatch, [('{"clips": []}', 'stop')] * 4)
+    long_speech = [segment(i * 1000, i * 1000 + 900, "cuvinte românești " * 4) for i in range(600)]
+    result = TranscriptionResult(
+        segments=long_speech, full_text="x", language="ro",
+        duration_seconds=600.0, provider="local",
+    )
+    async def no_repair(segments, transcript, language):
+        return None
+    monkeypatch.setattr(planner, "_repair_local_titles", no_repair)
+
+    await planner.plan_clips(
+        result, max_clips=24, auto_clip_count=True,
+        min_duration_seconds=30, max_duration_seconds=120,
+    )
+    assert len(captured) >= 2, "the transcript is planned in windows"
+    # Each window pays the per-request cap...
+    assert all(f"Return exactly {LOCAL_MAX_CLIPS_PER_REQUEST} clips" in prompt for prompt in captured)
+    # ...but the job's ceiling stays the requested count, so the later windows'
+    # clips are kept instead of discarded at selection.
+    assert planner.discovery_limit > LOCAL_MAX_CLIPS_PER_REQUEST
 
 
 @pytest.mark.asyncio
@@ -508,6 +570,189 @@ async def test_cloud_truncated_plan_keeps_the_same_request(monkeypatch):
     await _plan(planner, result)
     assert len(captured) == 2
     assert captured[0] == captured[1]
+
+
+# ---------------------------------------------------------------------------
+# Titles the local planner writes as descriptions
+# ---------------------------------------------------------------------------
+
+RUNAWAY = ("The speaker criticizes the current government's actions, "
+           "particularly their handling of a sports event, calling it a disgrace")
+FIRST_CLAUSE = "The speaker criticizes the current government's actions"
+
+
+def titled(summary):
+    return ClipPlanSegment(start_time_ms=0, end_time_ms=5000, virality_score=0.5, summary=summary)
+
+
+def test_title_usability_follows_the_seven_word_card():
+    assert _title_is_usable("Datoria publică a României", "ro")
+    assert not _title_is_usable(RUNAWAY, "ro")
+    assert not _title_is_usable(RUNAWAY, None)
+    assert _title_is_usable("The debt nobody mentions", "en")
+    # Only English drift is punished: a terse English title has no stopwords either.
+    assert _title_is_usable("Datoria publică crește", "en")
+    # Two "și" must not read as the English word "i".
+    assert _title_is_usable("Guvernul și criza și datoria", "ro")
+
+
+def test_missing_titles_are_left_alone():
+    assert not _title_needs_repair(None, "ro")
+    assert not _title_needs_repair("   ", "ro")
+
+
+def romanian_transcript():
+    speech = ("Guvernul a crescut datoria publică, premierul vorbește despre deficit "
+              "în fața parlamentului, iar sindicatele cer măriri de salariu pentru "
+              "profesori și medici pentru că prețurile la energie au explodat")
+    # The detector only reads a transcript with a few hundred distinct words as
+    # evidence of the spoken language; a thin one calls every title foreign.
+    filler = "".join(f" {chr(97 + i // 26)}{chr(97 + i % 26)}" for i in range(300))
+    return [segment(0, 60_000, speech + filler)]
+
+
+def test_terse_english_titles_are_foreign_to_a_romanian_video():
+    # A short English headline carries no stopword pattern for _is_english to see;
+    # the words the speaker never used are what mark it foreign.
+    vocabulary = _spoken_vocabulary(romanian_transcript())
+    assert _title_is_foreign("Media Censorship and Public Reaction", vocabulary)
+    assert not _title_is_foreign("Datoria publică a crescut", vocabulary)
+    assert not _title_is_foreign("Deficitul și datoria", vocabulary)
+
+
+def test_a_thin_transcript_is_not_evidence_of_a_foreign_title():
+    vocabulary = _spoken_vocabulary([segment(0, 5000, "datoria e uriașă")])
+    assert len(vocabulary) < 200
+    assert not _title_is_foreign("Media Censorship and Public Reaction", vocabulary)
+
+
+def test_the_spoken_vocabulary_decides_which_cards_read_as_foreign():
+    vocabulary = _spoken_vocabulary(romanian_transcript())
+    assert not _title_is_usable("Media Censorship and Public Reaction", "ro", vocabulary)
+    assert _title_is_usable("Datoria publică a crescut", "ro", vocabulary)
+    # An English video keeps its English titles.
+    assert _title_is_usable("Media Censorship and Public Reaction", "en", vocabulary)
+    # Fewer than three words give the detector nothing to judge.
+    assert _title_is_usable("Cenzura media", "ro", vocabulary)
+
+
+def test_title_repair_looks_at_the_foreign_ones_only():
+    vocabulary = _spoken_vocabulary(romanian_transcript())
+    assert _title_needs_repair("Media Censorship and Public Reaction", "ro", vocabulary)
+    assert not _title_needs_repair("Datoria publică a crescut", "ro", vocabulary)
+
+
+def test_trimmed_title_keeps_the_first_clause():
+    assert _trimmed_title(RUNAWAY) == FIRST_CLAUSE
+    assert len(FIRST_CLAUSE.split()) <= MAX_TITLE_WORDS
+    assert _trimmed_title("a b c d e f g h i j") == "a b c d e f g"
+    assert _trimmed_title("") is None
+
+
+def _repair_planner():
+    planner = IntelligencePlannerService.__new__(IntelligencePlannerService)
+    planner.settings = local_settings()
+    return planner
+
+
+@pytest.mark.asyncio
+async def test_repair_local_titles_asks_once_and_validates_answers(monkeypatch):
+    planner = _repair_planner()
+    payloads = []
+
+    async def fake_chat(settings, payload):
+        payloads.append(payload)
+        return completion_body(json.dumps({"titles": [
+            {"index": 0, "title": "Datoria României"},
+            {"index": 1, "title": "The speaker also criticizes the current government endlessly"},
+        ]}), "stop"), dict(USAGE)
+
+    monkeypatch.setattr(local_llm, "ollama_chat", fake_chat)
+    segments = [titled(RUNAWAY), titled(RUNAWAY)]
+    await planner._repair_local_titles(segments, [segment(0, 5000, "datoria e uriașă")], "ro")
+
+    assert len(payloads) == 1
+    assert "in ro" in payloads[0]["messages"][0]["content"]
+    assert segments[0].summary == "Datoria României"
+    # An answer that still breaks the rule falls back to the trim, not the card cut.
+    assert segments[1].summary == FIRST_CLAUSE
+
+
+@pytest.mark.asyncio
+async def test_repair_local_titles_rewrites_english_headlines_of_a_romanian_video(monkeypatch):
+    planner = _repair_planner()
+    asked = []
+
+    async def fake_chat(settings, payload):
+        asked.append(json.loads(payload["messages"][1]["content"]))
+        return completion_body(json.dumps({"titles": [
+            {"index": 1, "title": "Deficitul și datoria publică"},
+        ]}), "stop"), dict(USAGE)
+
+    monkeypatch.setattr(local_llm, "ollama_chat", fake_chat)
+    segments = [titled("Datoria publică a crescut"), titled("Media Censorship and Public Reaction")]
+    await planner._repair_local_titles(segments, romanian_transcript(), "ro")
+
+    assert [item["index"] for item in asked[0]["clips"]] == [1]
+    assert segments[0].summary == "Datoria publică a crescut"
+    assert segments[1].summary == "Deficitul și datoria publică"
+
+
+@pytest.mark.asyncio
+async def test_repair_local_titles_survives_an_unreachable_model(monkeypatch):
+    planner = _repair_planner()
+
+    async def broken(settings, payload):
+        raise RuntimeError("Ollama is not reachable")
+
+    monkeypatch.setattr(local_llm, "ollama_chat", broken)
+    segments = [titled(RUNAWAY)]
+    await planner._repair_local_titles(segments, [segment(0, 5000, "text")], "ro")
+    assert segments[0].summary == FIRST_CLAUSE
+
+
+@pytest.mark.asyncio
+async def test_local_plan_asks_for_and_ships_titles_in_the_spoken_language(monkeypatch):
+    plan = json.dumps({"clips": [{
+        "start_time": 20, "end_time": 80, "summary": RUNAWAY,
+        "scores": {"hook": 8, "standalone": 8, "arc": 8, "quotability": 8, "ending": 8},
+        "tags": ["datorie"], "emphasis": ["datorie"],
+    }]})
+    planner, captured, result = _budget_planner(monkeypatch, [(plan, "stop")])
+
+    async def fake_chat(settings, payload):
+        return completion_body(json.dumps({"titles": [{"index": 0, "title": "Datoria României"}]}),
+                               "stop"), dict(USAGE)
+
+    monkeypatch.setattr(local_llm, "ollama_chat", fake_chat)
+    out = await _plan(planner, result)
+    assert "Write every title in ro" in captured[0]
+    assert out.segments[0].summary == "Datoria României"
+
+
+@pytest.mark.asyncio
+async def test_cloud_plan_prompt_keeps_the_original_title_rules(monkeypatch):
+    planner, captured, result = _budget_planner(monkeypatch, [('{"clips": []}', "stop")])
+    planner.settings = planner_settings(ai_backend="cloud")
+    await _plan(planner, result)
+    assert "Write every title" not in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_local_plan_asks_for_headroom_over_the_minimum(monkeypatch):
+    # Gap trimming shortens what the planner sized, so a clip planned at the
+    # minimum ships under it. Only the local models need telling.
+    planner, captured, result = _budget_planner(monkeypatch, [('{"clips": []}', "stop")])
+    await _plan(planner, result)
+    assert "Aim for the middle of the length you pick, never its lower edge" in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_cloud_plan_keeps_the_original_duration_rules(monkeypatch):
+    planner, captured, result = _budget_planner(monkeypatch, [('{"clips": []}', "stop")])
+    planner.settings = planner_settings(ai_backend="cloud")
+    await _plan(planner, result)
+    assert "Aim for the middle of the length" not in captured[0]
 
 
 # ---------------------------------------------------------------------------

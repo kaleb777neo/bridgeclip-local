@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import type { CaptionStyleOverrides } from '../../shared/clip-editor'
 
 /** The Create wizard's steps, in order. */
 export type WizardStep = 'video' | 'format' | 'clips' | 'captions' | 'review'
@@ -40,10 +41,14 @@ export interface ClipDraft {
   durations: string[]
   autoClipCount: boolean
   maxClips: number
+  /** Full coverage: extract every self-contained moment, not only the most viral. */
+  coverage: boolean
   includeCaptions: boolean
   /** Only add caption without clipping: caption the whole video, no clip selection. */
   captionsOnly: boolean
   captionPreset: string
+  /** Customisation layered on captionPreset; null = the plain preset. */
+  captionStyle: CaptionStyleOverrides | null
   /** User-uploaded .srt for the transcript; null uses AI transcription. */
   srtPath: string | null
   srtName: string | null
@@ -85,9 +90,11 @@ export const useDraftStore = create<DraftState>((set) => ({
   durations: ['short'],
   autoClipCount: true,
   maxClips: 5,
+  coverage: false,
   includeCaptions: true,
   captionsOnly: false,
   captionPreset: 'pop',
+  captionStyle: null,
   srtPath: null,
   srtName: null,
   includeTitle: true,

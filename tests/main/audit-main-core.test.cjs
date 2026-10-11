@@ -49,7 +49,7 @@ function ipcWithLibrary(library) {
     './security': security,
     './network-policy': {},
     './validation': {},
-    './templates-store': {},
+    './templates-store': {}, './caption-styles-store': {},
     './template-resolve': {},
     './openrouter-models': {},
     './local-ai': {},

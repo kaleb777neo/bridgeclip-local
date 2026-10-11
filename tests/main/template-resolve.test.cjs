@@ -196,3 +196,20 @@ test('unknown templates, presets and format conflicts fail closed', () => {
   // An explicit 16:9 review choice stays — manual edits win, and it is renderable.
   assert.equal(resolve.applyTemplateSnapshot({ ...base({ workflow: 'review' }), templateId: 'square-pack' }).aspectRatio, '16:9')
 })
+
+test('a pack caption style materializes with its preset, and a manual choice wins', () => {
+  const style = { primaryColor: '#101010', highlightColor: '#39FF6A', font: 'Anton', sizeScale: 1.25, uppercase: false }
+  store.saveTemplate({ id: 'styled-pack', name: 'Styled pack', captionPresetId: 'pop', captionStyle: style, formats: ['9:16'] })
+  const filled = resolve.applyTemplateSnapshot({ ...bare(), templateId: 'styled-pack' })
+  assert.equal(filled.captionPreset, 'pop')
+  assert.deepEqual(filled.captionStyle, style)
+  const manual = resolve.applyTemplateSnapshot({
+    ...base({ captionPreset: 'neon', captionStyle: { ...style, font: 'Archivo Black' } }),
+    templateId: 'styled-pack'
+  })
+  assert.equal(manual.captionPreset, 'neon')
+  assert.deepEqual(manual.captionStyle.font, 'Archivo Black')
+  // A pack without a style never injects one.
+  store.saveTemplate({ id: 'plain-pack', name: 'Plain pack', captionPresetId: 'boxed', formats: ['9:16'] })
+  assert.equal(resolve.applyTemplateSnapshot({ ...bare(), templateId: 'plain-pack' }).captionStyle, undefined)
+})

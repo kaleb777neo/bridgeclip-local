@@ -39,7 +39,7 @@ function loadHandlers() {
     './clip-editor': clipEditor, './editor-ai': {}, './edit-inspector': { inspectEdits: async () => ({}) },
     './export-fcpxml': {}, './run-history': {}, './pipeline-runner': {}, './job-manager': { initJobManager() {} },
     './logger': {}, './security': { authorizeMedia: (p) => { if (!fs.existsSync(p)) throw new Error('The media file could not be read'); return p }, assertTrustedSender() {}, assertAbsolutePath(p) { return p }, isWebUrl: () => true, isTrustedExternalUrl: () => true, openAuthorizedMedia: async () => { throw new Error('unused') } },
-    './network-policy': {}, './validation': {}, './templates-store': {}, './template-resolve': {},
+    './network-policy': {}, './validation': {}, './templates-store': {}, './caption-styles-store': {}, './template-resolve': {},
     './openrouter-models': {}, './youtube-preview': {}, './tools': {}, './local-ai': { modelsDir: () => '/tmp/m' },
     './zernio/service': {}, './zernio/posts': {}, './zernio/analytics': {},
     './automations': {}, './library-posting': {}, './library-management': {}

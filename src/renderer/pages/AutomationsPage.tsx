@@ -257,6 +257,36 @@ export function AutomationsPage({ onNavigate, onViewLibrary }: { onNavigate: (pa
     else setNotice('Retry finished. Check the clip’s status in the content bank.')
   }
 
+  /** Every account of the saved automation takes the post; unsaved draft picks do not. */
+  const publishTargets = (automation: Automation): string =>
+    [...new Set(automation.accounts.map((account) => platformName(account.platform)))].join(', ') || 'no account yet'
+
+  // Both of these publish for real on the first click, so the destination is said
+  // out loud before the run starts.
+  const requestRunNow = (): void => {
+    if (!selected) return
+    const nextClip = nextAutomationContent(selected)
+    if (!nextClip) return
+    setConfirm({
+      title: 'Publish this clip now?',
+      tone: 'primary',
+      body: <>“{nextClip.title}” is posted to {publishTargets(selected)} right now, with the saved automation settings. Published posts stay on your accounts; unpublish them in Posts if this was not the plan.</>,
+      confirmLabel: 'Publish now',
+      onConfirm: () => void runNow()
+    })
+  }
+
+  const requestRetryContent = (item: AutomationContent): void => {
+    if (!selected) return
+    setConfirm({
+      title: 'Publish this clip again?',
+      tone: 'primary',
+      body: <>“{item.title}” is posted to {publishTargets(selected)} right now, with the saved automation settings. This is the same run that failed, so a partial post can publish the remaining accounts.</>,
+      confirmLabel: 'Retry and publish',
+      onConfirm: () => void retryContent(item)
+    })
+  }
+
   const remove = (): void => {
     if (!selected) return
     setConfirm({
@@ -515,8 +545,8 @@ export function AutomationsPage({ onNavigate, onViewLibrary }: { onNavigate: (pa
                       icon={<Play className="h-3 w-3" />}
                       loading={busy === 'run'}
                       disabled={Boolean(busy) || !nextClip || dirty}
-                      title={dirty ? 'Save automation changes first' : !nextClip ? 'Add a clip, then complete any TikTok reviews and enhanced drafts first' : 'Post the next ready clip now'}
-                      onClick={() => void runNow()}
+                      title={dirty ? 'Save automation changes first' : !nextClip ? 'Add a clip, then complete any TikTok reviews and enhanced drafts first' : 'Publish the next ready clip now, to every account this automation uses'}
+                      onClick={requestRunNow}
                     >Run now</Button>
                     <Button size="sm" variant="ghost" iconOnly aria-label={`Delete ${selected.name}`} title="Delete automation" icon={<Trash2 className="h-3.5 w-3.5" />} disabled={Boolean(busy)} onClick={remove} />
                   </div>
@@ -743,7 +773,7 @@ export function AutomationsPage({ onNavigate, onViewLibrary }: { onNavigate: (pa
                                 onEnhance={() => setEnhancing({ automationId: selected.id, contentId: item.id })}
                                 enhancementDisabled={dirty || !writingConfigured}
                                 enhanced={hasEnhancedMetadata(item, selected.accounts.length ? selected.accounts.map((account) => account.platform) : ['youtube'])}
-                                onRetry={() => void retryContent(item)}
+                                onRetry={() => requestRetryContent(item)}
                                 retryDisabled={dirty || Boolean(editing) || needsTikTokReview(selected, item)}
                                 onDismissError={() => { if (!busy) void mutate('dismiss-warning', () => getApi().automations.acknowledgeWarnings(selected.id, item.id)) }}
                                 onDismissMetadataError={() => { if (!busy) void mutate('dismiss-metadata', () => getApi().automations.dismissMetadataError(selected.id, item.id)) }}
@@ -916,7 +946,7 @@ function ContentRow({ item, nextUp, tiktokReviewNeeded, tiktokSelected, onReview
           {nextUp && <Badge tone="accent" className="h-4 px-1.5 text-[10px]">Next up</Badge>}
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-1">
-          {item.status === 'queued' && !item.postId && item.error && <Button size="sm" variant="secondary" icon={<RefreshCw className="h-3 w-3" />} disabled={busy || retryDisabled || Boolean(item.metadataDraft)} onClick={onRetry} title="Retry this clip now, using the saved automation settings">Retry clip</Button>}
+          {item.status === 'queued' && !item.postId && item.error && <Button size="sm" variant="secondary" icon={<RefreshCw className="h-3 w-3" />} disabled={busy || retryDisabled || Boolean(item.metadataDraft)} onClick={onRetry} title="Publish this failed clip again, right now, to every account this automation uses">Retry clip</Button>}
           {item.status === 'queued' && !item.postId && (item.metadataDraft || !enhanced) && <Button size="sm" variant="ghost" disabled={busy || (!item.metadataDraft && enhancementDisabled)} onClick={onEnhance}>{item.metadataDraft ? 'Review draft' : 'Enhance'}</Button>}
           {tiktokReviewNeeded && <Button size="sm" variant="secondary" onClick={onReviewTikTok} disabled={busy || reviewDisabled || Boolean(item.metadataDraft)}>Review TikTok</Button>}
           {item.status === 'needs_review' && <Button size="sm" variant="secondary" onClick={onReturnToQueue} disabled={busy || Boolean(editing)} title={editing ? 'Save or close the editor first' : 'Review and return this clip to the queue'}>Return to queue</Button>}

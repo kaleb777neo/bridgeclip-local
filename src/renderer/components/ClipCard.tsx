@@ -3,7 +3,6 @@ import { Check, Copy, FolderOpen, ImageOff, ListPlus, Play, Scissors, Send, Tras
 import { cn, formatTimecode, isMac, localFileUrl } from '../lib/utils'
 import { getApi } from '../lib/ipc'
 import { clipFilePath, loadThumbnail } from '../lib/thumbnails'
-import { dirname, join } from 'path'
 import type { ClipArtifact } from '../store/use-job-store'
 import { Checkbox } from './ui/Checkbox'
 import { Badge } from './ui/Badge'
@@ -20,6 +19,16 @@ const LAYOUT_LABELS: Record<string, string> = {
   screen: 'Whole frame',
   fit: 'Whole frame',
   center_crop: 'Center crop'
+}
+
+function fileDirectory(filePath: string): string {
+  const separator = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'))
+  return separator < 0 ? '' : filePath.slice(0, separator)
+}
+
+function fileInDirectory(directory: string, file: string): string {
+  if (!directory) return file
+  return `${directory}${directory.includes('\\') ? '\\' : '/'}${file}`
 }
 
 interface ClipCardProps {
@@ -91,12 +100,13 @@ export function ClipCard({
       })
     }
     // A stored cover (picked frame or uploaded image) replaces the auto cover.
+    const directory = fileDirectory(filePath)
     const stored = typeof getApi().history.thumbnail === 'function'
-      ? getApi().history.thumbnail(dirname(filePath), clip.clip_index).catch(() => null)
+      ? getApi().history.thumbnail(directory, clip.clip_index).catch(() => null)
       : Promise.resolve(null)
     void stored.then((cover) => {
       if (cancelled) return
-      if (cover?.kind === 'image' && cover.file) setThumb(join(dirname(filePath), cover.file))
+      if (cover?.kind === 'image' && cover.file) setThumb(fileInDirectory(directory, cover.file))
       else load(cover?.kind === 'frame' ? (cover.atMs ?? 0) / 1000 : undefined)
     })
     return () => {

@@ -51,7 +51,7 @@ test('each new video requires a workflow, with keyboard selection and guarded na
     assert.equal(motion.moving, true)
   }
   const addSource = async () => {
-    await page.getByPlaceholder('YouTube, Twitch VOD or direct video link').fill('https://example.com/video.mp4')
+    await page.getByPlaceholder(/or direct link/).fill('https://example.com/video.mp4')
     await page.getByRole('button', { name: 'Use link', exact: true }).click()
   }
   const assertUnselected = async () => {
@@ -114,7 +114,7 @@ test('each new video requires a workflow, with keyboard selection and guarded na
   assert.equal(await automatic.locator('svg.workflow-illustration').evaluate((svg) => svg.getAnimations({ subtree: true }).length), 0)
   await review.click()
   assert.equal(await review.locator('svg.workflow-illustration').evaluate((svg) => svg.getAnimations({ subtree: true }).length), 0)
-  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(720, 700))
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(720, 700))
   await page.waitForFunction(() => window.innerWidth === 720)
   if (artifacts) await page.screenshot({ path: path.join(artifacts, 'workflow-compact.png') })
   await page.waitForFunction(() => document.documentElement.scrollWidth <= window.innerWidth, null, { timeout: 5000 })

@@ -58,11 +58,35 @@ export interface ErrorUpdate {
 
 type BridgeMessage = ProgressUpdate | ResultUpdate | ErrorUpdate
 
-function safeBridgeText(value: unknown): string {
-  if (typeof value !== 'string' || value.length > 300 || /https?:\/\/|[\\/]|(?:token|secret|key)\s*[:=]/i.test(value)) {
-    return 'The clipping engine could not complete this step.'
-  }
-  return value
+const GENERIC_BRIDGE_TEXT = 'The clipping engine could not complete this step.'
+
+/**
+ * Worker text is often the only explanation a failed run gives, and the useful
+ * part of it is usually the thing it names: "Add credits at openrouter.ai/credits",
+ * "pip install -r engine/requirements-local.txt", "Rendering clip 3/10". A plain
+ * "contains a slash" rule threw all of those away.
+ *
+ * So the check is on the shapes that are actually private, not on the separator:
+ * scheme links and absolute local paths replace the whole string, while
+ * credentials are stripped in place and the rest of the sentence survives.
+ */
+export function safeBridgeText(value: unknown): string {
+  if (typeof value !== 'string') return GENERIC_BRIDGE_TEXT
+  // eslint-disable-next-line no-control-regex
+  const stripped = value.replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]+/g, ' ')
+  if (/\b[a-z][a-z0-9+.-]*:\/\//i.test(stripped) ||
+      /(?:^|[\s'"(])(?:[A-Za-z]:[\\/]|[\\/][^\\/\s])/.test(stripped)) return GENERIC_BRIDGE_TEXT
+  const text = stripped
+    .replace(/\b(?:authorization|bearer|basic)\s+\S+/gi, '[redacted]')
+    // Only a value long enough to be a credential; "the key: out of credits" stays readable.
+    .replace(/\b(?:api[_-]?key|access[_-]?token|token|secret|password|passwd|key)\b\s*[:=]\s*\S{8,}/gi, '[redacted]')
+    .replace(/\b(?:sk|pk|rk|zrk|ghp|xoxb|nvapi)[-_][A-Za-z0-9_-]{6,}\b/g, '[redacted]')
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*){0,2}/g, '[redacted]')
+    .replace(/[A-Za-z0-9+/]{40,}={0,2}/g, '[redacted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!text) return GENERIC_BRIDGE_TEXT
+  return text.length > 300 ? `${text.slice(0, 299).trimEnd()}…` : text
 }
 
 /**
@@ -461,6 +485,7 @@ export function startClipJob(
     ...(config.clipRequest ? { clip_request: config.clipRequest } : {}),
     max_clips: config.maxClips,
     auto_clip_count: config.autoClipCount,
+    coverage: config.coverage === true,
     duration_ranges: config.durationRanges,
     aspect_ratio: config.aspectRatio,
     aspect_ratios: config.aspectRatios?.length ? config.aspectRatios : [config.aspectRatio],
@@ -470,6 +495,7 @@ export function startClipJob(
     video_speed: config.videoSpeed ?? 1,
     include_captions: config.includeCaptions,
     caption_preset: config.captionPreset,
+    ...(config.captionStyle ? { caption_style: config.captionStyle } : {}),
     include_title: config.includeTitle ?? true,
     keyterms: vocabularyTerms(settings.customVocabulary),
     ...(config.srtPath ? { srt_path: config.srtPath } : {}),

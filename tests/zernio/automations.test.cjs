@@ -45,7 +45,10 @@ test('reordered queues and original media provenance survive a fresh load', asyn
     const [automation] = main.automations.createAutomation('Queue')
     const [added] = await main.automations.addAutomationContent(automation.id, paths)
     const [a, b, c] = added.content
-    assert.equal(a.sourceClipPath, fs.realpathSync(paths[0]))
+    // The store keeps the canonical spelling Windows resolves to (os.tmpdir() is
+    // an 8.3 path here), so compare against the same form the app writes.
+    const canonical = process.platform === 'win32' ? fs.realpathSync.native(paths[0]) : fs.realpathSync(paths[0])
+    assert.equal(a.sourceClipPath, canonical)
     main.automations.reorderAutomationContent(automation.id, c.id, a.id)
     const reloaded = loadMain(source, mocks).automations.listAutomations()[0]
     assert.deepEqual(reloaded.content.map((item) => item.id), [c.id, a.id, b.id])

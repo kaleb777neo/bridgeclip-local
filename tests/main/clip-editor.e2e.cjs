@@ -29,7 +29,7 @@ test('review editor refines candidates, restores discards, edits captions and ba
   fs.writeFileSync(path.join(userDataDir, 'settings.json'), JSON.stringify({ version: 6, outputDirectory: library, pythonPath: tools.python, openrouterApiKey: '', zernioApiKey: '' }))
   const appDir = buildApp(path.join(root, 'app'))
   linkEngine(appDir)
-  const session = await launchApp({ appDir, userDataDir, env: tools.appEnv })
+  const session = await launchApp({ appDir, userDataDir, env: tools.appEnv, show: true })
   t.after(async () => {
     await session.page.mouse.up().catch(() => {})
     // A failed assertion can leave an unsaved edit or a captured pointer.
@@ -74,7 +74,7 @@ test('review editor refines candidates, restores discards, edits captions and ba
   await clickCut(1, .75)
   await page.getByRole('combobox', { name: 'Timeline zoom', exact: true }).click()
   await page.getByRole('option', { name: 'Clip', exact: true }).click()
-  await page.getByRole('button', { name: 'Seek within cut 1', exact: true }).press('Enter')
+  await page.getByRole('button', { name: /^Seek within cut 1\b/ }).press('Enter')
   await page.waitForFunction(() => Math.abs(document.querySelector('.editor-source-frame video').currentTime - 1) < .04)
   // Leaving the editor for Settings saves pending edits and keeps the app mounted.
   const originalTitle = await page.getByLabel('Title', { exact: true }).inputValue()

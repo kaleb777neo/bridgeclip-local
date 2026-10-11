@@ -5,7 +5,7 @@ import { isWebUrl } from './security'
 import { CLIP_REQUEST_MAX_CHARS, DURATION_IDS, isVideoSpeed } from '../shared/job-contract'
 import { isModelId } from '../shared/openrouter-models'
 import { isTemplateId } from '../shared/templates'
-import { overlayPositions } from '../shared/clip-editor'
+import { overlayPositions, parseCaptionStyle } from '../shared/clip-editor'
 import { getTemplate } from './templates-store'
 
 // Trims what Python's str.strip() also treats as whitespace (\x1c-\x1f, \x85),
@@ -73,6 +73,10 @@ export function validateJobConfig(value: unknown): ClipJobConfig {
   )) throw new Error('Invalid output formats')
   if (v.workflow === 'review' && ((v.aspectRatios?.length ?? 0) > 1 || (v.aspectRatio === '1:1' && v.aspectRatios?.some((ratio) => ratio !== '1:1')))) throw new Error('Review & edit renders a single 9:16, 16:9 or 1:1 video')
   if (typeof v.captionPreset !== 'string' || !/^[a-z0-9_-]{1,64}$/i.test(v.captionPreset)) throw new Error('Invalid caption preset')
+  if (v.coverage !== undefined && typeof v.coverage !== 'boolean') throw new Error('Invalid coverage flag')
+  if (v.captionStyle !== undefined) {
+    try { parseCaptionStyle(v.captionStyle) } catch { throw new Error('Invalid caption style') }
+  }
   if (v.durationRanges !== null && (!Array.isArray(v.durationRanges) || v.durationRanges.length > DURATION_IDS.length || v.durationRanges.some((item) => !DURATION_IDS.includes(item)))) throw new Error('Invalid clip duration')
   for (const time of [v.startTimeSeconds, v.endTimeSeconds]) {
     if (time !== null && (typeof time !== 'number' || !Number.isFinite(time) || time < 0)) throw new Error('Invalid trim time')

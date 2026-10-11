@@ -104,7 +104,7 @@ export async function editorAiChat(settings: AppSettings, request: EditorAiChatR
         maxTokens: request.maxTokens, timeoutMs: REQUEST_TIMEOUT_MS
       })
     }
-    if (!settings.openrouterApiKey) throw new Error('No AI provider is ready. Choose the local or NVIDIA provider in Settings → AI, or add an OpenRouter API key.')
+    if (!settings.openrouterApiKey) throw new Error('No AI provider is ready. Choose the local or NVIDIA provider in Settings → Local AI, or add an OpenRouter API key.')
     const response = await fetch(openRouterChatUrl(), {
       method: 'POST',
       headers: {

@@ -26,7 +26,7 @@ test('camera scanning, exact frame edits, dismissals and Space playback survive 
   fs.writeFileSync(path.join(userDataDir, 'settings.json'), JSON.stringify({ version: 6, outputDirectory: library, pythonPath: tools.python, openrouterApiKey: '', zernioApiKey: '' }))
   const appDir = buildApp(path.join(root, 'app'))
   linkEngine(appDir)
-  const session = await launchApp({ appDir, userDataDir, env: tools.appEnv })
+  const session = await launchApp({ appDir, userDataDir, env: tools.appEnv, show: true })
   t.after(async () => {
     if (process.env.BRIDGECLIP_E2E_SHOTS) { fs.mkdirSync(process.env.BRIDGECLIP_E2E_SHOTS, { recursive: true }); await session.page.screenshot({ path: path.join(process.env.BRIDGECLIP_E2E_SHOTS, 'camera-final.png') }).catch(() => {}) }
     const timer = setTimeout(() => session.app.process().kill('SIGTERM'), 5000)
@@ -294,7 +294,7 @@ test('timeline seeking preserves playback and frame controls recover from edges'
   const saved = JSON.stringify(project)
   fs.writeFileSync(path.join(run, 'editor-project.json'), saved)
   fs.writeFileSync(path.join(run, 'job_output.json'), JSON.stringify({ job_id: 'edge-run', source_video_title: 'Frame edges', clips: [], editor_project: true }))
-  const session = await launchApp({ appDir: buildApp(path.join(root, 'app')), userDataDir })
+  const session = await launchApp({ appDir: buildApp(path.join(root, 'app')), userDataDir, show: true })
   t.after(async () => { await session.close(); fs.rmSync(root, { recursive: true, force: true }) })
   const { page } = session
   page.setDefaultTimeout(10000)

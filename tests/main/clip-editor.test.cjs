@@ -5,7 +5,32 @@ const path = require('node:path')
 const { loadMain, tempDir, fakeElectron } = require('../zernio/support/load-main.cjs')
 const fixture = require('../fixtures/editor/project.json')
 const schema = loadMain("export * from './src/shared/clip-editor'")
+const captionStyles = loadMain("export * from './src/shared/caption-styles'")
 const clone = () => structuredClone(fixture)
+
+test('caption style overrides validate strictly and round-trip through candidates', () => {
+  const style = { primaryColor: '#101010', highlightColor: '#39FF6A', font: 'Anton', sizeScale: 1.25, uppercase: false }
+  const p = clone(); p.candidates[0].caption_style = style
+  const parsed = schema.parseEditorProject(p)
+  assert.deepEqual(parsed.candidates[0].caption_style, style)
+  assert.deepEqual(schema.candidateEdit(parsed.candidates[0]).caption_style, style)
+  for (const bad of [
+    { ...style, primaryColor: 'red' }, { ...style, highlightColor: '#FFF' },
+    { ...style, font: 'Comic Sans' }, { ...style, sizeScale: 2.5 },
+    { ...style, uppercase: 'yes' }, { primaryColor: '#101010' }, 'not-an-object'
+  ]) { const p = clone(); p.candidates[0].caption_style = bad; assert.throws(() => schema.parseEditorProject(p)) }
+})
+
+test('saved caption styles parse strictly and reject unknown presets or ids', () => {
+  const valid = { version: 1, id: 'my-style', name: 'My style', preset: 'pop', style: { primaryColor: '#101010', highlightColor: '#39FF6A', font: 'Anton', sizeScale: 1.25, uppercase: false } }
+  assert.deepEqual(captionStyles.parseSavedCaptionStyle(valid), valid)
+  const minimal = { ...valid, style: { primaryColor: '#101010', highlightColor: '#39FF6A', font: 'Anton', sizeScale: 1 } }
+  assert.deepEqual(captionStyles.parseSavedCaptionStyle(minimal).style, minimal.style)
+  for (const bad of [
+    { ...valid, preset: 'unknown' }, { ...valid, id: 'Bad Id!' }, { ...valid, name: ' ' },
+    { ...valid, version: 2 }, { ...valid, style: { ...valid.style, font: 'nope' } }
+  ]) assert.throws(() => captionStyles.parseSavedCaptionStyle(bad))
+})
 
 test('editor project validates cuts, geometry and candidate identity; strips extra authority', () => {
   const p = clone(); p.apiKey = 'secret'; p.candidates[0].sourcePath = '/private.mp4'
@@ -747,9 +772,12 @@ test('idle editor runs sweep temporary folders and unreferenced media, never the
     for (const file of stale) { fs.mkdirSync(path.dirname(path.join(f.run, file)), { recursive: true }); fs.writeFileSync(path.join(f.run, file), 'x') }
     fs.writeFileSync(path.join(f.run, 'clip_00.mp4'), 'export')
     fs.writeFileSync(path.join(f.run, 'editor-notes.mp4'), 'unrelated')
+    // Bytes he already paid for: a killed download's partial survives every sweep.
+    fs.writeFileSync(path.join(f.run, 'editor-source.f616.mp4.part'), 'half of it')
     await f.main.openEditor(f.run)
     const left = fs.readdirSync(f.run).sort()
-    assert.deepEqual(left, ['clip_00.mp4', 'editor-notes.mp4', 'editor-preview.mp4', 'editor-project.json', 'editor-source.mp4', 'job_output.json'])
+    assert.deepEqual(left, ['clip_00.mp4', 'editor-notes.mp4', 'editor-preview.mp4', 'editor-project.json',
+      'editor-source.f616.mp4.part', 'editor-source.mp4', 'job_output.json'])
   } finally { f.cleanup() }
 })
 
@@ -791,7 +819,7 @@ test('editor media can be freed only when nothing is left to finish, and the pro
 })
 
 // A finished automatic run: clips on disk, but no editor project and no source kept.
-function importSetup(sourceUrl = 'https://youtu.be/dQw4w9WgXcQ') {
+function importSetup(sourceUrl = 'https://youtu.be/dQw4w9WgXcQ', outcome = 'committed') {
   const { EventEmitter } = require('node:events')
   const { PassThrough } = require('node:stream')
   const temp = tempDir('bridgeclip-import-')
@@ -808,6 +836,21 @@ function importSetup(sourceUrl = 'https://youtu.be/dQw4w9WgXcQ') {
     child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough()
     child.stdin.end = (data) => {
       config = JSON.parse(data)
+      if (outcome === 'missing') {
+        // The engine found no local copy of this video and was not given a download yes.
+        child.stdout.write('{"ok":false,"error":"source_missing"}')
+        setImmediate(() => child.emit('close', 1))
+        return
+      }
+      if (outcome === 'stalled') {
+        // A killed download: yt-dlp leaves a `.part` and its sidecar behind, plus the
+        // complete source of an earlier attempt the retry can still use.
+        fs.writeFileSync(path.join(run, 'editor-source.mp4'), 'downloaded')
+        fs.writeFileSync(path.join(run, 'editor-source.f616.mp4.part'), 'half of it')
+        fs.writeFileSync(path.join(run, 'editor-source.f616.mp4.ytdl'), 'metadata')
+        setImmediate(() => child.emit('close', 1))
+        return
+      }
       if (!fs.existsSync(path.join(run, 'editor-source.mp4'))) fs.writeFileSync(path.join(run, 'editor-source.mp4'), 'downloaded')
       fs.writeFileSync(path.join(run, 'editor-preview.mp4'), 'preview')
       fs.writeFileSync(path.join(run, 'editor-project.json'), JSON.stringify(fixture))
@@ -835,6 +878,39 @@ test('importing an automatic run re-downloads a web source and commits the edito
     assert.equal(session.project.candidates.length, fixture.candidates.length)
     assert.equal(JSON.parse(fs.readFileSync(path.join(f.run, 'job_output.json'))).editor_project, true)
     assert.equal(f.main.editorBusy(f.run), false)
+  } finally { f.cleanup() }
+})
+
+test('a stalled import keeps the bytes he already downloaded and the finished source', async () => {
+  const f = importSetup('https://youtu.be/dQw4w9WgXcQ', 'stalled')
+  try {
+    await assert.rejects(f.main.createEditorProject(f.run))
+    assert.ok(fs.existsSync(path.join(f.run, 'editor-source.mp4')), 'the retry reads the material already on disk')
+    // A killed download's `.part` is video data he paid for. Nothing deletes it.
+    assert.equal(fs.readFileSync(path.join(f.run, 'editor-source.f616.mp4.part'), 'utf8'), 'half of it')
+    assert.equal(fs.readFileSync(path.join(f.run, 'editor-source.f616.mp4.ytdl'), 'utf8'), 'metadata')
+    assert.equal(JSON.parse(fs.readFileSync(path.join(f.run, 'job_output.json'))).editor_project, undefined)
+  } finally { f.cleanup() }
+})
+
+test('an import asks before downloading instead of pulling bytes on its own', async () => {
+  const no = importSetup()
+  const yes = importSetup()
+  try {
+    // "Edit this" never sets allow_download, so the worker request stays read-from-disk only.
+    await no.main.createEditorProject(no.run)
+    assert.equal(no.config.allow_download, undefined)
+    await yes.main.createEditorProject(yes.run, undefined, undefined, true)
+    assert.equal(yes.config.allow_download, true)
+  } finally { no.cleanup(); yes.cleanup() }
+})
+
+test('a run with no local material asks for the file rather than downloading', async () => {
+  const f = importSetup('https://youtu.be/dQw4w9WgXcQ', 'missing')
+  try {
+    await assert.rejects(f.main.createEditorProject(f.run), /__editor_needs_material__/)
+    assert.equal(fs.existsSync(path.join(f.run, 'editor-project.json')), false)
+    assert.equal(JSON.parse(fs.readFileSync(path.join(f.run, 'job_output.json'))).editor_project, undefined)
   } finally { f.cleanup() }
 })
 
@@ -926,6 +1002,8 @@ test('import status turns worker progress into download bytes, rate and preview 
   assert.deepEqual(schema.editorImportStatus({ phase: 'scan', percent: 0, downloadedBytes: 6e8, totalBytes: 2.4e9 }),
     { label: 'Downloading the original video · 600.0 MB of 2.4 GB', percent: 25 })
   assert.deepEqual(schema.editorImportStatus({ phase: 'preview', percent: 43 }), { label: 'Preparing the editable preview · 43%', percent: 43 })
+  assert.deepEqual(schema.editorImportStatus({ phase: 'scan', percent: 100, local: true }),
+    { label: 'Restoring the original video from your Library', percent: 100 })
 })
 
 test('importing for one reel passes the clip index through and validates it', async () => {
@@ -982,6 +1060,10 @@ test('import progress exposes download bytes and rate before the project exists'
     worker.write('{"type":"progress","phase":"scan","percent":40}\n')
     await settle()
     assert.deepEqual(main.editorOperationProgress(run).progress, { phase: 'scan', percent: 50, downloadedBytes: 1200000000, totalBytes: 2400000000 })
+    // A Library copy comes off the disk, and the waiting screen must stop saying download.
+    worker.write('{"type":"progress","phase":"scan","percent":100,"local":true}\n')
+    await settle()
+    assert.deepEqual(main.editorOperationProgress(run).progress, { phase: 'scan', percent: 100, local: true })
     // Commit like the engine does, then report success.
     fs.writeFileSync(path.join(run, 'editor-source.mp4'), 'downloaded')
     fs.writeFileSync(path.join(run, 'editor-preview.mp4'), 'preview')

@@ -31,7 +31,7 @@ test('video speed supports keyboard selection, review, submission and reuse in E
     })
   }, root)
   await page.reload()
-  await page.getByPlaceholder('YouTube, Twitch VOD or direct video link').fill('https://example.com/video.mp4')
+  await page.getByPlaceholder(/or direct link/).fill('https://example.com/video.mp4')
   await page.getByRole('button', { name: 'Use link', exact: true }).click()
   await page.getByRole('radio', { name: 'Automatic', exact: true }).click()
   const steps = page.getByRole('navigation', { name: 'Create steps' })
@@ -47,9 +47,9 @@ test('video speed supports keyboard selection, review, submission and reuse in E
   for (let i = 0; i < 3; i++) await page.keyboard.press('ArrowRight')
   const chosen = speeds.getByRole('radio', { name: '1.5×', exact: true })
   assert.equal(await chosen.getAttribute('aria-checked'), 'true')
-  await page.getByRole('radio', { name: /Horizontal/ }).click()
+  await page.getByRole('button', { name: /Horizontal/ }).click()
   assert.equal(await chosen.getAttribute('aria-checked'), 'true')
-  await page.getByRole('radio', { name: /Vertical/ }).click()
+  await page.getByRole('button', { name: /Vertical/ }).click()
   // Screenshots are opt-in evidence: hidden Linux CI windows need not have
   // a drawable compositor surface for the functional assertions below.
   const artifacts = process.env.BRIDGECLIP_E2E_SHOTS
@@ -73,7 +73,7 @@ test('video speed supports keyboard selection, review, submission and reuse in E
   await page.getByRole('button', { name: 'Cancel', exact: true }).waitFor()
   await page.getByRole('button', { name: 'Create', exact: true }).click()
   await page.getByRole('button', { name: 'Clip another video' }).click()
-  await page.getByPlaceholder('YouTube, Twitch VOD or direct video link').fill('https://example.com/next.mp4')
+  await page.getByPlaceholder(/or direct link/).fill('https://example.com/next.mp4')
   await page.getByRole('button', { name: 'Use link', exact: true }).click()
   await page.getByRole('radio', { name: 'Automatic', exact: true }).click()
   await steps.getByRole('button', { name: /Format/ }).click()

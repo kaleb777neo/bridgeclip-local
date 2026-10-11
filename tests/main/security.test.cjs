@@ -196,7 +196,7 @@ test('the native picker authorizes media and shell opening rejects aliased appli
       './security': security,
       './network-policy': {},
       './validation': {},
-      './templates-store': {},
+      './templates-store': {}, './caption-styles-store': {},
       './template-resolve': {},
       './openrouter-models': {},
       './youtube-preview': { getYouTubePreview: async () => ({ title: 'A video' }) },
@@ -229,8 +229,13 @@ test('the native picker authorizes media and shell opening rejects aliased appli
     assert.throws(() => security.assertMediaPath(video, library))
     const picker = handlers.get('dialog:selectVideo')
     assert.throws(() => picker({ sender: contents, senderFrame: {} }), /Unauthorized application request/)
-    assert.equal(await picker({ sender: contents, senderFrame: frame }), fs.realpathSync(video))
+    const picked = await picker({ sender: contents, senderFrame: frame })
+    assert.equal(picked, security.canonicalMediaPath(video))
     assert.doesNotThrow(() => security.assertMediaPath(video, library))
+    // Windows can name a file through an 8.3 alias, which the engine expands when it
+    // writes clip paths, so authorization has to follow the file rather than the spelling.
+    const longName = process.platform === 'win32' ? fs.realpathSync.native(video) : fs.realpathSync(video)
+    assert.doesNotThrow(() => security.assertMediaPath(longName, library))
     const bundle = path.join(library, 'unsafe.app')
     fs.mkdirSync(bundle)
     const alias = path.join(library, 'ordinary-folder')
@@ -266,6 +271,8 @@ test('source video links normalize supported YouTube forms and allow only canoni
 test('job validation rejects malformed options and invalid trim intervals', () => {
   const job = { videoUrl: 'https://example.com/video', maxClips: 5, autoClipCount: true, includeCaptions: true, aspectRatio: '9:16', layoutStyle: 'auto', layoutVision: true, pacing: 'tight', captionPreset: 'pop', durationRanges: ['short'], startTimeSeconds: null, endTimeSeconds: null, bannerPlatform: null, bannerChannelUrl: null }
   assert.doesNotThrow(() => validateJobConfig(job))
+  assert.equal(validateJobConfig({ ...job, coverage: true }).coverage, true)
+  assert.throws(() => validateJobConfig({ ...job, coverage: 'yes' }), /Invalid coverage flag/)
   assert.equal(validateJobConfig(job).videoSpeed, 1)
   assert.equal(validateJobConfig(job).includeTitle, true)
   assert.equal(validateJobConfig({ ...job, includeTitle: false }).includeTitle, false)

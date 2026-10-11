@@ -48,7 +48,7 @@ Sponsorship and opening checks use a separate paired request. Both request recor
 are saved and both must succeed. A high score on one question cannot compensate
 for a failed check. Explicitly required visual context must still be supplied.
 
-Quality mode uses GPT-6 Sol for discovery and boundary repair; Economy uses
+Quality mode uses Claude Opus 5.5 for discovery and GPT-6 Sol for boundary repair; Economy uses
 GLM 5.3 Flash discovery and Gemini 3.8 Flash repair. Repairs receive exact failed
 criteria, their thresholds and earlier proposals. They select transcript segment
 IDs rather than inventing timestamps or speech. At most two boundary repairs use

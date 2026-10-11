@@ -8,6 +8,7 @@ const { execFileSync } = require('node:child_process')
 const { createMockZernio } = require('../support/mock-zernio.cjs')
 const { createPostingMock } = require('../support/mock-posts.cjs')
 const { buildApp, launchApp, ROOT } = require('../support/electron-app.cjs')
+const { fileLinksAvailable } = require('../../support/symlinks.cjs')
 
 const KEY = 'automation-e2e-key'
 const FFMPEG = fs.existsSync(path.join(ROOT, 'engine-bin', 'ffmpeg')) ? path.join(ROOT, 'engine-bin', 'ffmpeg') : 'ffmpeg'
@@ -18,7 +19,12 @@ async function choose(page, combobox, name) {
   await page.getByRole('listbox').getByRole('option', { name, exact: true }).click()
 }
 
-test('add library clips, review TikTok, and run a mixed-platform automation', { timeout: 180_000 }, async (t) => {
+/** Run now and Retry clip publish for real, so each one opens a confirmation first. */
+async function confirmPublish(page, label = 'Publish now') {
+  await page.getByRole('alertdialog').getByRole('button', { name: label, exact: true }).click()
+}
+
+test('add library clips, review TikTok, and run a mixed-platform automation', { timeout: 480_000 }, async (t) => {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-automation-e2e-'))
   const clip = path.join(work, 'new_clip.mp4')
   execFileSync(FFMPEG, ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=green:s=360x640:d=4:r=15',
@@ -222,9 +228,11 @@ test('add library clips, review TikTok, and run a mixed-platform automation', { 
     await page.getByRole('button', { name: 'Actions for First library clip', exact: true }).click()
     await page.getByRole('menuitem', { name: revealLabel, exact: true }).click()
     await page.getByText('This clip’s video file is no longer available.', { exact: true }).waitFor()
-    fs.symlinkSync(clips[0], bankFile)
-    assert.equal(await page.evaluate(({ id, contentId }) => window.bridgeclip.automations.showInFolder(id, contentId), bankIds), false, 'does not reveal a substituted symlink')
-    assert.equal(await app.evaluate(() => globalThis.revealedBankFiles.length), 1)
+    if (fileLinksAvailable) {
+      fs.symlinkSync(clips[0], bankFile)
+      assert.equal(await page.evaluate(({ id, contentId }) => window.bridgeclip.automations.showInFolder(id, contentId), bankIds), false, 'does not reveal a substituted symlink')
+      assert.equal(await app.evaluate(() => globalThis.revealedBankFiles.length), 1)
+    } else t.diagnostic('File symlinks unavailable; symlinked bank file assertion skipped')
   } finally {
     fs.rmSync(bankFile, { force: true })
     fs.renameSync(`${bankFile}.saved`, bankFile)
@@ -299,6 +307,16 @@ test('add library clips, review TikTok, and run a mixed-platform automation', { 
   await review.getByRole('button', { name: 'Approve for automation' }).click()
   await review.waitFor({ state: 'hidden' })
   await page.getByRole('button', { name: 'Run now' }).click()
+  const publishConfirm = page.getByRole('alertdialog')
+  // The guard names where the clip goes, and backing out of it publishes nothing.
+  const confirmBody = await publishConfirm.locator('p[data-selectable]').innerText()
+  for (const platform of ['YouTube', 'Instagram', 'TikTok']) assert.ok(confirmBody.includes(platform), `the confirmation says the clip goes to ${platform}: ${confirmBody}`)
+  await publishConfirm.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await publishConfirm.waitFor({ state: 'hidden' })
+  assert.equal(posting.state.uploads.length, 0, 'cancelling the confirmation never uploads')
+  assert.equal(posting.state.creates.length, 0, 'cancelling the confirmation never publishes')
+  await page.getByRole('button', { name: 'Run now' }).click()
+  await confirmPublish(page)
   await page.getByText('Run finished. Check the content bank for the result.').waitFor()
 
   assert.equal(posting.state.uploads.length, 1)
@@ -388,8 +406,12 @@ test('add library clips, review TikTok, and run a mixed-platform automation', { 
   await page.getByText(/Metadata enhancement failed:/).first().waitFor()
   const failedAlerts = page.getByRole('status').filter({ hasText: /^Metadata enhancement failed:/ })
   assert.equal(await failedAlerts.count(), 5)
-  await failedAlerts.first().getByRole('button', { name: 'Dismiss', exact: true }).click()
-  await page.waitForFunction(async () => (await window.bridgeclip.automations.list())[0].content.filter((item) => item.metadataErrorAcknowledged).length === 1)
+  const dismissedAlert = failedAlerts.first()
+  await dismissedAlert.getByRole('button', { name: 'Dismiss', exact: true }).click()
+  // A .first() locator re-resolves, so after this click it points at the next clip's
+  // alert and can never report detached. Count the alerts in the page instead.
+  await page.waitForFunction((expected) => [...document.querySelectorAll('[role="status"]')]
+    .filter((element) => /^Metadata enhancement failed:/.test(element.textContent ?? '')).length === expected, 4, { timeout: 15_000 })
   assert.equal(await failedAlerts.count(), 4, 'dismiss affects only the chosen clip')
   await page.reload()
   await page.getByRole('navigation', { name: 'Main' }).getByRole('button', { name: /Automations/ }).click()
@@ -556,9 +578,11 @@ test('dismiss an upload error and retry that exact clip after Run now skips it',
   const failedRow = page.locator('[data-rfd-draggable-id]').filter({ has: page.getByText('Failed clip', { exact: true }) })
   posting.state.failNextUpload = 503
   await page.getByRole('button', { name: 'Run now', exact: true }).click()
+  await confirmPublish(page)
   await failedRow.getByRole('alert').waitFor()
   await failedRow.getByRole('button', { name: 'Retry clip', exact: true }).waitFor()
   await page.getByRole('button', { name: 'Run now', exact: true }).click()
+  await confirmPublish(page)
   await page.getByRole('region', { name: 'Submitted', exact: true }).getByText('Fresh clip', { exact: true }).waitFor()
   assert.equal(posting.state.creates.length, 1)
   await failedRow.getByRole('alert').getByRole('button', { name: 'Dismiss', exact: true }).click()
@@ -572,10 +596,12 @@ test('dismiss an upload error and retry that exact clip after Run now skips it',
   assert.equal(posting.state.creates.length, 1, 'dismissal never publishes')
   posting.state.failNextUpload = 503
   await failedRow.getByRole('button', { name: 'Retry clip', exact: true }).click()
+  await confirmPublish(page, 'Retry and publish')
   await failedRow.getByRole('alert').waitFor()
   assert.equal(posting.state.creates.length, 1, 'a failed retry never falls through to another clip')
   if (process.env.BRIDGECLIP_UPLOAD_RECOVERY_SCREENSHOT) await page.screenshot({ path: process.env.BRIDGECLIP_UPLOAD_RECOVERY_SCREENSHOT })
   await failedRow.getByRole('button', { name: 'Retry clip', exact: true }).click()
+  await confirmPublish(page, 'Retry and publish')
   await page.getByRole('region', { name: 'Submitted', exact: true }).getByText('Failed clip', { exact: true }).waitFor()
   await page.getByRole('region', { name: 'Queued', exact: true }).getByText('Later clip', { exact: true }).waitFor()
   assert.equal(posting.state.creates.length, 2)

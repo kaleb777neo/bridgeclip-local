@@ -53,6 +53,35 @@ def _norm(word: str) -> str:
     """Comparison key for emphasis matching ("$14,500" -> "14500")."""
     return re.sub(r"[^a-z0-9]", "", word.lower())
 
+
+# Clitic halves are one spoken word, so a provider's split must rejoin fast.
+_HYPHEN_JOIN_MAX_GAP_MS = 500
+
+
+def merge_hyphen_splits(words: list[TranscriptWord]) -> list[TranscriptWord]:
+    """Rejoin tokens a provider split at a hyphen: "m" + "-aș" -> "m-aș".
+
+    Romanian clitics ("m-aș", "s-a", "du-te") come out of Whisper as two
+    tokens; left alone, grouping can break them across caption lines and the
+    word highlight fires twice for one spoken word. The halves are spoken as
+    a unit, so only parts close in time rejoin — never across a pause.
+    """
+    merged: list[TranscriptWord] = []
+    for word in words:
+        text = " ".join(word.word.split())
+        prev = merged[-1] if merged else None
+        if prev is not None and text and (
+            text.startswith("-") or " ".join(prev.word.split()).endswith("-")
+        ) and word.start_time_ms - prev.end_time_ms <= _HYPHEN_JOIN_MAX_GAP_MS:
+            merged[-1] = TranscriptWord(
+                " ".join(prev.word.split()) + text,
+                prev.start_time_ms,
+                max(prev.end_time_ms, word.end_time_ms),
+            )
+        elif text:
+            merged.append(word)
+    return merged
+
 # Side margins of the base style; libass wraps lines wider than the rest.
 SIDE_MARGIN = 60
 # Advance width per character (share of the font size) when the preset's font
@@ -264,6 +293,7 @@ class CaptionGeneratorService:
             w for w in sorted(words, key=lambda w: w.start_time_ms)
             if w.end_time_ms > clip_start_ms and w.start_time_ms < clip_end_ms and w.word.strip()
         ]
+        words = merge_hyphen_splits(words)
         if not words:
             return None
 
@@ -341,6 +371,7 @@ class CaptionGeneratorService:
                 all_words.extend(segment.words)
             else:
                 all_words.extend(self._split_segment_into_words(segment))
+        all_words = merge_hyphen_splits(all_words)
 
         clip_words = [
             w for w in all_words

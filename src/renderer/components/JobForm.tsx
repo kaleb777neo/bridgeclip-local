@@ -6,6 +6,7 @@ import { getApi } from '../lib/ipc'
 import { useDraftStore, type ClipDraft, type WizardAspectRatio, type WizardStep } from '../store/use-draft-store'
 import { useActiveJobs } from '../store/use-job-store'
 import type { BrandTemplate } from '../../shared/templates'
+import type { SavedCaptionStyle } from '../../shared/caption-styles'
 import type { ClipJobRequest } from '../../shared/jobs'
 import { MAX_PARALLEL_JOBS } from '../../shared/jobs'
 import { CaptionPresetPicker, CAPTION_PRESET_NAMES } from './CaptionPresetPicker'
@@ -64,6 +65,12 @@ export function parseTrimRange(enabled: boolean, startText: string, endText: str
 /** The run request for the current draft. */
 export function buildJobRequest(draft: ClipDraft, trim: { start: number | null; end: number | null }): ClipJobRequest {
   if (!draft.workflow) throw new Error('Choose a workflow before creating clips.')
+  // "Only add caption without clipping": the engine skips planning and renders the
+  // whole trimmed range as one captioned clip, so no clip selection is sent.
+  if (draft.captionsOnly && draft.workflow === 'automatic') {
+    const base = buildJobRequest({ ...draft, captionsOnly: false, includeCaptions: true, includeTitle: false }, trim)
+    return { ...base, workflow: 'captions-only' }
+  }
   // Review & edit exports one format, vertical or horizontal, from the editor.
   const ratios: WizardAspectRatio[] = draft.workflow === 'review'
     ? (draft.aspectRatios[0] === '1:1' ? ['9:16'] : [draft.aspectRatios[0]])
@@ -76,6 +83,7 @@ export function buildJobRequest(draft: ClipDraft, trim: { start: number | null; 
     ...(draft.clipRequest?.trim() ? { clipRequest: draft.clipRequest.trim() } : {}),
     maxClips: draft.autoClipCount ? null : draft.maxClips,
     autoClipCount: draft.autoClipCount,
+    coverage: draft.coverage,
     durationRanges: draft.durations.length > 0 ? draft.durations : null,
     aspectRatio: ratios[0],
     // With a pack selected the full format list always travels with the job: main only fills
@@ -87,6 +95,7 @@ export function buildJobRequest(draft: ClipDraft, trim: { start: number | null; 
     videoSpeed: draft.videoSpeed ?? 1,
     includeCaptions: draft.includeCaptions,
     captionPreset: draft.captionPreset,
+    ...(draft.captionStyle ? { captionStyle: draft.captionStyle } : {}),
     ...(draft.srtPath ? { srtPath: draft.srtPath } : {}),
     includeTitle: draft.includeTitle,
     startTimeSeconds: trim.start,
@@ -107,6 +116,7 @@ export function draftPatchForTemplate(template: BrandTemplate | null): Partial<C
   return {
     templateId: template.id,
     captionPreset: template.captionPresetId,
+    captionStyle: template.captionStyle ?? null,
     aspectRatios: [...template.formats] as WizardAspectRatio[],
     // Per-channel render settings: the same fill-only-what-the-pack-carries rule,
     // so later manual edits in the wizard still win at submit time.
@@ -335,7 +345,7 @@ function Stepper({ current, reachable, onSelect }: { current: WizardStep; reacha
 function VideoStep({ draft, update, trimError, disabled }: { draft: ClipDraft; update: Update; trimError: string | null; disabled?: boolean }): React.JSX.Element {
   return (
     <div className="space-y-3">
-      <WorkflowPicker value={draft.workflow} onChange={(workflow) => update({ workflow })} disabled={disabled} />
+      <WorkflowPicker value={draft.workflow} onChange={(workflow) => update({ workflow, ...(workflow === 'review' ? { captionsOnly: false } : {}) })} disabled={disabled} />
       <section aria-labelledby="video-source-heading" className="space-y-3 border-t border-white/[0.06] pt-4">
         <div>
           <h2 id="video-source-heading" className="text-sm font-semibold text-ink">{WIZARD_STEPS[0].title}</h2>
@@ -485,7 +495,7 @@ export function FormatStep({ draft, update }: { draft: ClipDraft; update: Update
       <Group label="Pacing">
         <SettingRow
           title="Cut dead air"
-          description="Proposes pause and filler cuts. When enabled, Jev checks each removal."
+          description="Proposes pause and filler cuts. Pauses follow local rules; with Jev on, up to 12 ambiguous filler words are re-checked before they are cut."
           control={
             <Switch label="Cut dead air and filler words" checked={draft.pacing === 'tight'} onChange={(on) => update({ pacing: on ? 'tight' : 'natural' })} />
           }
@@ -547,13 +557,13 @@ export function ClipsStep({ draft, update }: { draft: ClipDraft; update: Update 
         ) : nvidiaProvider ? (
           <div className="glass-tile rounded-xl px-3 py-2.5" aria-label="Free NVIDIA clipping mode">
             <span className="block text-sm font-medium text-ink">Free · {nvidiaPlannerModel} planning · Whisper {localWhisperModel} transcription</span>
-            <span className="block text-2xs text-ink-subtle">Planning runs on NVIDIA’s free cloud tier (about 40 requests per minute); transcription runs on this computer. Change models in Settings → AI provider; Jev review and web research are skipped.</span>
+            <span className="block text-2xs text-ink-subtle">Planning runs on NVIDIA’s free cloud tier (about 40 requests per minute); transcription runs on this computer. Change models in Settings → Local AI; Jev review and web research are skipped.</span>
           </div>
         ) : (
           <>
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-3" role="radiogroup" aria-label="Clipping mode">
               {([
-                { id: 'quality', label: 'Quality', hint: `GPT-6 Sol planning · ${draft.workflow === 'review' ? 'Jev review required' : `Jev review & repairs ${jevEnabled ? 'enabled' : 'off'}`} · MAI Transcribe 2` },
+                { id: 'quality', label: 'Quality', hint: `Claude Opus 5.5 planning · ${draft.workflow === 'review' ? 'Jev review required' : `Jev review & repairs ${jevEnabled ? 'enabled' : 'off'}`} · MAI Transcribe 2` },
                 { id: 'economy', label: 'Economy', hint: 'GLM 5.3 Flash planning · Whisper Turbo' },
                 { id: 'advanced', label: 'Advanced', hint: 'Choose your OpenRouter models' }
               ] as const).map((mode) => {
@@ -594,10 +604,20 @@ export function ClipsStep({ draft, update }: { draft: ClipDraft; update: Update 
         {(draft.videoSpeed ?? 1) > 1 && <p className="mt-2 text-2xs text-ink-subtle">Lengths refer to the original footage. At {draft.videoSpeed}×, 60 seconds becomes about {Math.round(60 / draft.videoSpeed)} seconds before dead-air cuts.</p>}
       </Group>
 
+      <Group label="What to extract">
+        <SettingRow
+          title="Full coverage"
+          description={draft.coverage
+            ? 'Every self-contained moment becomes a clip — the whole episode, tiled without duplicates.'
+            : 'Off: only the most engaging moments. Turn on to extract everything worth posting.'}
+          control={<Switch label="Full coverage" checked={draft.coverage} onChange={(coverage) => update({ coverage })} />}
+        />
+      </Group>
+
       <Group label="Number of clips">
         <SettingRow
           title="Let AI decide"
-          description="Every moment worth posting."
+          description={draft.coverage ? 'The count follows how much material the video has.' : 'Every moment worth posting.'}
           control={<Switch label="Let AI decide how many clips" checked={draft.autoClipCount} onChange={(autoClipCount) => update({ autoClipCount })} />}
         />
         {!draft.autoClipCount && (
@@ -635,6 +655,14 @@ export function ClipsStep({ draft, update }: { draft: ClipDraft; update: Update 
 }
 
 export function CaptionsStep({ draft, update }: { draft: ClipDraft; update: Update }): React.JSX.Element {
+  /** Saved caption styles, offered as picker tiles next to the built-ins. */
+  const [captionStyles, setCaptionStyles] = useState<SavedCaptionStyle[]>([])
+  useEffect(() => {
+    let active = true
+    // A renderer hot-reloaded over an older preload has no caption-styles bridge.
+    void getApi().captionStyles?.list().then((list) => { if (active) setCaptionStyles(list) }).catch(() => {})
+    return () => { active = false }
+  }, [])
   return (
     <div className="space-y-3">
       {draft.workflow !== 'review' && (
@@ -670,17 +698,21 @@ export function CaptionsStep({ draft, update }: { draft: ClipDraft; update: Upda
         <CaptionPresetPicker
           showPreview
           value={draft.captionPreset}
-          onChange={(captionPreset) => update({ captionPreset, includeCaptions: true })}
+          onChange={(captionPreset) => update({ captionPreset, captionStyle: null, includeCaptions: true })}
           allowNone
           noneSelected={!draft.includeCaptions}
           onSelectNone={() => update({ includeCaptions: false })}
+          customStyles={captionStyles}
+          styleValue={draft.captionStyle}
+          onSelectCustom={(saved) => update({ captionPreset: saved.preset, captionStyle: saved.style, includeCaptions: true })}
+          onDeleteCustom={(id) => { void getApi().captionStyles?.delete(id).then(setCaptionStyles).catch(() => {}) }}
         />
       </div>
-      <label className="flex items-center justify-between gap-2 text-xs text-ink">
+      {draft.workflow === 'automatic' && <label className="flex items-center justify-between gap-2 text-xs text-ink">
         <span>Only add caption without clipping <span className="text-ink-subtle">Beta</span> — caption the whole video as one clip</span>
         <input type="checkbox" aria-label="Only add caption without clipping" checked={draft.captionsOnly}
           onChange={(e) => update({ captionsOnly: e.target.checked, includeCaptions: true })} />
-      </label>
+      </label>}
     </div>
   )
 }
@@ -715,11 +747,19 @@ function ReviewStep({ draft, trim, onEdit }: {
     { step: 'format', label: 'Pacing', value: draft.workflow === 'review' ? 'Manual · choose your own cuts in the editor' : draft.pacing === 'tight' ? 'Cut dead air' : 'Keep pauses' },
     { step: 'format', label: 'Speed', value: `${draft.videoSpeed ?? 1}×${(draft.videoSpeed ?? 1) === 1 ? ' · Normal' : ' · All exported clips'}` },
     { step: 'clips', label: 'Mode', value: draft.clippingMode === 'advanced' ? 'Advanced · custom models' : draft.clippingMode === 'economy' ? 'Economy · lower cost' : 'Quality · higher accuracy' },
+    { step: 'clips', label: 'Extraction', value: draft.coverage ? 'Full coverage' : 'Best moments' },
     { step: 'clips', label: 'Clips', value: `${lengths}${(draft.videoSpeed ?? 1) > 1 && draft.durations.length > 0 ? ' of source footage' : ''} · ${draft.autoClipCount ? 'AI decides how many' : `Up to ${draft.maxClips}`}` },
     { step: 'clips', label: 'What to clip', value: draft.clipRequest?.trim() || 'The best moments' },
-    { step: 'captions', label: 'Captions', value: draft.includeCaptions ? CAPTION_PRESET_NAMES[draft.captionPreset] ?? draft.captionPreset : 'Off' }
+    { step: 'captions', label: 'Captions', value: draft.includeCaptions ? `${CAPTION_PRESET_NAMES[draft.captionPreset] ?? draft.captionPreset}${draft.captionStyle ? ' (customized)' : ''}` : 'Off' }
   ]
   if (draft.workflow !== 'review') rows.push({ step: 'captions', label: 'Title', value: draft.includeTitle ? 'Shown at the top' : 'Off' })
+  // Captions-only skips planning and the title card, so the clip rows cannot
+  // describe the run as a selection of moments.
+  if (draft.captionsOnly) for (const row of rows) {
+    if (row.label === 'Clips') { row.value = 'One clip · the whole video, captioned'; row.step = 'captions' }
+    if (row.label === 'What to clip') { row.value = 'Not used — nothing is selected'; row.step = 'captions' }
+    if (row.label === 'Title') row.value = 'Off — captions only'
+  }
   if (draft.bannerPlatform && draft.bannerChannelUrl) rows.push({ step: 'format', label: 'Banner', value: `${draft.bannerPlatform} · ${draft.bannerChannelUrl}` })
   if (draft.clippingMode === 'advanced') rows.splice(5, 0,
     { step: 'clips', label: 'Transcribe', value: draft.transcriptionModel || 'Choose a model' },
@@ -797,7 +837,7 @@ function AdvancedModels({ draft, update }: { draft: ClipDraft; update: Update })
       onChange={(transcriptionModel) => update({ transcriptionModel })} />
     <ModelPicker task="planning" models={catalog?.planning ?? []} value={draft.plannerModel} loading={loading}
       onChange={(plannerModel) => update({ plannerModel })} />
-    <p className="text-2xs text-ink-subtle">Temporary errors are retried with your selected models. No automatic model switching. Usage bills your OpenRouter account. Optional AI framing checks use Gemini and can be changed in Format.</p>
+    <p className="text-2xs text-ink-subtle">Temporary errors are retried with your selected models, never a different one. The exception is the optional AI framing check: it uses Gemini and can fall back to another model. Usage bills your OpenRouter account. The framing check can be changed in Format.</p>
   </div>
 }
 

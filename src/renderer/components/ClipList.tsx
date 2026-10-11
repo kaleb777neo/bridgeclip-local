@@ -1,6 +1,6 @@
 import { SavedStageTimings } from './StageBreakdown'
 import { parseJobOutput } from '../../shared/job-output'
-import { editorImportStatus, editorProgress, EDITOR_NEEDS_SOURCE, type EditorOperation, type EditorProgress } from '../../shared/clip-editor'
+import { editorImportStatus, editorNeedsMaterial, editorProgress, EDITOR_NEEDS_MATERIAL, EDITOR_NEEDS_SOURCE, type EditorOperation, type EditorProgress } from '../../shared/clip-editor'
 import { ClipEditor } from './ClipEditor'
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 import { CalendarClock,  ArrowLeft, Check, ChevronDown, Clapperboard, Download, FileCode, FolderOpen, ListPlus, Plus, Scissors, Search, Send, Trash2, Youtube } from 'lucide-react'
@@ -71,6 +71,8 @@ function ClipRun(props: ClipListProps): React.JSX.Element {
   const [importing, setImporting] = useState(false)
   /** Live download/preview progress for the import waiting screen. */
   const [importProgress, setImportProgress] = useState<EditorProgress | null>(null)
+  /** The reel whose original video is missing: the import stopped and asked instead of downloading. */
+  const [needsMaterial, setNeedsMaterial] = useState<number | null>(null)
   /** An editor operation main is running on this run (scan, preview rebuild, import from elsewhere). */
   const [operation, setOperation] = useState<EditorOperation | null>(null)
   const [remaining, setRemaining] = useState<number | null>(null)
@@ -110,22 +112,31 @@ function ClipRun(props: ClipListProps): React.JSX.Element {
     return () => { window.clearInterval(timer) }
   }, [importing, props.outputDir])
   // Re-attach the run's source, then open the editor focused on the clicked clip.
-  const runImport = async (clipIndex: number): Promise<void> => {
+  const runImport = async (clipIndex: number, choice: { download?: boolean; file?: string } = {}): Promise<void> => {
     if (!props.outputDir || importing) return
+    const run = props.outputDir
     setImporting(true)
     setImportProgress(null)
     setEditorError(null)
+    setNeedsMaterial(null)
     try {
       let session
-      try {
-        // The focused clip index makes the engine preview only that reel's window first.
-        session = await getApi().editor.createProject(props.outputDir, undefined, clipIndex)
-      } catch (cause) {
-        // Main asks for the original file when there is no downloadable URL, or a re-download failed.
-        if (errorMessage(cause, '') !== EDITOR_NEEDS_SOURCE) throw cause
-        const picked = await getApi().dialog.selectVideo()
-        if (!picked) return
-        session = await getApi().editor.createProject(props.outputDir, picked, clipIndex)
+      if (choice.file) {
+        session = await getApi().editor.createProject(run, choice.file, clipIndex)
+      } else {
+        try {
+          // The focused clip index makes the engine preview only that reel's window first.
+          // Without his yes, the engine reads the Library and never the network.
+          session = await getApi().editor.createProject(run, undefined, clipIndex, choice.download === true)
+        } catch (cause) {
+          const message = errorMessage(cause, '')
+          if (message === EDITOR_NEEDS_MATERIAL) { setNeedsMaterial(clipIndex); return }
+          // No downloadable URL, or the download he allowed failed: fall back to the picker.
+          if (message !== EDITOR_NEEDS_SOURCE) throw cause
+          const picked = await getApi().dialog.selectVideo()
+          if (!picked) return
+          session = await getApi().editor.createProject(run, picked, clipIndex)
+        }
       }
       setClipCandidates(candidateIdsByClip(session.project.candidates))
       setRemaining(editorProgress(session.project.candidates).remaining)
@@ -148,6 +159,29 @@ function ClipRun(props: ClipListProps): React.JSX.Element {
         {importing && props.outputDir && <div>
           <Button size="sm" variant="ghost" onClick={() => { void getApi().editor.cancel(props.outputDir!) }}>Cancel</Button>
         </div>}
+      </div>
+    </Page>
+  }
+  // The original video is nowhere on this PC: ask, and only then move bytes.
+  if (needsMaterial !== null) {
+    const clipIndex = needsMaterial
+    return <Page width="wide">{props.leading}
+      <div className="mt-4 max-w-lg space-y-3">
+        <h2 className="text-base font-semibold text-ink">The original video is not in your Library</h2>
+        <p className="text-sm text-ink-muted">{editorNeedsMaterial(output.source_video_title, output.source_video_duration_seconds)}</p>
+        <p className="text-xs text-ink-muted">Whichever you pick stays in this run, so the next "Edit this" of this video opens from disk with no download.</p>
+        <div className="flex flex-wrap gap-2 pt-1">
+          <Button size="sm" onClick={() => { void runImport(clipIndex, { download: true }) }}>
+            <Download size={14} className="mr-1.5" /> Download it again
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => {
+            void (async () => {
+              const picked = await getApi().dialog.selectVideo()
+              if (picked) await runImport(clipIndex, { file: picked })
+            })()
+          }}>Choose a video file</Button>
+          <Button size="sm" variant="ghost" onClick={() => setNeedsMaterial(null)}>Cancel</Button>
+        </div>
       </div>
     </Page>
   }
@@ -202,7 +236,7 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
   const [sort, setSort] = useState<Sort>('score')
   const [weights, setWeights] = useState({ ...defaultWeights })
   const hasEditorial = output.clips.some((c) => c.editorial?.status === 'success')
-  const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [selection, setSelection] = useState<Set<number>>(new Set())
   const [exporting, setExporting] = useState(false)
   const [downloadTargets, setDownloadTargets] = useState<ClipArtifact[] | null>(null)
   const [xmlExporting, setXmlExporting] = useState(false)
@@ -235,7 +269,7 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
 
   useEffect(() => {
     if (noticeTimer.current) clearTimeout(noticeTimer.current)
-    setSelected(new Set())
+    setSelection(new Set())
     setInspectEdits(false)
     setAspect(null)
     setPosting(null)
@@ -291,15 +325,17 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
   const posted = clips.filter((clip) => statusByClip.get(clip.clip_index)?.state === 'posted')
   const visibleClips = filtering ? clips : [...(unpostedExpanded ? unposted : []), ...(postedExpanded ? posted : [])]
   const visibleIds = visibleClips.map((clip) => clip.clip_index).join(',')
-  useEffect(() => {
-    const visible = new Set(visibleIds.split(',').filter(Boolean).map(Number))
-    setSelected((previous) => new Set([...previous].filter((index) => visible.has(index))))
-  }, [visibleIds])
+  const visible = new Set(visibleIds ? visibleIds.split(',').map(Number) : [])
+  // Prune the selection during render, not from an effect: for the frame between a
+  // filter change and that effect the toolbar still counted - and posted, banked,
+  // downloaded and deleted - clips that were no longer on screen.
+  const selected = new Set([...selection].filter((index) => visible.has(index)))
+  if (selected.size !== selection.size) setSelection(selected)
   const allSelected = visibleClips.length > 0 && visibleClips.every((clip) => selected.has(clip.clip_index))
 
   const toggle = (index: number): void => {
     if (deletingRef.current) return
-    setSelected((prev) => {
+    setSelection((prev) => {
       const next = new Set(prev)
       if (next.has(index)) next.delete(index)
       else next.add(index)
@@ -314,7 +350,7 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
       if (typeof getApi().history.deleteClips !== 'function') throw new Error('Restart BridgeClip to enable deleting selected clips.')
       const fresh = await getApi().history.deleteClips(outputDir, indices)
       onOutputChanged(fresh)
-      setSelected(new Set()); setStatusRetry((value) => value + 1)
+      setSelection(new Set()); setStatusRetry((value) => value + 1)
     } catch (cause) {
       // A cleanup failure can happen after the manifest was committed. Refresh
       // from disk so removed clips are never left available for posting/export.
@@ -429,7 +465,7 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
         description={editor?.remaining ? `${editor.remaining} clip${editor.remaining === 1 ? '' : 's'} left to finish` : undefined}
         actions={
           <>
-            {editor && <Button disabled={deleting} variant={editor.remaining ? 'primary' : 'ghost'} icon={<Scissors className="h-4 w-4" />} onClick={editor.onOpen}>
+            {editor && <Button disabled={deleting || editor.busy} title={editor.busy ? 'Another editor operation is running for this video. Wait for it to finish.' : undefined} variant={editor.remaining ? 'primary' : 'ghost'} icon={<Scissors className="h-4 w-4" />} onClick={editor.onOpen}>
               {editor.remaining ? 'Continue editing' : 'Open editor'}
             </Button>}
             {outputDir && <Button onClick={() => setInspectEdits(true)}>Inspect transcript & edits</Button>}
@@ -499,7 +535,7 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
             disabled={deleting}
             checked={allSelected}
             indeterminate={selected.size > 0 && !allSelected}
-            onChange={() => setSelected(allSelected ? new Set() : new Set(visibleClips.map((c) => c.clip_index)))}
+            onChange={() => setSelection(allSelected ? new Set() : new Set(visibleClips.map((c) => c.clip_index)))}
             label="Select all clips"
           />
           <span className="whitespace-nowrap text-sm text-ink-muted">
@@ -522,7 +558,7 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
         <div className="flex shrink-0 items-center gap-2">
           {selected.size > 0 && (
             <div className="flex items-center gap-1.5 animate-fade-in">
-              <Button variant="ghost" size="sm" disabled={deleting} onClick={() => setSelected(new Set())}>
+              <Button variant="ghost" size="sm" disabled={deleting} onClick={() => setSelection(new Set())}>
                 Clear
               </Button>
               <Button
@@ -633,7 +669,7 @@ function GeneratedClipList({ output, outputDir: runDirectory, leading, onNewClip
         onClose={() => setBankClips(null)}
         onAdded={(name) => {
           setBankClips(null)
-          setSelected(new Set())
+          setSelection(new Set())
           setAddedToBank(true)
           setNotice(`Added ${bankClips.length} clip${bankClips.length === 1 ? '' : 's'} to ${name}.`)
           if (noticeTimer.current) clearTimeout(noticeTimer.current)

@@ -151,7 +151,7 @@ export function LocalAiSection(): React.JSX.Element {
       <Panel>
       <PanelHeader
         icon={<IconTile tone="accent"><CloudOff /></IconTile>}
-        title="AI provider"
+        title="Local AI"
         description="Choose where clip planning and transcription run: the OpenRouter cloud, NVIDIA's free tier, or your own machine."
       />
       <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-3" role="radiogroup" aria-label="AI provider">

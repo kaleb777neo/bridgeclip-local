@@ -21,7 +21,7 @@ export function PageHeader({ title, description, actions, eyebrow, leading, clas
         <h1 className="truncate text-xl font-semibold tracking-[-0.02em] text-ink xl:text-2xl">{title}</h1>
         {description && <p className="mt-1 max-w-2xl text-sm text-ink-muted">{description}</p>}
       </div>
-      {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
+      {actions && <div className="flex max-w-full flex-wrap items-center justify-end gap-2">{actions}</div>}
     </header>
   )
 }

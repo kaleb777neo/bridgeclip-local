@@ -1,13 +1,12 @@
 import { execFile } from 'child_process'
 import { createHash } from 'crypto'
-import { realpathSync } from 'fs'
 import { promisify } from 'util'
 import { youtubeSourceUrl } from '../shared/video-source'
 import type { AutomationSourceContext } from '../shared/automations'
 import type { LibraryClipTarget } from '../shared/library-posting'
 import type { JobOutput } from '../shared/job-output'
 import { getJobHistory, getJobOutput } from './file-manager'
-import { isWithinDirectory, openAuthorizedMedia } from './security'
+import { canonicalMediaPath, isWithinDirectory, openAuthorizedMedia } from './security'
 import { resolveBinary } from './tools'
 
 export { youtubeSourceUrl } from '../shared/video-source'
@@ -22,7 +21,7 @@ export async function findLibraryClipForClip(bankFile: string | null, library: s
       if (!isWithinDirectory(sourceClipPath, run.outputDir)) continue
       const output = await getJobOutput(run.outputDir, library)
       const clip = output?.clips.find((clip) => {
-        try { return realpathSync(clip.s3_url.replace(/^file:\/\//, '')) === realpathSync(sourceClipPath) } catch { return false }
+        try { return canonicalMediaPath(clip.s3_url.replace(/^file:\/\//, '')) === canonicalMediaPath(sourceClipPath) } catch { return false }
       })
       if (clip) return { outputDir: run.outputDir, clipIndex: clip.clip_index }
     }

@@ -2,7 +2,7 @@
 
 BridgeClip can clip videos entirely on your computer — no OpenRouter key, no
 cloud cost, and transcripts never leave the machine. One switch in
-**Settings → AI provider** moves transcription and clip planning from the cloud
+**Settings → Local AI** moves transcription and clip planning from the cloud
 to local models; rendering, captions and smart framing were already local.
 A middle ground — free NVIDIA cloud planning with this same local Whisper
 transcription — is described in [nvidia-cloud.md](nvidia-cloud.md).

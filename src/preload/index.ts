@@ -20,6 +20,7 @@ import type { CalendarResult, ClipMediaInfo, PostClipRequest, PostClipResult, Po
 import type { BestTimeResult, DashboardResult } from '../shared/zernio-analytics'
 import type { ClipJobRequest, JobSnapshot } from '../shared/jobs'
 import type { BrandTemplate } from '../shared/templates'
+import type { SavedCaptionStyle } from '../shared/caption-styles'
 import type { MetadataEnhancement, AutomationSourceGroup, AutomationBatchResult, AutomationSourceContext, Automation, AutomationUpdate, AutomationTikTokReview, AutomationTikTokReviewUpdate } from '../shared/automations'
 import type { LibraryClipPostingStatus, LibraryEnhancementOptions, LibraryRunPostingCounts } from '../shared/library-posting'
 import type { OpenRouterCatalog } from '../shared/openrouter-models'
@@ -92,8 +93,10 @@ export interface BridgeClipAPI {
   editor: {
     open: (path: string) => Promise<EditorSession>
     /** Re-attach an automatic run's source (URL, or the file the user picked) to make its clips editable.
-     * `focusClipIndex` prepares only that reel's preview window first (fast per-reel edit). */
-    createProject: (path: string, mediaPath?: string, focusClipIndex?: number) => Promise<EditorSession>
+     * `focusClipIndex` prepares only that reel's preview window first (fast per-reel edit).
+     * `allowDownload` is his answer to "the original isn't on this PC" — without it the import
+     * only ever reads the Library, because a button must not pull gigabytes by itself. */
+    createProject: (path: string, mediaPath?: string, focusClipIndex?: number, allowDownload?: boolean) => Promise<EditorSession>
     save: (path: string, revision: number, edits: CandidateEdit[], speakerNames?: Record<string, string>) => Promise<EditorSession>
     /** Opens a picker for the kind (image | video | audio), copies the choice into the project; null when cancelled. */
     addAsset: (path: string, kind: 'image' | 'video' | 'audio') => Promise<{ asset: string; name: string } | null>
@@ -198,6 +201,14 @@ export interface BridgeClipAPI {
     save: (template: BrandTemplate, logoPath?: string | null, introPath?: string | null, outroPath?: string | null) => Promise<BrandTemplate>
     /** false when the id was not a saved pack; built-ins throw instead. */
     delete: (id: string) => Promise<boolean>
+  }
+  captionStyles: {
+    /** The user's saved caption styles. */
+    list: () => Promise<SavedCaptionStyle[]>
+    /** Inserts or replaces by id; returns the updated list. */
+    save: (style: SavedCaptionStyle) => Promise<SavedCaptionStyle[]>
+    /** Removes one; returns the updated list. */
+    delete: (id: string) => Promise<SavedCaptionStyle[]>
   }
   zernio: {
     checkStatus: () => Promise<ZernioStatusCheck>
@@ -345,7 +356,8 @@ const api: BridgeClipAPI = {
   source: { youtubePreview: (url, details = false) => ipcRenderer.invoke('source:youtubePreview', url, details) },
   editor: {
     open: (path) => ipcRenderer.invoke('editor:open', path),
-    createProject: (path, mediaPath, focusClipIndex) => ipcRenderer.invoke('editor:createProject', path, mediaPath, focusClipIndex),
+    createProject: (path, mediaPath, focusClipIndex, allowDownload) =>
+      ipcRenderer.invoke('editor:createProject', path, mediaPath, focusClipIndex, allowDownload),
     save: (path, revision, edits, speakerNames) => ipcRenderer.invoke('editor:save', path, revision, edits, speakerNames),
     addAsset: (path, kind) => ipcRenderer.invoke('editor:addAsset', path, kind),
     addAssetDropped: (path, file) => ipcRenderer.invoke('editor:addAssetDropped', path, file),
@@ -421,6 +433,11 @@ const api: BridgeClipAPI = {
     list: () => ipcRenderer.invoke('templates:list'),
     save: (template, logoPath = null, introPath = null, outroPath = null) => ipcRenderer.invoke('templates:save', template, logoPath, introPath, outroPath),
     delete: (id) => ipcRenderer.invoke('templates:delete', id)
+  },
+  captionStyles: {
+    list: () => ipcRenderer.invoke('captionStyles:list'),
+    save: (style) => ipcRenderer.invoke('captionStyles:save', style),
+    delete: (id) => ipcRenderer.invoke('captionStyles:delete', id)
   },
   zernio: {
     checkStatus: () => ipcRenderer.invoke('zernio:checkStatus'),

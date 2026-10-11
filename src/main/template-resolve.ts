@@ -22,6 +22,7 @@ export function materializeTemplate(template: BrandTemplate, request: ClipJobReq
   const [primary, ...rest] = template.formats
   const next: ClipJobRequest = { ...request, templateId: template.id }
   if (given.captionPreset === undefined) next.captionPreset = template.captionPresetId
+  if (template.captionStyle && given.captionStyle === undefined) next.captionStyle = template.captionStyle
   if (given.aspectRatio === undefined && !given.aspectRatios?.length) {
     next.aspectRatio = primary
     next.aspectRatios = [primary, ...rest]

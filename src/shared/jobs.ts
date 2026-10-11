@@ -1,7 +1,7 @@
 import type { RunDiagnostics } from './run-diagnostics'
 import type { PipelineStage } from './job-progress'
 import type { JobOutput } from './job-output'
-import type { OverlayPosition } from './clip-editor'
+import type { CaptionStyleOverrides, OverlayPosition } from './clip-editor'
 
 /** Brand-template logo snapshot; main owns the asset, so `path` is absolute. */
 export interface JobLogoOverlay { path: string; position: OverlayPosition; /** Fraction of output width, 0.05–0.5. */ scale: number; /** 0.1–1. */ opacity: number; /** Corner inset as a fraction of output width; absent keeps the engine margin. */ margin?: number }
@@ -23,6 +23,8 @@ export interface ClipJobRequest {
   clipRequest?: string
   maxClips: number | null
   autoClipCount: boolean
+  /** Full-coverage extraction: every self-contained moment, not only the most viral. */
+  coverage?: boolean
   durationRanges: string[] | null
   aspectRatio: string
   /** Output formats for every clip; aspectRatio stays the primary (= [0]). Missing on older requests. */
@@ -34,6 +36,8 @@ export interface ClipJobRequest {
   videoSpeed?: number
   includeCaptions: boolean
   captionPreset: string
+  /** Caption customisation layered on the preset; absent = the plain preset. */
+  captionStyle?: CaptionStyleOverrides
   /** Title card at the top of Automatic clips. Older requests default to shown. */
   includeTitle?: boolean
   startTimeSeconds: number | null

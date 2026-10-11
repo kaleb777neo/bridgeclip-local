@@ -165,6 +165,28 @@ test('the title card is shown by default and can be turned off for automatic run
   } finally { useDraftStore.setState(original) }
 })
 
+test('captions-only sends the engine workflow that skips clip selection', () => {
+  const { CaptionsStep, useDraftStore, buildJobRequest } = form.exports
+  const original = useDraftStore.getState()
+  try {
+    original.update({ workflow: 'automatic', source: 'https://example.com/video' })
+    assert.equal(useDraftStore.getState().captionsOnly, false)
+    const automatic = renderToStaticMarkup(React.createElement(CaptionsStep, { draft: useDraftStore.getState(), update() {} }))
+    assert.match(automatic, /aria-label="Only add caption without clipping"/)
+    original.update({ captionsOnly: true, includeTitle: true })
+    const request = buildJobRequest(useDraftStore.getState(), { start: 10, end: 70 })
+    assert.equal(request.workflow, 'captions-only')
+    assert.equal(request.includeCaptions, true)
+    assert.equal(request.includeTitle, false)
+    assert.equal(request.startTimeSeconds, 10)
+    assert.equal(request.endTimeSeconds, 70)
+    // Review & edit has no captions-only run, so neither the switch nor the workflow is offered.
+    const review = renderToStaticMarkup(React.createElement(CaptionsStep, { draft: { ...useDraftStore.getState(), workflow: 'review' }, update() {} }))
+    assert.doesNotMatch(review, /Only add caption without clipping/)
+    assert.equal(buildJobRequest({ ...useDraftStore.getState(), workflow: 'review' }, { start: null, end: null }).workflow, 'review')
+  } finally { useDraftStore.setState(original) }
+})
+
 test('what to clip is optional, trimmed into the request and cleared for the next video', () => {
   const { ClipsStep, useDraftStore, buildJobRequest } = form.exports
   const original = useDraftStore.getState()

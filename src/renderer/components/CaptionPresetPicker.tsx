@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
-import { Ban, Check, Pause, Play, RotateCcw } from 'lucide-react'
+import { Ban, Check, Pause, Play, RotateCcw, X } from 'lucide-react'
 import { cn } from '../lib/utils'
 import { Button } from './ui/Button'
+import type { CaptionStyleOverrides } from '../../shared/clip-editor'
+import type { SavedCaptionStyle } from '../../shared/caption-styles'
 
 /**
  * Mirrors the caption presets in engine/clip_engine/config.py closely
@@ -355,6 +357,64 @@ const PRESETS: CaptionPreset[] = [
 /** Display names by preset id, for summaries outside the picker. */
 export const CAPTION_PRESET_NAMES: Record<string, string> = Object.fromEntries(PRESETS.map((preset) => [preset.id, preset.name]))
 
+/** The editor's font choices: engine face names mapped to their preview CSS. */
+export interface CaptionFontOption { face: string; label: string; css: string; weight: number; italic?: boolean }
+export const CAPTION_FONTS: CaptionFontOption[] = [
+  { face: 'Montserrat Black', label: 'Montserrat Black', css: '"Montserrat", system-ui, sans-serif', weight: 900 },
+  { face: 'Montserrat ExtraBold', label: 'Montserrat ExtraBold', css: '"Montserrat", system-ui, sans-serif', weight: 800 },
+  { face: 'Poppins Black', label: 'Poppins Black', css: '"Poppins", system-ui, sans-serif', weight: 900 },
+  { face: 'Poppins ExtraBold', label: 'Poppins ExtraBold', css: '"Poppins", system-ui, sans-serif', weight: 800 },
+  { face: 'Anton', label: 'Anton', css: '"Anton", "Impact", "Arial Narrow", sans-serif', weight: 400 },
+  { face: 'Archivo Black', label: 'Archivo Black', css: '"Archivo Black", "Arial Black", system-ui, sans-serif', weight: 400 },
+  { face: 'Instrument Serif Italic', label: 'Instrument Serif', css: '"Instrument Serif", Georgia, serif', weight: 400, italic: true },
+  { face: 'Plus Jakarta Sans', label: 'Plus Jakarta Sans', css: '"Plus Jakarta Sans", system-ui, sans-serif', weight: 700 }
+]
+export const captionFontByFace = (face: string): CaptionFontOption => CAPTION_FONTS.find((font) => font.face === face) ?? CAPTION_FONTS[0]
+
+/** The engine face behind a preview preset, so "Customize" starts from what's on screen. */
+export function engineFontOf(preset: CaptionPreset): string {
+  if (preset.font.includes('Anton')) return 'Anton'
+  if (preset.font.includes('Archivo')) return 'Archivo Black'
+  if (preset.font.includes('Instrument')) return 'Instrument Serif Italic'
+  if (preset.font.includes('Jakarta')) return 'Plus Jakarta Sans'
+  if (preset.font.includes('Poppins')) return preset.weight >= 900 ? 'Poppins Black' : 'Poppins ExtraBold'
+  if (preset.font.includes('Montserrat')) return preset.weight >= 900 ? 'Montserrat Black' : preset.weight >= 800 ? 'Montserrat ExtraBold' : 'Montserrat Black'
+  return 'Montserrat Black'
+}
+
+/** The accent a style panel should open with: the pill, the glow, or the active word. */
+export function accentOf(preset: CaptionPreset): string {
+  return preset.pill ?? preset.glow ?? preset.highlight
+}
+
+/**
+ * Layer editor customisation onto a preview preset, mirroring the engine's
+ * apply_caption_style_overrides: the accent lands on the active word and its
+ * pill/glow carrier (a pill keeps the text colour so the word stays readable).
+ */
+export function applyCaptionStyleOverrides(preset: CaptionPreset, ov: CaptionStyleOverrides): CaptionPreset {
+  const font = captionFontByFace(ov.font)
+  const pill = preset.pill ? ov.highlightColor : preset.pill
+  return {
+    ...preset,
+    primary: ov.primaryColor,
+    highlight: preset.pill ? ov.primaryColor : ov.highlightColor,
+    pill,
+    glow: preset.glow ? ov.highlightColor : preset.glow,
+    font: font.css,
+    weight: font.weight,
+    italic: font.italic,
+    uppercase: ov.uppercase ?? preset.uppercase,
+    size: preset.size * ov.sizeScale
+  }
+}
+
+/** Field-by-field equality for primitive override objects. */
+export function sameCaptionStyle(a: CaptionStyleOverrides | null | undefined, b: CaptionStyleOverrides | null | undefined): boolean {
+  if (!a || !b) return false
+  return a.primaryColor === b.primaryColor && a.highlightColor === b.highlightColor && a.font === b.font && a.sizeScale === b.sizeScale && (a.uppercase ?? null) === (b.uppercase ?? null)
+}
+
 /**
  * Preset `size` and `stroke` are tuned for an 84px-tall preview. The compact
  * tile is 60px tall, so samples render at this fraction to keep the same fit.
@@ -555,13 +615,21 @@ interface CaptionPresetPickerProps {
   allowNone?: boolean
   noneSelected?: boolean
   onSelectNone?: () => void
+  /** The user's saved styles, offered as tiles after the built-ins. */
+  customStyles?: SavedCaptionStyle[]
+  /** Selecting a saved style layers its overrides on its base preset. */
+  onSelectCustom?: (style: SavedCaptionStyle) => void
+  /** Current overrides, so a saved tile can show as checked and the motion preview can react. */
+  styleValue?: CaptionStyleOverrides | null
+  onDeleteCustom?: (id: string) => void
 }
 
-export function CaptionPresetPicker({ value, onChange, disabled, showPreview = false, allowNone = false, noneSelected = false, onSelectNone }: CaptionPresetPickerProps): React.JSX.Element {
+export function CaptionPresetPicker({ value, onChange, disabled, showPreview = false, allowNone = false, noneSelected = false, onSelectNone, customStyles = [], onSelectCustom, styleValue = null, onDeleteCustom }: CaptionPresetPickerProps): React.JSX.Element {
   const current = PRESETS.find((preset) => preset.id === value) ?? PRESETS[0]
+  const previewPreset = styleValue ? applyCaptionStyleOverrides(current, styleValue) : current
   return (
     <div>
-      {showPreview && !noneSelected && <CaptionMotionPreview key={current.id} preset={current} disabled={disabled} />}
+      {showPreview && !noneSelected && <CaptionMotionPreview key={styleValue ? `${current.id}:${JSON.stringify(styleValue)}` : current.id} preset={previewPreset} disabled={disabled} />}
       <div className="grid grid-cols-[repeat(auto-fill,minmax(104px,1fr))] gap-2" role="radiogroup" aria-label="Caption style">
         {allowNone && (
           <button
@@ -627,6 +695,56 @@ export function CaptionPresetPicker({ value, onChange, disabled, showPreview = f
               </span>
               <span className={cn('block truncate px-1.5 pb-0.5 pt-1.5 text-xs font-semibold', selected ? 'text-ink' : 'text-ink/90')}>
                 {preset.name}
+              </span>
+              {selected && styleValue && (
+                <span className="absolute left-1.5 top-1.5 rounded-full bg-accent px-1.5 py-px text-[9px] font-semibold text-accent-ink">edited</span>
+              )}
+            </button>
+          )
+        })}
+        {customStyles.map((saved) => {
+          const selected = value === saved.preset && sameCaptionStyle(styleValue, saved.style)
+          const base = PRESETS.find((preset) => preset.id === saved.preset) ?? PRESETS[0]
+          return (
+            <button
+              key={saved.id}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              aria-label={saved.name}
+              aria-description={`${base.name} base, customised`}
+              disabled={disabled}
+              onClick={() => onSelectCustom?.(saved)}
+              className={cn(
+                'glass-tile glass-tile-hover group relative rounded-xl p-1 text-left hover:-translate-y-0.5',
+                selected && 'glass-selected',
+                disabled && 'opacity-50'
+              )}
+            >
+              <span
+                className="relative flex h-[60px] items-end justify-center overflow-hidden rounded-lg px-1.5 pb-2.5 shadow-[inset_0_0_0_1px_rgb(255_255_255/0.06)]"
+                style={{ background: SCENE }}
+              >
+                <CaptionSample preset={applyCaptionStyleOverrides(base, saved.style)} />
+                {selected && (
+                  <span className="absolute right-1.5 top-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-accent text-accent-ink shadow-[0_0_0_1px_rgb(var(--accent)/0.6)] animate-pop-in">
+                    <Check className="h-2.5 w-2.5" strokeWidth={3.5} />
+                  </span>
+                )}
+                {onDeleteCustom && !disabled && (
+                  <button
+                    type="button"
+                    aria-label={`Delete style ${saved.name}`}
+                    title={`Delete style ${saved.name}`}
+                    className="absolute left-1 top-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-fill text-ink-subtle opacity-0 transition-opacity group-hover:opacity-100 hover:text-danger"
+                    onClick={(e) => { e.stopPropagation(); onDeleteCustom(saved.id) }}
+                  >
+                    <X className="h-2.5 w-2.5" strokeWidth={3} />
+                  </button>
+                )}
+              </span>
+              <span className={cn('block truncate px-1.5 pb-0.5 pt-1.5 text-xs font-semibold', selected ? 'text-ink' : 'text-ink/90')}>
+                {saved.name}
               </span>
             </button>
           )
