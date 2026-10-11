@@ -62,6 +62,7 @@ Use footage you have permission to use. See the [user guide](docs/usage.md) for 
 ### Find complete moments
 
 - Discover clips with their setup and ending intact, using the source transcript and metadata.
+- Turn on **Full coverage** to extract every self-contained moment — not only the most viral — with missed gaps re-planned automatically, duplicates dropped, and multi-hour sources tiled completely.
 - Choose **Quality**, **Economy**, or **Advanced** with your own compatible OpenRouter models — or run planning for free on **NVIDIA's hosted models** with local Whisper transcription.
 - Enable optional source research and Jev editorial checks for context, title support and completeness.
 - Caption a whole video without re-cutting with **captions-only mode**, and import from direct links or platform pages (Vimeo, Dropbox, Drive, Zoom, X, LinkedIn and more) up to **10 hours** long.
@@ -73,14 +74,14 @@ Use footage you have permission to use. See the [user guide](docs/usage.md) for 
 - Adjust crops, use full-frame, split or fit layouts, and inspect suggested camera changes.
 - Rework clips on **element tracks**: drag b-roll, text overlays, effects and voiceovers on their own lanes, band-select cuts to crop them together, or add a section straight from the transcript.
 - Remove **filler words** in one click, **auto-censor** curse words in captions and audio, and cut flagged bad takes — every cut stays reversible with Undo.
-- Correct and position captions anywhere in the frame, suppress them in selected sections, and export one clip, all ready clips, or the timeline to **Final Cut Pro / DaVinci** via FCPXML. Edits autosave.
+- Correct and position captions anywhere in the frame, suppress them in selected sections, and watch the **live caption preview** play the real words — in the language they were transcribed — grouped exactly as the export groups them. Export one clip, all ready clips, or the timeline to **Final Cut Pro / DaVinci** via FCPXML. Edits autosave.
 
 ### Shape the final video
 
 - Export vertical **9:16**, horizontal **16:9** or square **1:1** clips with framing that follows faces and accommodates screen shares.
-- Preview **thirty caption presets** with animated samples, including karaoke-style and viral layouts.
-- Cut dead air and export at **1×–2× speed**, preserving voice pitch and caption timing.
-- Brand every project with **brand templates** — logo, CTA badge, caption preset and your own intro/outro videos — saved as packs you apply per clip or by default.
+- Preview **thirty caption presets** with animated samples, including karaoke-style and viral layouts — then **customize any of them**: text and accent colors, font, size, uppercase and placement, with the changes previewed live and the styled look saved as your own reusable tile.
+- Cut dead air and export at **1×–2× speed**, preserving voice pitch and caption timing; hyphenated words the transcriber splits ("m-aș") rejoin into one highlighted word.
+- Brand every project with **brand templates** — logo, CTA badge, caption look (preset or customized) and your own intro/outro videos — saved as packs you apply per clip or by default.
 - Narrate with **local voiceovers** (installed Windows voices, custom pronunciations) and soundtrack from an importable **music library** with volume, fades and start-at control.
 - Check overlays against phone-app **safe zones** in phone preview, and apply local blur or speech enhancement as range effects.
 
@@ -95,6 +96,7 @@ Use footage you have permission to use. See the [user guide](docs/usage.md) for 
 ### Understand each run
 
 - Follow processing stages, candidate progress and the saved time breakdown in Jobs.
+- See what to expect before it happens: the expected clip count when coverage planning starts, and a self-correcting **estimate of remaining render time** as clips finish.
 - Inspect transcripts, edit decisions and Jev reviews, including failed runs.
 - See model usage and provider-reported costs, with incomplete totals labeled.
 
